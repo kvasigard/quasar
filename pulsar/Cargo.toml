@@ -1,0 +1,10 @@
+[package]
+name = "pulsar"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+windows-sys = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+ctrlc = "3.5.2"

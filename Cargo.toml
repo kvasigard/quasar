@@ -1,0 +1,15 @@
+[workspace]
+members = ["pulsar"]
+resolver = "3"
+
+[workspace.dependencies]
+env_logger = "0.11.9"
+log = "0.4.29"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Services",
+    "Win32_System_Time",
+    "Win32_System_ProcessStatus"
+] }
