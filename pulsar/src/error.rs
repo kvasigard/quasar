@@ -17,10 +17,7 @@ pub enum AppError {
     ///
     /// `code` is the raw Win32 error code (GetLastError).
     /// `message` is a human-readable description obtained via FormatMessageW.
-    WindowsApi {
-        code: u32,
-        message: String,
-    },
+    WindowsApi { code: u32, message: String },
 
     /// Represents internal application errors that are not related to Win32.
     ///
@@ -59,7 +56,6 @@ impl fmt::Display for AppError {
 
 impl std::error::Error for AppError {}
 
-
 /// Macro that retrieves the last Windows error code and message.
 ///
 /// This macro calls:
@@ -70,32 +66,32 @@ impl std::error::Error for AppError {}
 #[macro_export]
 macro_rules! win_last_error {
     () => {{
-        use windows_sys::Win32::Foundation::{GetLastError};
+        use windows_sys::Win32::Foundation::GetLastError;
         use windows_sys::Win32::System::Diagnostics::Debug::{
-            FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
+            FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,
         };
 
-            let code = GetLastError(); 
+        let code = GetLastError();
 
-            let mut buffer: [u16; 512] = [0; 512];
-            let len = FormatMessageW(
-                FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                std::ptr::null(),
-                code,
-                0,
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
-                std::ptr::null(),
-            );
+        let mut buffer: [u16; 512] = [0; 512];
+        let len = FormatMessageW(
+            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            std::ptr::null(),
+            code,
+            0,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            std::ptr::null(),
+        );
 
-            let message = if len > 0 {
-                String::from_utf16_lossy(&buffer[..len as usize])
-                    .trim()
-                    .to_string()
-            } else {
-                format!("Unknown Windows error {}", code)
-            };
+        let message = if len > 0 {
+            String::from_utf16_lossy(&buffer[..len as usize])
+                .trim()
+                .to_string()
+        } else {
+            format!("Unknown Windows error {}", code)
+        };
 
-            $crate::error::AppError::from_win32(code, message)
+        $crate::error::AppError::from_win32(code, message)
     }};
 }
