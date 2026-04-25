@@ -8,3 +8,4 @@ windows-sys = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 ctrlc = "3.5.2"
+shared = { path = "../shared" }

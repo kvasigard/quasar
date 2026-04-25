@@ -16,6 +16,7 @@ wdk = "0.4.1"
 wdk-alloc = "0.4.1"
 wdk-panic = "0.4.1"
 wdk-sys = "0.5.1"
+shared = { path = "../shared" }
 
 [build-dependencies]
 wdk-build = "0.5.1"

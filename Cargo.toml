@@ -1,5 +1,6 @@
 [workspace]
-members = ["pulsar", "singularity"]
+members = ["pulsar", "shared"]
+exclude = ["singularity"]
 resolver = "3"
 
 [workspace.dependencies]
