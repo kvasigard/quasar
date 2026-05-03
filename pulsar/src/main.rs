@@ -6,6 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use pulsar::communications::kmdf;
 use pulsar::helpers::symbol_resolver::SymbolResolver;
 use pulsar::pipeline::Event;
 use pulsar::pipeline::EventDispatcher;
@@ -19,6 +20,11 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     log::info!("Starting Singularity ETW Engine...");
+
+    if let Err(e) = kmdf::request_ppl() {
+        log::error!("Failed to get PPL priviledges: {}", e);
+        return;
+    }
 
     // Atomic flag to signal immediate shutdown across threads.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
