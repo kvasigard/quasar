@@ -45,6 +45,7 @@ macro_rules! define_guid {
         ];
     };
 }
+
 // ========================================================================
 // WINDOWS CONSTANTS
 // ========================================================================
@@ -72,11 +73,11 @@ pub const SINGULARITY_DEVICE_TYPE: u32 = 0x8000;
 
 // Custom IOCTL functions must be in the range 0x800 to 0xFFF
 pub const FUNCTION_PING: u32 = 0x800;
+pub const FUNCTION_ELEVATE: u32 = 0x801;
 
-// Our first IOCTL Code
-pub const IOCTL_SINGULARITY_PING: u32 = ctl_code!(
+pub const IOCTL_SINGULARITY_ELEVATE: u32 = ctl_code!(
     SINGULARITY_DEVICE_TYPE,
-    FUNCTION_PING,
+    FUNCTION_ELEVATE,
     METHOD_BUFFERED,
     FILE_ANY_ACCESS
 );
@@ -87,14 +88,8 @@ pub const IOCTL_SINGULARITY_PING: u32 = ctl_code!(
 
 /// #[repr(C)] is strictly required so the Rust compiler doesn't reorder
 /// the fields, which would cause parsing errors between User and Kernel space.
-#[repr(C)]
-pub struct PingRequest {
-    pub process_id: u32,
-    pub magic_value: u64,
-}
 
 #[repr(C)]
-pub struct PingResponse {
-    pub success: bool,
-    pub message_code: u32,
+pub struct ProcessProtectionRequest {
+    pub target_pid: u32,
 }
