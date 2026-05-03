@@ -29,7 +29,7 @@ macro_rules! ctl_code {
 /// ```
 macro_rules! define_guid {
     ($name:ident, $l:expr, $w1:expr, $w2:expr, $($b:expr),+) => {
-        pub const $name: [u8; 16] = [
+        pub static $name: [u8; 16] = [
             ($l as u32 & 0xFF) as u8,
             (($l as u32 >> 8) & 0xFF) as u8,
             (($l as u32 >> 16) & 0xFF) as u8,
@@ -79,22 +79,6 @@ pub const IOCTL_SINGULARITY_PING: u32 = ctl_code!(
     FUNCTION_PING,
     METHOD_BUFFERED,
     FILE_ANY_ACCESS
-);
-
-// {c7ac5a26-22bd-4cc2-842a-e5ad5b48a257}
-define_guid!(
-    GUID_SINGULARITY,
-    0xc7ac5a26,
-    0x22bd,
-    0x4cc2,
-    0x84,
-    0x2a,
-    0xe5,
-    0xad,
-    0x5b,
-    0x48,
-    0xa2,
-    0x57
 );
 
 // ========================================================================
