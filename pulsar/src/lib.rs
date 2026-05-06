@@ -1,6 +1,7 @@
 //! Core library for the Singularity EDR agent.
 
-pub mod communications;
+pub mod comm;
+pub mod drivers;
 pub mod error;
 pub mod helpers;
 pub mod pipeline;

@@ -1,9 +1,9 @@
-pub mod elevate;
+pub mod permissions;
 
-use shared::IOCTL_SINGULARITY_ELEVATE;
+use shared::ioctl::IOCTL_CHANGE_PPL_LEVEL;
 use wdk::println;
 use wdk_sys::{
-    STATUS_INVALID_DEVICE_REQUEST, WDFQUEUE__, WDFREQUEST__, call_unsafe_wdf_function_binding,
+    call_unsafe_wdf_function_binding, STATUS_INVALID_DEVICE_REQUEST, WDFQUEUE__, WDFREQUEST__,
 };
 
 /// Handles incoming Device Control (IOCTL) requests.
@@ -26,10 +26,10 @@ pub unsafe extern "C" fn singularity_device_control(
     let mut bytes_returned: u64 = 0;
 
     let status = match io_control_code {
-        IOCTL_SINGULARITY_ELEVATE => {
+        IOCTL_CHANGE_PPL_LEVEL => {
             // SAFETY: The `request` pointer is provided by WDF and is valid for this callback.
             unsafe {
-                let (status, bytes) = elevate::handle_elevate(request);
+                let (status, bytes) = permissions::handle_change_ppl(request);
                 bytes_returned = bytes;
                 status
             }

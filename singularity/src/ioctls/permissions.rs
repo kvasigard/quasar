@@ -1,12 +1,12 @@
-use shared::ProcessProtectionRequest;
+use shared::ioctl::ChangeProcessPplLevel;
 use wdk::{nt_success, println};
-use wdk_sys::{NTSTATUS, STATUS_SUCCESS, WDFREQUEST__, call_unsafe_wdf_function_binding};
+use wdk_sys::{call_unsafe_wdf_function_binding, NTSTATUS, STATUS_SUCCESS, WDFREQUEST__};
 
 // Import our DKOM logic from the internals module
-use crate::internals::dkom::elevate_process_to_ppl;
+use crate::internals::dkom::change_process_ppl;
 
-/// Handles the process elevation IOCTL request. It elevates the requested process to PPL
-/// Antimalware level.
+/// Handles the change PPL IOCTL request. It dynamically alters the
+/// target process protection level via DKOM.
 ///
 /// # Arguments
 ///
@@ -22,36 +22,40 @@ use crate::internals::dkom::elevate_process_to_ppl;
 /// The caller must ensure that the `request` pointer is a valid, framework-supplied handle.
 /// The function utilizes safe WDF abstractions to validate the input buffer size before
 /// dereferencing the memory into a Rust reference.
-pub unsafe fn handle_elevate(request: *mut WDFREQUEST__) -> (NTSTATUS, u64) {
+pub unsafe fn handle_change_ppl(request: *mut WDFREQUEST__) -> (NTSTATUS, u64) {
     let mut input_buffer: *mut core::ffi::c_void = core::ptr::null_mut();
     let mut input_size: usize = 0;
 
     // SAFETY: We pass valid pointers to receive the buffer. WDF validates that the
-    // buffer size matches at least the size of `ProcessProtectionRequest`.
+    // buffer size matches at least the size of `ChangePermissionsRequest`.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfRequestRetrieveInputBuffer,
             request,
-            core::mem::size_of::<ProcessProtectionRequest>(),
+            core::mem::size_of::<ChangeProcessPplLevel>(),
             &raw mut input_buffer,
             &raw mut input_size
         )
     };
 
     if !nt_success(status) {
-        println!("[Singularity::elevate] Error: Failed to retrieve input buffer {status:#010X}");
+        println!(
+            "[Singularity::permissions] Error: Failed to retrieve input buffer {status:#010X}"
+        );
         return (status, 0);
     }
 
     // SAFETY: WDF guarantees the buffer is valid and appropriately sized per the call above.
-    let req = unsafe { &*(input_buffer as *const ProcessProtectionRequest) };
+    // `kmdf_client` goes out of scope here. The RAII `Drop` implementation
+    // will safely call CloseHandle(), detaching from the driver.
+    let req = unsafe { &*(input_buffer as *const ChangeProcessPplLevel) };
 
     println!(
-        "[Singularity::elevate] Requesting PPL change for PID: {}",
-        req.target_pid
+        "[Singularity::permissions] Requesting permissions change for PID: {} to Level: {:#02X}",
+        req.process_id, req.level
     );
 
-    let dkom_status = match elevate_process_to_ppl(req.target_pid) {
+    let dkom_status = match change_process_ppl(req.process_id, req.level) {
         Ok(_) => STATUS_SUCCESS,
         Err(e) => e,
     };

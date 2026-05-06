@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use pulsar::communications::kmdf;
+use pulsar::drivers::kmdf;
 use pulsar::helpers::symbol_resolver::SymbolResolver;
 use pulsar::pipeline::Event;
 use pulsar::pipeline::EventDispatcher;
@@ -21,10 +21,27 @@ fn main() {
 
     log::info!("Starting Singularity ETW Engine...");
 
-    if let Err(e) = kmdf::request_ppl() {
-        log::error!("Failed to get PPL priviledges: {}", e);
+    // TODO: Connect, healthcheck and installation tasks shall be moved to a
+    // bootstrap script in the future to reduce boilerplate in main
+    let kmdf_client = match kmdf::Singularity::connect() {
+        Ok(client) => client,
+        Err(e) => {
+            log::error!("Failed to connect to Singularity KMDF driver: {}", e);
+            return;
+        }
+    };
+
+    let ppl_request = shared::ioctl::ChangeProcessPplLevel {
+        process_id: std::process::id(), // Dynamically grab our current user-mode PID
+        level: 0x31,                    // PPL-Antimalware (Signer: 0x3 | Type: 0x1)
+    };
+
+    if let Err(e) = kmdf_client.send(&ppl_request) {
+        log::error!("Failed to acquire PPL privileges: {}", e);
         return;
     }
+
+    log::info!("Successfully established PPL elevation.");
 
     // Atomic flag to signal immediate shutdown across threads.
     let shutdown_flag = Arc::new(AtomicBool::new(false));

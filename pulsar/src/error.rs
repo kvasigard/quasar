@@ -71,18 +71,22 @@ macro_rules! win_last_error {
             FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,
         };
 
-        let code = GetLastError();
+        #[allow(unused_unsafe)]
+        let code = unsafe { GetLastError() };
 
         let mut buffer: [u16; 512] = [0; 512];
-        let len = FormatMessageW(
-            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-            std::ptr::null(),
-            code,
-            0,
-            buffer.as_mut_ptr(),
-            buffer.len() as u32,
-            std::ptr::null(),
-        );
+        #[allow(unused_unsafe)]
+        let len = unsafe {
+            FormatMessageW(
+                FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                std::ptr::null(),
+                code,
+                0,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                std::ptr::null(),
+            )
+        };
 
         let message = if len > 0 {
             String::from_utf16_lossy(&buffer[..len as usize])

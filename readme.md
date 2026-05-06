@@ -4,34 +4,42 @@
 
 ## Architecture
 
-Quasar is designed as a multi-component workspace, split between user-mode analysis and kernel-mode visibility:
+Quasar is designed as a multi-component workspace, split between user-mode analysis, kernel-mode visibility, and shared definitions:
 
-* **Pulsar (User-Mode):** This is the user-mode agent in charge of collecting some system telemetry and routing it through an internal processing pipeline for real-time analysis. It manages data ingestion via "Sensors", dispatches the events across threads without blocking, and feeds them into analytical "Sinks" where the actual detection logic lives.
-* **Singularity (Kernel-Mode):** A Windows Kernel-Mode Driver Framework (KMDF) driver written purely in Rust. It serves as the privileged component of the EDR, providing deep system visibility, robust event tracing, and other enforcement capabilities that are otherwise inaccessible or easily bypassed from user-land.
+* **Pulsar (User-Mode):** This is the user-mode agent in charge of collecting system telemetry and routing it through an internal processing pipeline for real-time analysis. It manages data ingestion via "Sensors", dispatches the events across threads without blocking, and feeds them into analytical "Sinks" where the actual detection logic lives. It also orchestrates kernel-mode component lifecycles.
+* **Singularity (Kernel-Mode):** A Windows Kernel-Mode Driver Framework (KMDF) driver written purely in Rust. It serves as the privileged component of the EDR, providing deep system visibility, Direct Kernel Object Manipulation (DKOM) capabilities, and robust event tracing that is otherwise inaccessible from user-land.
+* **Shared:** A common Rust crate used to bridge the gap between `pulsar` and `singularity`. It houses shared data structures, enum definitions, and IOCTL codes ensuring strict memory layout and communication consistency between user-mode and kernel-mode.
 
 ## Project Structure
-
 ```text
 quasar/
-├── Cargo.toml                # Workspace manifest (Profile and Dependency management)
+├── shared/                   # Common definitions between um and km (IOCTLs, Structs)
 ├── pulsar/                   # Core EDR Engine (User-Mode)
-│   ├── Cargo.toml            # Pulsar dependencies
 │   └── src/
 │       ├── main.rs           # Entry point and initialization
 │       ├── lib.rs            # Library core
 │       ├── error.rs          # Custom AppError implementation
+│       ├── comm/             # Inter-process communication and transport primitives
+│       ├── drivers/          # Driver lifecycle management and SCM control
 │       ├── pipeline/         # Event dispatcher and routing logic
-│       ├── sensors/          # ETW session builder, consumer, and director
-│       ├── sinks/            # Analytical detection modules (DirectSyscallSink)
-│       └── helpers/          # Stack unwinding and DbgHelp symbol resolution
+│       ├── sensors/          # Telemetry ingestion 
+│       ├── sinks/            # Analytical detection modules 
+│       └── helpers/          
 └── singularity/              # KMDF Driver (Kernel-Mode)
-    ├── .cargo/config.toml    # Compiler flags for kernel environment (panic=abort, crt-static)
-    ├── Cargo.toml            # Driver dependencies (wdk, wdk-sys, etc.)
+    ├── .cargo/config.toml    # Compiler flags for kernel environment
     ├── Makefile.toml         # cargo-make configuration for driver packaging
     ├── build.rs              # Bindgen execution for WDK headers
     ├── singularity.inx       # Driver installation and isolated package template
     └── src/
-        └── lib.rs            # DriverEntry and core kernel logic
+        ├── lib.rs            # DriverEntry and core kernel logic
+        ├── device.rs         # WDF Device initialization and context
+        ├── raii.rs           # Safe Resource Acquisition Is Initialization wrappers
+        ├── internals/        # Implementation logic
+        │   ├── mod.rs
+        │   └── dkom.rs       # Direct Kernel Object Manipulation logic
+        └── ioctls/           # IOCTL dispatching and handlers
+            ├── mod.rs
+            └── elevate.rs    # Token elevation handler
 ```
 
 ## Features
