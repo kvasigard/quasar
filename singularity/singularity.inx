@@ -1,0 +1,60 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=System ; It might be a more appropriate class for an EDR. Keeping this for now.
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%ManufacturerName%
+CatalogFile=singularity.cat
+DriverVer= ; DriverVer is set by Stampinf during the build process
+PnpLockDown=1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+singularity.sys  = 1,,
+
+;*****************************************
+; Install Section
+;*****************************************
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$.10.0...16299
+
+; This restricts the installation to Windows 10 Build 16299 and newer
+[Standard.NT$ARCH$.10.0...16299]
+%singularity.DeviceDesc%=singularity_Device, Root\singularity
+
+; The install sections just use the architecture decoration
+[singularity_Device.NT$ARCH$]
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+singularity.sys
+
+;-------------- Service installation
+[singularity_Device.NT$ARCH$.Services]
+AddService = singularity,%SPSVCINST_ASSOCSERVICE%, singularity_Service_Inst
+
+; -------------- singularity driver install sections
+[singularity_Service_Inst]
+DisplayName    = %singularity.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\singularity.sys
+
+[singularity_Device.NT$ARCH$.Wdf]
+KmdfService = singularity, singularity_wdfsect
+
+[singularity_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+SPSVCINST_ASSOCSERVICE= 0x00000002
+ManufacturerName="Quasar EDR S.L."
+DiskName = "singularity Installation Disk"
+singularity.DeviceDesc = "singularity Device"
+singularity.SVCDESC = "singularity Service"
