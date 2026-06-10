@@ -12,6 +12,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Services",
     "Win32_System_Time",
+    "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_System_ProcessStatus",
     "Win32_Storage_FileSystem",
     "Win32_System_IO"

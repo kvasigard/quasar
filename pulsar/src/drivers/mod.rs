@@ -12,3 +12,4 @@
 //! belong to the `sensors` and `comm` modules.
 
 pub mod kmdf;
+pub mod scm;

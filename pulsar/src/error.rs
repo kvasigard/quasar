@@ -10,6 +10,7 @@ use std::fmt;
 ///
 /// This enum intentionally keeps the number of variants small.
 /// - `WindowsApi` is used for any failure originating from Win32 calls.
+/// - `Bootstrap` is used for initialization sequence failures (e.g., driver missing, privileges).
 /// - `Internal` is used for unexpected states or logic errors inside the app.
 #[derive(Debug)]
 pub enum AppError {
@@ -18,6 +19,9 @@ pub enum AppError {
     /// `code` is the raw Win32 error code (GetLastError).
     /// `message` is a human-readable description obtained via FormatMessageW.
     WindowsApi { code: u32, message: String },
+
+    /// Represents an error encountered during the bootstrap/initialization phase.
+    Bootstrap(String),
 
     /// Represents internal application errors that are not related to Win32.
     ///
@@ -37,6 +41,11 @@ impl AppError {
         }
     }
 
+    /// Creates a Bootstrap error variant.
+    pub fn bootstrap(msg: impl Into<String>) -> Self {
+        Self::Bootstrap(msg.into())
+    }
+
     /// Creates an internal error variant.
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
@@ -49,6 +58,7 @@ impl fmt::Display for AppError {
             Self::WindowsApi { code, message } => {
                 write!(f, "Windows API Error {}: {}", code, message)
             }
+            Self::Bootstrap(msg) => write!(f, "Bootstrap Error: {}", msg),
             Self::Internal(msg) => write!(f, "Internal Error: {}", msg),
         }
     }
