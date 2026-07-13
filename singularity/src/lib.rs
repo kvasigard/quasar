@@ -83,7 +83,7 @@ pub unsafe extern "system" fn driver_entry(
     }
 
     // Delegate Control Device and Queue creation to our device module
-    device::create_control_device(driver_handle)
+    unsafe { device::create_control_device(driver_handle) }
 }
 
 unsafe extern "C" fn singularity_driver_unload(_driver: WDFDRIVER) {

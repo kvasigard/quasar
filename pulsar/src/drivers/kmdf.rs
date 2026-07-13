@@ -27,7 +27,7 @@ impl Drop for Singularity {
 impl Singularity {
     /// Acquires a handle to interact with the KMDF driver.
     pub fn connect() -> Result<Self, AppError> {
-        let device_path = windows_sys::w!("\\\\.\\Singularity");
+        let device_path = windows_sys::w!("\\\\.\\SingularityDevice");
 
         // SAFETY: Device path is built to guarantee proper null-termination via the `w!` macro.
         // Access rights are restricted to the minimum required.

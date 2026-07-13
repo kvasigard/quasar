@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use pulsar::drivers::kmdf;
+use pulsar::bootstrap;
 use pulsar::helpers::symbol_resolver::SymbolResolver;
 use pulsar::pipeline::Event;
 use pulsar::pipeline::EventDispatcher;
@@ -14,34 +14,33 @@ use pulsar::sensors::etw::EtwSession;
 use pulsar::sensors::etw::KernelSessionBuilder;
 use pulsar::sensors::etw::director::SessionDirector;
 use pulsar::sinks::direct_sys::DirectSyscallSink;
+use windows_sys::Win32::Foundation::ERROR_SERVICE_DEPENDENCY_FAIL;
 
 fn main() {
-    // Initialize the standard 'log' crate using env_logger.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    log::info!("Starting Singularity ETW Engine...");
-
-    // TODO: Connect, healthcheck and installation tasks shall be moved to a
-    // bootstrap script in the future to reduce boilerplate in main
-    let kmdf_client = match kmdf::Singularity::connect() {
-        Ok(client) => client,
-        Err(e) => {
-            log::error!("Failed to connect to Singularity KMDF driver: {}", e);
-            return;
+    // Check for --uninstall or /uninstall command-line options
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--uninstall" || arg == "/uninstall") {
+        log::info!("Uninstall option detected. Initiating driver teardown...");
+        match pulsar::drivers::scm::unload_driver() {
+            Ok(_) => {
+                log::info!("Singularity driver successfully stopped and unregistered.");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                log::error!("Failed to unload/uninstall Singularity driver: {}", e);
+                std::process::exit(1);
+            }
         }
-    };
-
-    let ppl_request = shared::ioctl::ChangeProcessPplLevel {
-        process_id: std::process::id(), // Dynamically grab our current user-mode PID
-        level: 0x31,                    // PPL-Antimalware (Signer: 0x3 | Type: 0x1)
-    };
-
-    if let Err(e) = kmdf_client.send(&ppl_request) {
-        log::error!("Failed to acquire PPL privileges: {}", e);
-        return;
     }
 
-    log::info!("Successfully established PPL elevation.");
+    log::info!("Starting Singularity Engine...");
+
+    if let Err(e) = bootstrap::initialize() {
+        log::error!("Initialization failed: {}", e);
+        std::process::exit(ERROR_SERVICE_DEPENDENCY_FAIL as i32);
+    };
 
     // Atomic flag to signal immediate shutdown across threads.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
