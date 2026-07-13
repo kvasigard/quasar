@@ -35,7 +35,7 @@ pub unsafe fn create_control_device(driver_handle: WDFDRIVER) -> NTSTATUS {
 
     // Assign a Device Name before creating the device.
     // Non-PnP devices require an internal kernel name.
-    let device_name_buffer = windows_sys::w!("\\Device\\Singularity");
+    let device_name_buffer = windows_sys::w!("\\Device\\SingularityDevice");
     let device_name = unsafe {
         let mut name_uninit = core::mem::MaybeUninit::<wdk_sys::UNICODE_STRING>::uninit();
         RtlInitUnicodeString(name_uninit.as_mut_ptr(), device_name_buffer);
@@ -78,7 +78,7 @@ pub unsafe fn create_control_device(driver_handle: WDFDRIVER) -> NTSTATUS {
     }
 
     // Create a Symbolic Link instead of a Device Interface.
-    let symlink_buffer = windows_sys::w!("\\DosDevices\\Singularity");
+    let symlink_buffer = windows_sys::w!("\\DosDevices\\SingularityDevice");
     let symlink_string = unsafe {
         let mut symlink_uninit = core::mem::MaybeUninit::<wdk_sys::UNICODE_STRING>::uninit();
         RtlInitUnicodeString(symlink_uninit.as_mut_ptr(), symlink_buffer);

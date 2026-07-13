@@ -17,14 +17,29 @@ use pulsar::sinks::direct_sys::DirectSyscallSink;
 use windows_sys::Win32::Foundation::ERROR_SERVICE_DEPENDENCY_FAIL;
 
 fn main() {
-    // Initialize the standard 'log' crate using env_logger.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // Check for --uninstall or /uninstall command-line options
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--uninstall" || arg == "/uninstall") {
+        log::info!("Uninstall option detected. Initiating driver teardown...");
+        match pulsar::drivers::scm::unload_driver() {
+            Ok(_) => {
+                log::info!("Singularity driver successfully stopped and unregistered.");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                log::error!("Failed to unload/uninstall Singularity driver: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     log::info!("Starting Singularity Engine...");
 
     if let Err(e) = bootstrap::initialize() {
         log::error!("Initialization failed: {}", e);
-        return ERROR_SERVICE_DEPENDENCY_FAIL;
+        std::process::exit(ERROR_SERVICE_DEPENDENCY_FAIL as i32);
     };
 
     // Atomic flag to signal immediate shutdown across threads.

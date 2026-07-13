@@ -40,6 +40,24 @@ use windows_sys::Win32::System::Threading::{
 /// Returns an `AppError` if any step in the initialization sequence fails, such as
 /// lacking Administrator rights, failing to find or load the driver package components,
 /// failing to communicate with the driver, or failing to acquire PPL status.
+/// Executes the pre-flight checks and driver initialization sequence.
+///
+/// This function performs the following sequence:
+/// 1. Verifies that the current process is running with Administrator privileges.
+/// 2. Dynamically locates both the `singularity.inf` and `singularity.sys` files.
+/// 3. Checks if Singularity driver service is registered:
+///    - If not registered: Installs INF and loads SCM dynamic.
+///    - If registered:
+///      - Checks for driver upgrades (checks if file contents of local and registered binary are identical).
+///      - If upgrade is needed: unloads, installs new INF, loads SCM.
+///      - If no upgrade is needed: starts the service if it was stopped.
+/// 4. Connects to the KMDF driver via `\Device\SingularityDevice` (handled by client).
+/// 5. Sends the initialization IOCTL containing Pulsar's current PID.
+/// 6. Verifies that the OS has successfully applied the requested protection level (PPL-Antimalware).
+///
+/// # Errors
+///
+/// Returns an `AppError` if any step in the initialization sequence fails.
 pub fn initialize() -> Result<(), AppError> {
     log::debug!("Starting bootstrap sequence...");
 
@@ -52,21 +70,63 @@ pub fn initialize() -> Result<(), AppError> {
     // Resolve the dynamic paths to both package configuration and binary files
     let (inf_path, sys_path) = resolve_package_paths()?;
 
-    // Securely stage and install the driver package via the Windows Driver Store
-    log::debug!("Installing driver package via INF from: {}", inf_path);
-    install_inf_driver(&inf_path)?;
+    // Check if Singularity service is already registered
+    let is_registered = scm::is_driver_service_registered()?;
+    let mut do_install = !is_registered;
 
-    // Start the driver service using the unmodified SCM module.
-    // Since DiInstallDriverW handles registry entry generation, scm::load_driver
-    // will successfully OpenServiceW, skip CreateServiceW, and cleanly execute StartServiceW.
-    log::debug!("Loading Singularity kernel driver via SCM orchestration...");
-    if let Err(e) = scm::load_driver(&sys_path) {
-        return Err(AppError::internal(format!(
-            "Error while starting the driver service: {e}"
-        )));
+    if is_registered {
+        log::debug!("Singularity driver service is already registered. Checking if upgrade is needed...");
+        if let Ok(installed_binary_path) = scm::get_service_binary_path() {
+            let resolved_installed_path = clean_driver_path(&installed_binary_path);
+            log::debug!("Comparing local '{}' with installed driver '{}'...", sys_path, resolved_installed_path);
+            
+            let files_match = match (std::fs::read(&sys_path), std::fs::read(&resolved_installed_path)) {
+                (Ok(local_bytes), Ok(installed_bytes)) => local_bytes == installed_bytes,
+                _ => false,
+            };
+
+            if !files_match {
+                log::info!("New version of driver detected. Stopping and unloading old driver service...");
+                // Stop and delete the service first before installing the new version
+                let _ = scm::unload_driver();
+                do_install = true;
+            }
+        } else {
+            log::warn!("Could not retrieve installed driver binary path. Safe-triggering reinstall.");
+            let _ = scm::unload_driver();
+            do_install = true;
+        }
+    }
+
+    if do_install {
+        // Securely stage and install the driver package via the Windows Driver Store
+        log::debug!("Installing driver package via INF from: {}", inf_path);
+        install_inf_driver(&inf_path)?;
+
+        // Start the driver service using SCM module
+        log::debug!("Loading Singularity kernel driver via SCM orchestration...");
+        if let Err(e) = scm::load_driver(&sys_path) {
+            return Err(AppError::internal(format!(
+                "Error while starting the driver service: {e}"
+            )));
+        }
+    } else {
+        // If already registered and up-to-date, check if running. Start if stopped.
+        if !scm::is_service_running()? {
+            log::debug!("Starting Singularity driver service (registered but stopped)...");
+            if let Err(e) = scm::load_driver(&sys_path) {
+                return Err(AppError::internal(format!(
+                    "Error while starting the driver service: {e}"
+                )));
+            }
+        } else {
+            log::debug!("Singularity driver service is already running.");
+        }
     }
 
     log::debug!("Connecting to the Singularity driver...");
+    // kmdf_client goes out of scope here when this function returns, and its RAII
+    // Drop implementation will call CloseHandle(), detaching from the driver.
     let kmdf_client = match kmdf::Singularity::connect() {
         Ok(client) => client,
         Err(e) => {
@@ -88,17 +148,35 @@ pub fn initialize() -> Result<(), AppError> {
         )));
     }
 
-    // NOTE: This is currently not working because the DKOM modification does not
-    //       populate the changes to other structures.
-    // Check if the current process is actually running as PPL-Antimalware
-    // log::debug!("Verifying applied Process Protection Level...");
-    // if !is_ppl_antimalware() {
-    //     return Err(AppError::internal(
-    //         "Failed to verify PPL-Antimalware token status.",
-    //     ));
-    // }
+    // Verify applied Process Protection Level (PPL)
+    log::debug!("Verifying applied Process Protection Level...");
+    if !is_ppl_antimalware() {
+        return Err(AppError::internal(
+            "Failed to verify PPL-Antimalware token status.",
+        ));
+    }
 
     Ok(())
+}
+
+/// Helper function to normalize/clean the service binary path.
+fn clean_driver_path(path: &str) -> String {
+    let mut cleaned = path.trim().to_string();
+    
+    // Remote driver path prefix commonly used by SCM
+    if cleaned.starts_with("\\??\\") {
+        cleaned = cleaned[4..].to_string();
+    }
+    
+    // Strip quotes
+    cleaned = cleaned.trim_matches('"').to_string();
+
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    cleaned = cleaned.replace("\\SystemRoot\\", &format!("{}\\", system_root));
+    cleaned = cleaned.replace("\\systemroot\\", &format!("{}\\", system_root));
+    cleaned = cleaned.replace("%SystemRoot%", &system_root);
+    cleaned = cleaned.replace("%systemroot%", &system_root);
+    cleaned
 }
 
 /// Securely installs an INF-based driver package into the Windows Driver Store.

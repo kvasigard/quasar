@@ -8,13 +8,15 @@ use crate::win_last_error;
 use std::ffi::c_void;
 use std::ptr;
 use windows_sys::Win32::Foundation::{
-    ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST, GetLastError,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST,
+    GetLastError,
 };
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
-    OpenServiceW, SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS, SERVICE_CONTROL_STOP,
-    SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, SERVICE_KERNEL_DRIVER, SERVICE_START,
-    SERVICE_STATUS, SERVICE_STOP, StartServiceW,
+    OpenServiceW, QueryServiceConfigW, QueryServiceStatus, QUERY_SERVICE_CONFIGW,
+    SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START,
+    SERVICE_ERROR_NORMAL, SERVICE_KERNEL_DRIVER, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS,
+    SERVICE_RUNNING, SERVICE_START, SERVICE_STATUS, SERVICE_STOP, StartServiceW,
 };
 
 /// A safe RAII wrapper around Windows Service Control handles.
@@ -199,4 +201,150 @@ pub fn unload_driver() -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+/// Checks if the driver service is already registered in the Service Control Manager.
+pub fn is_driver_service_registered() -> Result<bool, AppError> {
+    log::debug!("Checking if Singularity driver service is registered...");
+
+    let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS) };
+    if scm.is_null() {
+        return Err(win_last_error!());
+    }
+    let scm_handle = ScmHandle(scm);
+
+    let service_name = windows_sys::w!("Singularity");
+
+    let service = unsafe {
+        OpenServiceW(
+            scm_handle.0,
+            service_name,
+            SERVICE_QUERY_STATUS,
+        )
+    };
+
+    if service.is_null() {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_SERVICE_DOES_NOT_EXIST {
+            return Ok(false);
+        }
+        return Err(win_last_error!());
+    }
+
+    Ok(true)
+}
+
+/// Retrieves the configured binary path name for the driver service.
+pub fn get_service_binary_path() -> Result<String, AppError> {
+    log::debug!("Retrieving Singularity driver service binary path...");
+
+    let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS) };
+    if scm.is_null() {
+        return Err(win_last_error!());
+    }
+    let scm_handle = ScmHandle(scm);
+
+    let service_name = windows_sys::w!("Singularity");
+
+    let service = unsafe {
+        OpenServiceW(
+            scm_handle.0,
+            service_name,
+            SERVICE_QUERY_CONFIG,
+        )
+    };
+
+    if service.is_null() {
+        return Err(win_last_error!());
+    }
+    let service_handle = ScmHandle(service);
+
+    let mut bytes_needed: u32 = 0;
+    
+    // Query required buffer size
+    unsafe {
+        QueryServiceConfigW(
+            service_handle.0,
+            ptr::null_mut(),
+            0,
+            &mut bytes_needed,
+        );
+    }
+
+    let err = unsafe { GetLastError() };
+    if err != ERROR_INSUFFICIENT_BUFFER {
+        return Err(win_last_error!());
+    }
+
+    // Allocate buffer with alignment for the struct
+    let mut buffer = vec![0u8; bytes_needed as usize];
+    let config_ptr = buffer.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW;
+
+    let success = unsafe {
+        QueryServiceConfigW(
+            service_handle.0,
+            config_ptr,
+            bytes_needed,
+            &mut bytes_needed,
+        )
+    };
+
+    if success == 0 {
+        return Err(win_last_error!());
+    }
+
+    let binary_path_ptr = unsafe { (*config_ptr).lpBinaryPathName };
+    if binary_path_ptr.is_null() {
+        return Err(AppError::internal("Service binary path pointer is null"));
+    }
+
+    // Retrieve string length
+    let mut len = 0;
+    unsafe {
+        while *binary_path_ptr.add(len) != 0 {
+            len += 1;
+        }
+    }
+
+    let wide_slice = unsafe { std::slice::from_raw_parts(binary_path_ptr, len) };
+    let binary_path = String::from_utf16_lossy(wide_slice);
+
+    Ok(binary_path)
+}
+
+/// Checks if the driver service is currently running.
+pub fn is_service_running() -> Result<bool, AppError> {
+    log::debug!("Checking if Singularity driver service is running...");
+
+    let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS) };
+    if scm.is_null() {
+        return Err(win_last_error!());
+    }
+    let scm_handle = ScmHandle(scm);
+
+    let service_name = windows_sys::w!("Singularity");
+
+    let service = unsafe {
+        OpenServiceW(
+            scm_handle.0,
+            service_name,
+            SERVICE_QUERY_STATUS,
+        )
+    };
+
+    if service.is_null() {
+        return Ok(false);
+    }
+    let service_handle = ScmHandle(service);
+
+    let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
+    let success = unsafe {
+        QueryServiceStatus(service_handle.0, &mut status)
+    };
+
+    if success == 0 {
+        return Err(win_last_error!());
+    }
+
+    Ok(status.dwCurrentState == SERVICE_RUNNING)
 }

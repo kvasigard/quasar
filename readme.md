@@ -105,13 +105,23 @@ $env:RUST_LOG="debug"
 cargo run
 ```
 
-To stop the agent, press `Ctrl+C`. The application will intercept the termination signal and initiate a graceful shutdown, safely unregistering the ETW sessions and freeing system resources.
+To stop the agent, press `Ctrl+C`. The application will intercept the termination signal and initiate a graceful shutdown, safely unregistering the ETW sessions and freeing system resources. 
+
+#### Automated Driver Lifecycle
+Pulsar automatically manages the driver's SCM lifecycle:
+- **Automatic Loading**: If the `Singularity` driver service is not registered, Pulsar dynamically stages, registers, and starts the driver service at startup.
+- **Dynamic Upgrades**: If a new version of `singularity.sys` is placed in the deploy folder, Pulsar detects the binary mismatch, stops/deletes the old service, and registers/starts the updated version.
+- **Fail-Fast**: If SCM loading or PPL verification fail, Pulsar logs a critical trace and exits immediately with Win32 exit code `1068` (`ERROR_SERVICE_DEPENDENCY_FAIL`).
+
+#### Uninstalling the Driver
+To cleanly stop and uninstall the driver package from the SCM, run Pulsar with the `--uninstall` flag:
+```bash
+.\target\release\pulsar.exe --uninstall
+```
 
 ### Singularity
-To install and start the driver for testing on a target machine (ensure Test Signing Mode is enabled: `bcdedit /set testsigning on`):
-
+To compile the driver, ensure Test Signing Mode is enabled on the test VM (`bcdedit /set testsigning on`).
+Pulsar automates the service registration during its startup sequence using the INF package, but you can also interact with it manually using standard SCM tools:
 ```cmd
-# Right-click the singularity.inf file and select "Install", or use sc.exe:
-sc create singularity type= kernel binPath= C:\Path\To\singularity.sys
-sc start singularity
+sc query singularity
 ```
