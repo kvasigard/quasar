@@ -25,21 +25,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_PROTECTION_LEVEL_INFORMATION, ProcessProtectionLevelInfo,
 };
 
-/// Executes the pre-flight checks and driver initialization sequence.
-///
-/// This function performs the following sequence:
-/// 1. Verifies that the current process is running with Administrator privileges.
-/// 2. Dynamically locates both the `singularity.inf` and `singularity.sys` files.
-/// 3. Registers and provisions the driver package cleanly using `DiInstallDriverW`.
-/// 4. Starts the kernel driver via the unmodified Service Control Manager module.
-/// 5. Connects to the KMDF driver and requests elevation to PPL-Antimalware.
-/// 6. Verifies that the OS has successfully applied the requested protection level.
-///
-/// # Errors
-///
-/// Returns an `AppError` if any step in the initialization sequence fails, such as
-/// lacking Administrator rights, failing to find or load the driver package components,
-/// failing to communicate with the driver, or failing to acquire PPL status.
+
 /// Executes the pre-flight checks and driver initialization sequence.
 ///
 /// This function performs the following sequence:
@@ -295,9 +281,8 @@ fn is_running_as_admin() -> bool {
 
 /// Queries the OS to verify if the current process has the expected PPL level.
 ///
-/// Returns `true` if the process is protected as PPL-Antimalware (0x31), otherwise `false`.
-///
-/// WARNING: Currently this does not work
+/// Returns `true` if the process is protected as PPL-Antimalware (represented as
+/// `PROTECTION_LEVEL_ANTIMALWARE_LIGHT` = 3 in user-mode API), otherwise `false`.
 fn is_ppl_antimalware() -> bool {
     unsafe {
         // SAFETY: `PROCESS_PROTECTION_LEVEL_INFORMATION` is a plain C-struct.
@@ -319,11 +304,12 @@ fn is_ppl_antimalware() -> bool {
             return false;
         }
 
+        // Note: The user-mode GetProcessInformation API returns an enum value from 0 to 7.
+        // Value 3 corresponds to PROTECTION_LEVEL_ANTIMALWARE_LIGHT.
+        // This is different from the raw kernel PS_PROTECTION byte (0x31) that the driver writes.
         let level = ppl_info.ProtectionLevel;
-        let protection_type = level & 0x07;
-        let signer = (level >> 4) & 0x0F;
+        log::debug!("User-mode process protection level returned: {}", level);
 
-        print!("protection_type = {protection_type}, signer = {signer}");
-        ppl_info.ProtectionLevel == 0x31
+        level == 3
     }
 }
