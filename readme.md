@@ -21,7 +21,7 @@ quasar/
 │       ├── lib.rs            # Library core
 │       ├── error.rs          # Centralized error handling (AppError, HandlerError)
 │       ├── comm/             # Inter-process communication and transport primitives
-│       ├── context/          # SystemContext facade, ProcessTree, and module mapping
+│       ├── context/          # Context database from system events
 │       ├── drivers/          # Driver lifecycle management and SCM control
 │       ├── pipeline/         # Event dispatcher and routing logic
 │       ├── sensors/          # Telemetry ingestion (ETW NT Kernel Logger)
