@@ -88,7 +88,7 @@ impl DirectSyscallSink {
                     );
                 }
             } else {
-                log::debug!(
+                log::trace!(
                     target: "direct_sys",
                     "Unbacked syscall: PID {} TID {} Addr {:#x}",
                     stack.stack_process,

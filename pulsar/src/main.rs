@@ -1,13 +1,11 @@
 //! Pulsar EDR Agent - Main entry point and orchestration.
 
 use std::sync::mpsc;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use clap::Parser;
+use pulsar::cli::Cli;
 use pulsar::error::AppError;
 use pulsar::helpers::symbol_resolver::SymbolResolver;
 use pulsar::pipeline::{Event, EventDispatcher};
@@ -16,45 +14,9 @@ use pulsar::sensors::etw::{EtwSession, KernelSession, KernelSessionBuilder};
 use pulsar::sinks::{direct_sys::DirectSyscallSink, system_context::SystemContextSink};
 use windows_sys::Win32::Foundation::ERROR_SERVICE_DEPENDENCY_FAIL;
 
-/// Pulsar Endpoint Detection and Response (EDR) Telemetry Agent.
-#[derive(Parser, Debug)]
-#[command(
-    name = "pulsar",
-    author = "Quasar Team",
-    version,
-    about = "Lightweight Windows Endpoint Detection and Response (EDR) agent",
-    long_about = "Pulsar is the user-mode agent for the Quasar EDR engine. It manages driver lifecycle, \
-                  spins up real-time NT Kernel Logger ETW sessions, and routes telemetry through \
-                  analytical sinks for behavioral detection and context tracking."
-)]
-pub struct Cli {
-    /// Stop and uninstall the Singularity kernel driver service from SCM and exit.
-    #[arg(short, long)]
-    pub uninstall: bool,
-
-    /// Disable Direct Syscall anomaly detection and kernel stack tracing.
-    #[arg(
-        long,
-        help = "Disable direct syscall anomaly detection and stack tracing"
-    )]
-    pub disable_syscalls: bool,
-
-    /// Disable system process tree and module mapping context tracking.
-    #[arg(
-        long,
-        help = "Disable system process tree and module mapping context tracking"
-    )]
-    pub disable_context: bool,
-
-    /// Skip Singularity driver installation, loading, and PPL elevation (standalone ETW mode).
-    #[arg(
-        long,
-        help = "Skip driver service loading and PPL elevation (standalone ETW mode)"
-    )]
-    pub skip_driver: bool,
-}
-
 /// Handles the `--uninstall` CLI flag by requesting SCM to stop and delete the driver service.
+///
+/// Terminates the process upon completion, exiting with code `0` on success or `1` on failure.
 fn handle_uninstall() {
     log::info!("Uninstall option detected. Initiating Singularity driver teardown...");
     match pulsar::drivers::scm::unload_driver() {
@@ -70,6 +32,14 @@ fn handle_uninstall() {
 }
 
 /// Orchestrates pre-flight driver installation, SCM service start, and PPL-Antimalware elevation.
+///
+/// If `skip_driver` is `false`, invokes [`pulsar::bootstrap::initialize`] to verify administrator
+/// privileges, install/load the Singularity kernel driver, and elevate the process to PPL.
+/// If initialization fails, logs an error and exits the process with `ERROR_SERVICE_DEPENDENCY_FAIL`.
+///
+/// # Arguments
+///
+/// * `skip_driver` - When `true`, bypasses driver initialization and PPL elevation, running the agent in standalone mode.
 fn init_driver_and_ppl(skip_driver: bool) {
     if !skip_driver {
         if let Err(e) = pulsar::bootstrap::initialize() {
@@ -82,10 +52,23 @@ fn init_driver_and_ppl(skip_driver: bool) {
 }
 
 /// Initializes the telemetry ingestion channel, shared symbol resolver, and starts the event dispatcher thread.
+///
+/// Configures and attaches subscribers (e.g. [`DirectSyscallSink`], [`SystemContextSink`]) to the event
+/// dispatcher based on enabled features, and spawns the background worker thread.
+///
+/// # Arguments
+///
+/// * `enable_syscalls` - Whether to register the [`DirectSyscallSink`] for stack tracing and syscall anomaly detection.
+/// * `enable_context` - Whether to register the [`SystemContextSink`] for process and module tracking.
+///
+/// # Returns
+///
+/// A tuple containing:
+/// * The synchronous sender [`mpsc::SyncSender<Event>`] used to ingest ETW events into the channel.
+/// * The [`JoinHandle<()>`] for the background dispatcher worker thread.
 fn setup_event_pipeline(
     enable_syscalls: bool,
     enable_context: bool,
-    shutdown_flag: Arc<AtomicBool>,
 ) -> (mpsc::SyncSender<Event>, JoinHandle<()>) {
     // Inter-thread ring-buffer queue for high throughput
     let (tx, rx) = mpsc::sync_channel::<Event>(1_000_000);
@@ -110,14 +93,33 @@ fn setup_event_pipeline(
     }
 
     if !enable_syscalls && !enable_context {
-        log::warn!("No detection or context sinks were enabled. Running in pass-through ingestion mode.");
+        log::warn!(
+            "No detection or context sinks were enabled. Running in pass-through ingestion mode."
+        );
     }
 
-    let dispatcher_handle = dispatcher.start(shutdown_flag);
+    let dispatcher_handle = dispatcher.start();
     (tx, dispatcher_handle)
 }
 
 /// Configures and starts the NT Kernel Logger ETW session, returning the active session and consumer handle.
+///
+/// Constructs the ETW session according to the active sink configurations, starts trace collection,
+/// and begins consuming events asynchronously via a background thread.
+///
+/// # Arguments
+///
+/// * `enable_syscalls` - Enables ETW kernel providers required for syscall tracing.
+/// * `enable_context` - Enables ETW kernel providers required for process/image context tracking.
+/// * `tx` - Ingestion channel sender passed to the ETW consumer to forward events into the pipeline.
+///
+/// # Returns
+///
+/// A tuple containing the active [`KernelSession`] and the consumer thread [`JoinHandle`].
+///
+/// # Errors
+///
+/// Returns an [`AppError`] if session building, starting, or consumer attachment fails.
 fn start_kernel_session(
     enable_syscalls: bool,
     enable_context: bool,
@@ -141,22 +143,34 @@ fn start_kernel_session(
     Ok((kernel_session, consumer_handle))
 }
 
-/// Registers the Ctrl+C signal handler and blocks the main thread until interruption is received.
-fn wait_for_shutdown(shutdown_flag: Arc<AtomicBool>) {
+/// Registers the Ctrl+C signal handler and blocks the main thread until an interruption signal is received.
+///
+/// # Panics
+///
+/// Panics if setting the Ctrl+C signal handler fails.
+fn wait_for_shutdown() {
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
-    let ctrlc_flag = Arc::clone(&shutdown_flag);
 
     ctrlc::set_handler(move || {
         log::info!("Termination signal detected. Signaling application to stop...");
-        ctrlc_flag.store(true, Ordering::SeqCst);
         let _ = shutdown_tx.send(());
     })
     .expect("Error setting Ctrl-C handler");
 
+    // Pure OS-level wait, 0% CPU usage
     let _ = shutdown_rx.recv();
 }
 
 /// Gracefully stops the ETW kernel trace session and joins background worker threads.
+///
+/// Stops event tracing on the active [`KernelSession`], waits for the ETW consumer thread
+/// to exit, and waits for the dispatcher thread to complete event processing and shut down.
+///
+/// # Arguments
+///
+/// * `kernel_session` - The active ETW kernel session to stop.
+/// * `consumer_handle` - Handle to the ETW consumer background thread to join.
+/// * `dispatcher_handle` - Handle to the event dispatcher background thread to join.
 fn teardown_session(
     mut kernel_session: KernelSession,
     consumer_handle: JoinHandle<Result<(), AppError>>,
@@ -179,11 +193,51 @@ fn teardown_session(
     log::info!("Graceful shutdown complete. All resources freed successfully.");
 }
 
-fn main() {
-    // Initialize logging from environment (supports dynamic RUST_LOG configuration, defaulting to info)
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+/// Initializes the `env_logger` subsystem according to command-line parameters and environment variables.
+///
+/// If `--log-file` is provided, redirects log output to the target file in append mode.
+/// Otherwise, default stderr/stdout console logging is used. If `--log-mode` is supplied,
+/// applies the specified [`log::LevelFilter`], falling back to the `RUST_LOG` environment
+/// variable or `"info"` by default.
+///
+/// # Arguments
+///
+/// * `cli` - Parsed command-line arguments.
+fn init_logger(cli: &Cli) {
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
 
+    if let Some(log_mode) = cli.log_mode {
+        builder.filter_level(log_mode.into());
+    }
+
+    if let Some(ref log_path) = cli.log_file {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            Ok(file) => {
+                builder.target(env_logger::Target::Pipe(Box::new(file)));
+            }
+            Err(e) => {
+                eprintln!("Failed to open log file '{}': {}", log_path.display(), e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    builder.init();
+}
+
+/// Application entry point for the Pulsar EDR agent.
+///
+/// Parses command-line arguments, orchestrates driver bootstrap, configures the event pipeline
+/// and ETW session, and manages execution lifecycle until termination.
+fn main() {
     let cli = Cli::parse();
+    init_logger(&cli);
+
     log::debug!("Parsed CLI configuration: {:?}", cli);
 
     if cli.uninstall {
@@ -192,19 +246,21 @@ fn main() {
 
     log::info!("Starting Quasar EDR Engine (Pulsar)...");
 
-    // Phase 1: Initialize driver and request PPL elevation
+    // Initialize driver and request PPL elevation
     init_driver_and_ppl(cli.skip_driver);
 
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-
-    // Phase 2: Setup event bus and dispatching pipeline
+    // Setup event bus and dispatching pipeline
     let enable_syscalls = !cli.disable_syscalls;
     let enable_context = !cli.disable_context;
 
-    let (tx, dispatcher_handle) =
-        setup_event_pipeline(enable_syscalls, enable_context, Arc::clone(&shutdown_flag));
+    // TODO: Currently the setup_event_pipline does not follow the Open-Closed
+    // principle; everytime a new functionality is added we need to change the
+    // funtion signature. In the future consider using a global configuration.
+    // To be future-prove that configuration shall be able to change the EDR
+    // behaviour at runtime.
+    let (tx, dispatcher_handle) = setup_event_pipeline(enable_syscalls, enable_context);
 
-    // Phase 3: Build and start NT Kernel Logger ETW session
+    // Build and start NT Kernel Logger ETW session
     let (kernel_session, consumer_handle) =
         match start_kernel_session(enable_syscalls, enable_context, tx) {
             Ok(handles) => handles,
@@ -214,11 +270,13 @@ fn main() {
             }
         };
 
-    log::info!("Quasar EDR Engine is active and capturing telemetry. Press Ctrl+C to safely stop...");
+    log::info!(
+        "Quasar EDR Engine is active and capturing telemetry. Press Ctrl+C to safely stop..."
+    );
 
-    // Phase 4: Wait for user termination signal
-    wait_for_shutdown(shutdown_flag);
+    // Wait for user termination signal
+    wait_for_shutdown();
 
-    // Phase 5: Teardown session and join worker threads
+    // Teardown session and join worker threads
     teardown_session(kernel_session, consumer_handle, dispatcher_handle);
 }

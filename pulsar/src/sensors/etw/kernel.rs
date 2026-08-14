@@ -100,48 +100,50 @@ pub enum KernelFlag {
 ///
 /// `record` must be a valid pointer to an `EVENT_RECORD` provided by the ETW runtime.
 unsafe extern "system" fn etw_callback(record: *mut EVENT_RECORD) {
-    if record.is_null() {
-        return;
-    }
-
-    // SAFETY: Already checked for null
-    unsafe {
-        let ctx_ptr = (*record).UserContext as *mut TraceContext;
-        if ctx_ptr.is_null() {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if record.is_null() {
             return;
         }
 
-        // Discard System (4), Idle (0), and our own tracer PID to avoid infinite loops
-        // or processing irrelevant background OS noise.
-        let process_id = (*record).EventHeader.ProcessId;
-        let current_pid = (*ctx_ptr).current_pid;
+        // SAFETY: Already checked for null
+        unsafe {
+            let ctx_ptr = (*record).UserContext as *mut TraceContext;
+            if ctx_ptr.is_null() {
+                return;
+            }
 
-        if process_id == 0 || process_id == 4 || process_id == current_pid {
-            return;
-        }
+            // Discard System (4), Idle (0), and our own tracer PID to avoid infinite loops
+            // or processing irrelevant background OS noise.
+            let process_id = (*record).EventHeader.ProcessId;
+            let current_pid = (*ctx_ptr).current_pid;
 
-        // Parse and send the event to the Dispatcher.
-        if let Some(event_record) = EventRecord::from_raw(record) {
-            let event = Event::Etw(event_record);
+            if process_id == 0 || process_id == 4 || process_id == current_pid {
+                return;
+            }
 
-            if let Err(err) = (*ctx_ptr).sender.try_send(event) {
-                match err {
-                    TrySendError::Full(_) => {
-                        // Warn only once if the channel is full
-                        if !(*ctx_ptr).channel_full_warned.swap(true, Ordering::Relaxed) {
-                            log::warn!(
-                                target: "etw_kernel",
-                                "The event channel reached its maximum capacity. Some events might be dropped."
-                            );
+            // Parse and send the event to the Dispatcher.
+            if let Some(event_record) = EventRecord::from_raw(record) {
+                let event = Event::Etw(event_record);
+
+                if let Err(err) = (*ctx_ptr).sender.try_send(event) {
+                    match err {
+                        TrySendError::Full(_) => {
+                            // Warn only once if the channel is full
+                            if !(*ctx_ptr).channel_full_warned.swap(true, Ordering::Relaxed) {
+                                log::warn!(
+                                    target: "etw_kernel",
+                                    "The event channel reached its maximum capacity. Some events might be dropped."
+                                );
+                            }
                         }
-                    }
-                    TrySendError::Disconnected(_) => {
-                        // Channel dropped, gracefully ignore as shutdown is in progress
+                        TrySendError::Disconnected(_) => {
+                            // Channel dropped, gracefully ignore as shutdown is in progress
+                        }
                     }
                 }
             }
         }
-    }
+    }));
 }
 
 /// Singleton guard ensuring only one NT Kernel Logger is created concurrently.

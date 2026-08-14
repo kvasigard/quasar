@@ -2,17 +2,9 @@
 
 use crate::context::TREE;
 use crate::context::process::{LoadedModule, ProcessContext, ProcessKey};
+use crate::error::HandlerError;
 use crate::helpers::strings::*;
 use crate::sensors::etw::EventRecord;
-
-/// Deserialization and resolution errors encountered during ETW payload handling.
-#[derive(Debug)]
-pub enum HandlerError {
-    /// Payload buffer length is smaller than the required fixed structure header.
-    PayloadTooShort { expected: usize, actual: usize },
-    /// Process ID does not exist in the active process tree.
-    ProcessNotFound(u32),
-}
 
 /// Handles process creation and rundown events (`OPCODE_PROCESS_START` / `OPCODE_PROCESS_DC_START`).
 ///

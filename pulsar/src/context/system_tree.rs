@@ -9,19 +9,18 @@ use crate::context::process::{ProcessContext, ProcessKey};
 
 /// Concurrent graph and relational storage container for process trees.
 ///
-/// **Why a Two-Tier Architecture?**
-/// 1. `active_pids`: Fast O(1) table mapping raw OS PIDs to synthetic `ProcessKey`s.
+/// * `active_pids`: Fast O(1) table mapping raw OS PIDs to synthetic `ProcessKey`s.
 ///    Only holds running processes so recycled PIDs never collide.
-/// 2. `processes`: The historical context arena. Holds active AND recently dead
+/// * `processes`: The historical context arena. Holds active AND recently dead
 ///    processes for forensic lineage lookups.
-/// 3. `retention_queue`: Time-ordered FIFO queue to prune old exited processes
+/// * `retention_queue`: Time-ordered FIFO queue to prune old exited processes
 ///    and prevent memory leaks.
 pub struct SystemTree {
-    /// Ingress index: Active PID -> Current ProcessKey.
+    /// This structure maps an active PID to its current ProcessKey.
     active_pids: RwLock<HashMap<u32, ProcessKey>>,
-    /// Relational Arena: `ProcessKey` -> `Arc<ProcessContext>`.
+    /// This structure provides the ProcessContext for any given ProcessKey.
     processes: RwLock<HashMap<ProcessKey, Arc<ProcessContext>>>,
-    /// Retention Tracker: (ProcessKey, ExitTimestamp) ordered by termination time.
+    /// This structure helps to purge the exited process till a certain timestamp.
     retention_queue: RwLock<VecDeque<(ProcessKey, i64)>>,
 }
 
@@ -53,7 +52,7 @@ impl SystemTree {
         let parent_pid = context.parent_pid;
         let key = context.key;
 
-        // Step 1: Look up parent's synthetic key via the active PID index
+        // Look up parent's synthetic key via the active PID index
         let resolved_parent_key = {
             let active = self.active_pids.read().unwrap();
             active.get(&parent_pid).copied()
@@ -62,17 +61,18 @@ impl SystemTree {
         context.parent_key = resolved_parent_key;
         let context_arc = Arc::new(context);
 
-        // Step 2: Register in historical arena and link under parent's child list
+        // Register in historical arena and link under parent's child list
         {
             let mut arena = self.processes.write().unwrap();
             arena.insert(key, Arc::clone(&context_arc));
 
-            if let Some(parent_ctx) = resolved_parent_key.and_then(|parent_k| arena.get(&parent_k)) {
+            if let Some(parent_ctx) = resolved_parent_key.and_then(|parent_k| arena.get(&parent_k))
+            {
                 parent_ctx.child_keys.write().unwrap().insert(key);
             }
         }
 
-        // Step 3: Activate PID routing for incoming telemetry
+        // Activate PID routing for incoming telemetry
         {
             let mut active = self.active_pids.write().unwrap();
             active.insert(pid, key);
@@ -103,13 +103,13 @@ impl SystemTree {
         exit_status: u32,
         timestamp: i64,
     ) -> Option<Arc<ProcessContext>> {
-        // Step 1: Remove from active PID routing so recycled PIDs do not hit an exited instance
+        // Remove from active PID routing so recycled PIDs do not hit an exited instance
         let key = {
             let mut active = self.active_pids.write().unwrap();
             active.remove(&pid)?
         };
 
-        // Step 2: Mark termination in historical arena and enqueue for deferred cleanup
+        // Mark termination in historical arena and enqueue for deferred cleanup
         let arena = self.processes.read().unwrap();
         if let Some(context) = arena.get(&key) {
             context.mark_terminated(exit_status, timestamp);

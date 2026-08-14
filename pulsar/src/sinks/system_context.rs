@@ -137,7 +137,7 @@ impl Subscriber for SystemContextSink {
         if let Err(err) = result {
             log::warn!(
                 target: "system_context",
-                "Failed to process lifecycle event (Opcode: {}) for PID {}: {err:?}",
+                "Failed to process lifecycle event (Opcode: {}) for PID {}: {err}",
                 record.opcode,
                 record.process_id
             );

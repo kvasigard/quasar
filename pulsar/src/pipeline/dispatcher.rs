@@ -2,10 +2,8 @@
 
 use crate::pipeline::Event;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::Receiver;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 /// The subscriber contract defining interest evaluation and event handling.
 pub trait Subscriber: Send + Sync {
@@ -58,39 +56,25 @@ impl EventDispatcher {
 
     /// Launches the dispatch routing loop in a background worker thread.
     ///
-    /// # Arguments
-    ///
-    /// * `shutdown_flag` - Atomic flag checked periodically to initiate graceful termination.
-    ///
     /// # Returns
     ///
     /// A `JoinHandle` for the spawned background thread.
-    pub fn start(self, shutdown_flag: Arc<AtomicBool>) -> JoinHandle<()> {
+    pub fn start(self) -> JoinHandle<()> {
         thread::spawn(move || {
             log::debug!(target: "dispatcher", "EventDispatcher background thread started.");
 
-            // Loop until the shutdown flag is set to true
-            while !shutdown_flag.load(Ordering::SeqCst) {
-                match self.rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(event) => {
-                        let event_ptr = Arc::new(event);
+            while let Ok(event) = self.rx.recv() {
+                let event_ptr = Arc::new(event);
 
-                        for sub in &self.subscribers {
-                            if sub.is_interested(&event_ptr) {
-                                sub.on_event(&event_ptr);
-                            }
-                        }
-                    }
-                    Err(RecvTimeoutError::Timeout) => {
-                        continue;
-                    }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        break;
+                for sub in &self.subscribers {
+                    if sub.is_interested(&event_ptr) {
+                        sub.on_event(&event_ptr);
                     }
                 }
-            }
+            } // Closing or dropping the sender (tx) will naturally cause rx.recv() to return
+            // Err(RecvTimeoutError::Disconnected) instantly.
 
-            log::debug!(target: "dispatcher", "Event bus stopped by signal or disconnection. Dispatcher terminating.");
+            log::debug!(target: "dispatcher", "Event bus channel closed. Dispatcher terminating.");
         })
     }
 }

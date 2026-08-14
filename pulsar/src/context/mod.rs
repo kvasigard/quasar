@@ -7,6 +7,7 @@ pub mod system_tree;
 use std::sync::LazyLock;
 
 // Re-export common types for ergonomics across sink implementations
+pub use crate::error::HandlerError;
 pub use handlers::*;
 pub use process::{LoadedModule, ProcessContext, ProcessKey};
 pub use system_tree::SystemTree;
