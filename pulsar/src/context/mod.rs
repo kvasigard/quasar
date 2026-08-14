@@ -2,7 +2,8 @@
 
 pub mod handlers;
 pub mod process;
-pub mod system_tree;
+pub mod process_tree;
+pub mod system;
 
 use std::sync::LazyLock;
 
@@ -10,7 +11,7 @@ use std::sync::LazyLock;
 pub use crate::error::HandlerError;
 pub use handlers::*;
 pub use process::{LoadedModule, ProcessContext, ProcessKey};
-pub use system_tree::SystemTree;
+pub use system::SystemContext;
 
-/// Global singleton instance of the `SystemTree`.
-pub static TREE: LazyLock<SystemTree> = LazyLock::new(SystemTree::new);
+/// Global singleton
+pub static CONTEXT: LazyLock<SystemContext> = LazyLock::new(SystemContext::new);

@@ -15,7 +15,7 @@ use crate::context::process::{ProcessContext, ProcessKey};
 ///    processes for forensic lineage lookups.
 /// * `retention_queue`: Time-ordered FIFO queue to prune old exited processes
 ///    and prevent memory leaks.
-pub struct SystemTree {
+pub struct ProcessTree {
     /// This structure maps an active PID to its current ProcessKey.
     active_pids: RwLock<HashMap<u32, ProcessKey>>,
     /// This structure provides the ProcessContext for any given ProcessKey.
@@ -24,12 +24,12 @@ pub struct SystemTree {
     retention_queue: RwLock<VecDeque<(ProcessKey, i64)>>,
 }
 
-impl SystemTree {
-    /// Creates a new empty `SystemTree`.
+impl ProcessTree {
+    /// Creates a new empty `ProcessTree`.
     ///
     /// # Returns
     ///
-    /// An empty `SystemTree` with initialized indices.
+    /// An empty `ProcessTree` with initialized indices.
     pub fn new() -> Self {
         Self {
             active_pids: RwLock::new(HashMap::new()),
@@ -226,7 +226,7 @@ impl SystemTree {
     }
 }
 
-impl Default for SystemTree {
+impl Default for ProcessTree {
     fn default() -> Self {
         Self::new()
     }

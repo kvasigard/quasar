@@ -1,6 +1,6 @@
 //! Ingestion handlers and binary parsers for NT Kernel Logger ETW telemetry.
 
-use crate::context::TREE;
+use crate::context::CONTEXT;
 use crate::context::process::{LoadedModule, ProcessContext, ProcessKey};
 use crate::error::HandlerError;
 use crate::helpers::strings::*;
@@ -14,7 +14,7 @@ use crate::sensors::etw::EventRecord;
 ///
 /// # Returns
 ///
-/// `Ok(())` on successful insertion into `TREE`, or `Err(HandlerError)` if payload is malformed.
+/// `Ok(())` on successful insertion into `SystemContext`, or `Err(HandlerError)` if payload is malformed.
 ///
 /// # Errors
 ///
@@ -55,7 +55,7 @@ pub fn handle_process_start(record: &EventRecord) -> Result<(), HandlerError> {
     context.package_full_name = package_full_name;
     context.application_id = application_id;
 
-    TREE.insert_process(context);
+    CONTEXT.insert_process(context);
     Ok(())
 }
 
@@ -86,7 +86,7 @@ pub fn handle_process_exit(record: &EventRecord) -> Result<(), HandlerError> {
     let pid = u32::from_ne_bytes(data[8..12].try_into().unwrap());
     let exit_status = u32::from_ne_bytes(data[20..24].try_into().unwrap());
 
-    if TREE
+    if CONTEXT
         .exit_process(pid, exit_status, record.timestamp)
         .is_none()
     {
@@ -141,7 +141,7 @@ pub fn handle_image_load(record: &EventRecord) -> Result<(), HandlerError> {
         default_base,
     };
 
-    if let Some(ctx) = TREE.get_by_pid(pid) {
+    if let Some(ctx) = CONTEXT.get_process(pid) {
         ctx.record_module_load(module);
     } else {
         return Err(HandlerError::ProcessNotFound(pid));
@@ -177,7 +177,7 @@ pub fn handle_image_unload(record: &EventRecord) -> Result<(), HandlerError> {
     let image_base = u64::from_ne_bytes(data[0..8].try_into().unwrap());
     let pid = u32::from_ne_bytes(data[16..20].try_into().unwrap());
 
-    if let Some(ctx) = TREE.get_by_pid(pid) {
+    if let Some(ctx) = CONTEXT.get_process(pid) {
         ctx.record_module_unload(image_base);
     }
 

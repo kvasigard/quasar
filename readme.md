@@ -16,11 +16,12 @@ quasar/
 ├── shared/                   # Common definitions between um and km (IOCTLs, Structs)
 ├── pulsar/                   # Core EDR Engine (User-Mode)
 │   └── src/
-│       ├── main.rs           # Modularized orchestration & CLI parsing
+│       ├── main.rs           # Orchestration & lifecycle management
+│       ├── cli.rs            # Command-line interface definitions and LogMode
 │       ├── lib.rs            # Library core
-│       ├── error.rs          # Custom AppError implementation
+│       ├── error.rs          # Centralized error handling (AppError, HandlerError)
 │       ├── comm/             # Inter-process communication and transport primitives
-│       ├── context/          # In-memory process graph and module mapping topology
+│       ├── context/          # SystemContext facade, ProcessTree, and module mapping
 │       ├── drivers/          # Driver lifecycle management and SCM control
 │       ├── pipeline/         # Event dispatcher and routing logic
 │       ├── sensors/          # Telemetry ingestion (ETW NT Kernel Logger)
@@ -52,7 +53,7 @@ At the time of writing this, the project features are aligned with only one purp
 
 ### Detections & Analytics
 * **Direct Syscall Detection:** Identifies processes attempting to bypass standard user-land API hooking by executing `syscall` instructions directly. It achieves this by capturing kernel-level system call events and utilizing stack unwinding/correlation to verify if the execution origin is legitimate.
-* **Process & Context Tracking:** Maintains an in-memory graph (`SystemTree`) mapping active process lifecycles, DLL image loads, and ancestry hierarchies with $O(1)$ lookups and historical retention.
+* **Process & Context Tracking:** Maintains an in-memory graph (`SystemContext` / `ProcessTree`) mapping active process lifecycles, DLL image loads, and ancestry hierarchies with $O(1)$ lookups and historical retention.
 
 ## Prerequisites
 
@@ -101,10 +102,12 @@ cargo run --release
 ```
 
 #### CLI Configuration Flags
-All detection and telemetry features are **enabled by default**. You can pass CLI flags to disable specific subsystems:
+All detection and telemetry features are **enabled by default**. You can pass CLI flags to disable specific subsystems or configure runtime behavior:
 
 | Option | Description |
 | :--- | :--- |
+| `-l, --log-mode <LEVEL>` | Sets the logging verbosity level (`off`, `error`, `warn`, `info`, `debug`, `trace`). |
+| `-f, --log-file <PATH>` | Redirects log output to the specified file in append mode instead of the console. |
 | `--disable-syscalls` | Disables direct syscall anomaly detection and ETW kernel stack tracing. |
 | `--disable-context` | Disables process tree and module mapping context tracking. |
 | `--skip-driver` | Skips Singularity kernel driver loading and PPL elevation (useful for standalone ETW inspection). |
@@ -115,6 +118,12 @@ All detection and telemetry features are **enabled by default**. You can pass CL
 ```powershell
 # Run with all features enabled (default)
 .\target\release\pulsar.exe
+
+# Run with debug logging enabled
+.\target\release\pulsar.exe --log-mode debug
+
+# Write trace logs directly to a file
+.\target\release\pulsar.exe -l trace -f C:\logs\pulsar.log
 
 # Run in standalone ETW mode without driver/PPL elevation
 .\target\release\pulsar.exe --skip-driver
@@ -127,17 +136,10 @@ All detection and telemetry features are **enabled by default**. You can pass CL
 ```
 
 #### Logging Configuration
-Set the `RUST_LOG` environment variable to configure runtime log verbosity:
-
-```powershell
-# Enable debug logs
-$env:RUST_LOG="debug"
-cargo run
-
-# Enable high-frequency trace logging
-$env:RUST_LOG="trace"
-cargo run
-```
+Logging can be controlled via CLI flags or the `RUST_LOG` environment variable:
+- **CLI Flag (Recommended):** Use `-l, --log-mode <LEVEL>` (`off`, `error`, `warn`, `info`, `debug`, `trace`).
+- **File Redirection:** Use `-f, --log-file <PATH>` to output logs to a file.
+- **Environment Variable Fallback:** Set `$env:RUST_LOG="debug"` or `$env:RUST_LOG="trace"`.
 
 To stop the agent, press `Ctrl+C`. The application will intercept the termination signal and initiate a graceful shutdown, safely stopping the ETW kernel session and releasing system resources.
 
