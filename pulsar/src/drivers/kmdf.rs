@@ -1,3 +1,5 @@
+//! RAII wrapper and IOCTL dispatch client for the Singularity KMDF kernel driver.
+
 use std::ffi::c_void;
 use std::ptr;
 
@@ -10,11 +12,12 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
+/// Safe RAII handle to the `\Device\SingularityDevice` kernel device object.
 pub struct Singularity(HANDLE);
 
 impl Drop for Singularity {
     fn drop(&mut self) {
-        log::trace!("Droping Singularity KMDF handle");
+        log::trace!(target: "kmdf", "Dropping Singularity KMDF handle");
         if self.0 != INVALID_HANDLE_VALUE {
             // SAFETY: The handle is guaranteed valid or INVALID_HANDLE_VALUE.
             unsafe {
@@ -25,7 +28,15 @@ impl Drop for Singularity {
 }
 
 impl Singularity {
-    /// Acquires a handle to interact with the KMDF driver.
+    /// Acquires a handle to interact with the KMDF driver via `CreateFileW`.
+    ///
+    /// # Returns
+    ///
+    /// An initialized `Singularity` client handle on success, or an `AppError` on Win32 failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AppError::WindowsApi` if the device file cannot be opened (e.g. driver not loaded).
     pub fn connect() -> Result<Self, AppError> {
         let device_path = windows_sys::w!("\\\\.\\SingularityDevice");
 
@@ -47,15 +58,24 @@ impl Singularity {
             return Err(win_last_error!());
         }
 
-        log::debug!("Successfully acquired handle to Singularity KMDF driver.");
+        log::debug!(target: "kmdf", "Successfully acquired handle to Singularity KMDF driver.");
 
         Ok(Self(handle))
     }
 
     /// Dispatches a strongly-typed IOCTL command to the KMDF driver.
     ///
-    /// This generic implementation automatically handles memory sizing, pointer casting,
-    /// and output buffer initialization based on the `IoctlCommand` trait definition.
+    /// # Arguments
+    ///
+    /// * `command` - Concrete reference to an `IoctlMessage` payload.
+    ///
+    /// # Returns
+    ///
+    /// The decoded `C::Response` structure populated by the driver.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AppError::WindowsApi` if `DeviceIoControl` fails.
     pub fn send<C: IoctlMessage>(&self, command: &C) -> Result<C::Response, AppError> {
         // Prepare an uninitialized memory block for the exact type of the expected response.
         let mut response = std::mem::MaybeUninit::<C::Response>::uninit();
@@ -67,7 +87,7 @@ impl Singularity {
         let output_ptr = response.as_mut_ptr() as *mut c_void;
         let output_size = size_of::<C::Response>() as u32;
 
-        log::debug!("Dispatching IOCTL: {:#X}", C::CODE);
+        log::debug!(target: "kmdf", "Dispatching IOCTL: {:#X}", C::CODE);
 
         // SAFETY:
         // - `self.0` is guaranteed to be a valid handle by the `connect` constructor.
@@ -92,7 +112,6 @@ impl Singularity {
 
         // SAFETY: If DeviceIoControl returns non-zero, the kernel driver has successfully
         // populated the output buffer. It is now safe to assume the memory is initialized.
-        // For types like `()`, size_of is 0, and reading it is inherently safe.
         let initialized_response = unsafe { response.assume_init() };
 
         Ok(initialized_response)

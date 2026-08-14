@@ -8,7 +8,7 @@ Quasar is designed as a multi-component workspace, split between user-mode analy
 
 * **Pulsar (User-Mode):** This is the user-mode agent in charge of collecting system telemetry and routing it through an internal processing pipeline for real-time analysis. It manages data ingestion via "Sensors", dispatches the events across threads without blocking, and feeds them into analytical "Sinks" where the actual detection logic lives. It also orchestrates kernel-mode component lifecycles.
 * **Singularity (Kernel-Mode):** A Windows Kernel-Mode Driver Framework (KMDF) driver written purely in Rust. It serves as the privileged component of the EDR, providing deep system visibility, Direct Kernel Object Manipulation (DKOM) capabilities, and robust event tracing that is otherwise inaccessible from user-land.
-* **Shared:** A common Rust crate used to bridge the gap between `pulsar` and `singularity`. It houses shared data structures, enum definitions, and IOCTL codes ensuring strict memory layout and communication consistency between user-mode and kernel-mode.
+* **Shared:** A common `no_std` Rust crate used to bridge the gap between `pulsar` and `singularity`. It houses shared data structures, enum definitions, and IOCTL codes ensuring strict memory layout and communication consistency between user-mode and kernel-mode.
 
 ## Project Structure
 ```text
@@ -16,15 +16,16 @@ quasar/
 ├── shared/                   # Common definitions between um and km (IOCTLs, Structs)
 ├── pulsar/                   # Core EDR Engine (User-Mode)
 │   └── src/
-│       ├── main.rs           # Entry point and initialization
+│       ├── main.rs           # Modularized orchestration & CLI parsing
 │       ├── lib.rs            # Library core
 │       ├── error.rs          # Custom AppError implementation
 │       ├── comm/             # Inter-process communication and transport primitives
+│       ├── context/          # In-memory process graph and module mapping topology
 │       ├── drivers/          # Driver lifecycle management and SCM control
 │       ├── pipeline/         # Event dispatcher and routing logic
-│       ├── sensors/          # Telemetry ingestion 
-│       ├── sinks/            # Analytical detection modules 
-│       └── helpers/          
+│       ├── sensors/          # Telemetry ingestion (ETW NT Kernel Logger)
+│       ├── sinks/            # Analytical detection modules (DirectSyscallSink, SystemContextSink)
+│       └── helpers/          # Stack correlator, symbol resolver, string decoding
 └── singularity/              # KMDF Driver (Kernel-Mode)
     ├── .cargo/config.toml    # Compiler flags for kernel environment
     ├── Makefile.toml         # cargo-make configuration for driver packaging
@@ -47,10 +48,11 @@ quasar/
 At the time of writing this, the project features are aligned with only one purpose: detect stack anomalies. More features will be added hopefully in the future.
 
 ### Telemetry Sources
-* **ETW (Event Tracing for Windows):** Programmatically builds, starts, and consumes NT Kernel Logger ETW sessions. This allows the engine to capture real-time, high-fidelity and verbose system events (like system calls) directly from the Windows kernel.
+* **ETW (Event Tracing for Windows):** Programmatically builds, starts, and consumes NT Kernel Logger ETW sessions. This allows the engine to capture real-time, high-fidelity, and verbose system events (like system calls and process/image lifecycles) directly from the Windows kernel.
 
-### Detections
-* **Direct Syscall:** Identifies processes attempting to bypass standard user-land API hooking by executing `syscall` instructions directly. It achieves this by capturing kernel-level system call events and utilizing stack unwinding/correlation to verify if the execution origin is legitimate.
+### Detections & Analytics
+* **Direct Syscall Detection:** Identifies processes attempting to bypass standard user-land API hooking by executing `syscall` instructions directly. It achieves this by capturing kernel-level system call events and utilizing stack unwinding/correlation to verify if the execution origin is legitimate.
+* **Process & Context Tracking:** Maintains an in-memory graph (`SystemTree`) mapping active process lifecycles, DLL image loads, and ancestry hierarchies with $O(1)$ lookups and historical retention.
 
 ## Prerequisites
 
@@ -69,7 +71,7 @@ From the workspace root, build the agent using standard Cargo commands:
 
 ```bash
 # Clone the repository
-git clone [https://github.com/kvasigard/quasar.git](https://github.com/kvasigard/quasar.git)
+git clone https://github.com/kvasigard/quasar.git
 cd quasar
 
 # Build the release version
@@ -87,8 +89,8 @@ The final, isolated driver package will be output to `target/<debug|release>/sin
 
 ## Usage
 
-### Pulsar
-Due to the restrictions of the Windows ETW API, you must run the compiled binary as an **Administrator**.
+### Pulsar (Command-Line Options)
+Due to the restrictions of the Windows ETW API, you must run the compiled binary in an **Administrator** terminal.
 
 ```bash
 # Run directly with cargo (must be in an Admin shell)
@@ -98,14 +100,46 @@ cargo run --release
 .\target\release\pulsar.exe
 ```
 
-Set the `RUST_LOG` environment variable to configure logging output:
+#### CLI Configuration Flags
+All detection and telemetry features are **enabled by default**. You can pass CLI flags to disable specific subsystems:
 
-```bash
+| Option | Description |
+| :--- | :--- |
+| `--disable-syscalls` | Disables direct syscall anomaly detection and ETW kernel stack tracing. |
+| `--disable-context` | Disables process tree and module mapping context tracking. |
+| `--skip-driver` | Skips Singularity kernel driver loading and PPL elevation (useful for standalone ETW inspection). |
+| `-u, --uninstall` | Stops and unregisters the Singularity driver service from the SCM and exits. |
+| `-h, --help` | Displays the help menu with all available options. |
+
+#### Examples
+```powershell
+# Run with all features enabled (default)
+.\target\release\pulsar.exe
+
+# Run in standalone ETW mode without driver/PPL elevation
+.\target\release\pulsar.exe --skip-driver
+
+# Disable direct syscall detection (run context tracking only)
+.\target\release\pulsar.exe --disable-syscalls
+
+# Disable context tracking (run syscall detection only)
+.\target\release\pulsar.exe --disable-context
+```
+
+#### Logging Configuration
+Set the `RUST_LOG` environment variable to configure runtime log verbosity:
+
+```powershell
+# Enable debug logs
 $env:RUST_LOG="debug"
+cargo run
+
+# Enable high-frequency trace logging
+$env:RUST_LOG="trace"
 cargo run
 ```
 
-To stop the agent, press `Ctrl+C`. The application will intercept the termination signal and initiate a graceful shutdown, safely unregistering the ETW sessions and freeing system resources. 
+To stop the agent, press `Ctrl+C`. The application will intercept the termination signal and initiate a graceful shutdown, safely stopping the ETW kernel session and releasing system resources.
 
 #### Automated Driver Lifecycle
 Pulsar automatically manages the driver's SCM lifecycle:

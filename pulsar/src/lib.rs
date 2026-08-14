@@ -2,6 +2,7 @@
 
 pub mod bootstrap;
 pub mod comm;
+pub mod context;
 pub mod drivers;
 pub mod error;
 pub mod helpers;

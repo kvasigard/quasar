@@ -1,39 +1,39 @@
-//! Centralized application error type.
-//!
-//! This module defines the primary error enum used across the entire
-//! application. It provides idiomatic Rust error handling while also
-//! supporting Windows API failures through windows-rs.
+//! Centralized application error type and Windows API error decoding.
 
 use std::fmt;
 
-/// Main error type for the application.
+/// Main error type for the Pulsar application.
 ///
-/// This enum intentionally keeps the number of variants small.
-/// - `WindowsApi` is used for any failure originating from Win32 calls.
-/// - `Bootstrap` is used for initialization sequence failures (e.g., driver missing, privileges).
-/// - `Internal` is used for unexpected states or logic errors inside the app.
+/// Variants:
+/// - `WindowsApi` is used for any failure originating from Win32 / NTAPI calls.
+/// - `Bootstrap` is used for initialization sequence failures (e.g. driver missing, lack of admin privileges).
+/// - `Internal` is used for unexpected internal states or logic errors.
 #[derive(Debug)]
 pub enum AppError {
     /// Represents an error returned by the Windows API.
     ///
-    /// `code` is the raw Win32 error code (GetLastError).
-    /// `message` is a human-readable description obtained via FormatMessageW.
+    /// `code` is the raw Win32 error code (`GetLastError`).
+    /// `message` is a human-readable description obtained via `FormatMessageW`.
     WindowsApi { code: u32, message: String },
 
     /// Represents an error encountered during the bootstrap/initialization phase.
     Bootstrap(String),
 
-    /// Represents internal application errors that are not related to Win32.
-    ///
-    /// This is a flexible catch‑all for logic errors, invalid states,
-    /// or any other unexpected condition.
+    /// Represents internal application errors that are not directly caused by Win32.
     Internal(String),
 }
 
 impl AppError {
     /// Creates a Windows API error variant.
     ///
-    /// This is typically used together with the `win_last_error!()` macro.
+    /// # Arguments
+    ///
+    /// * `code` - Win32 error code.
+    /// * `message` - Human readable error description.
+    ///
+    /// # Returns
+    ///
+    /// An `AppError::WindowsApi` instance.
     pub fn from_win32(code: u32, message: impl Into<String>) -> Self {
         Self::WindowsApi {
             code,
@@ -42,11 +42,27 @@ impl AppError {
     }
 
     /// Creates a Bootstrap error variant.
+    ///
+    /// # Arguments
+    ///
+    /// * `msg` - Bootstrap failure description.
+    ///
+    /// # Returns
+    ///
+    /// An `AppError::Bootstrap` instance.
     pub fn bootstrap(msg: impl Into<String>) -> Self {
         Self::Bootstrap(msg.into())
     }
 
     /// Creates an internal error variant.
+    ///
+    /// # Arguments
+    ///
+    /// * `msg` - Internal error description.
+    ///
+    /// # Returns
+    ///
+    /// An `AppError::Internal` instance.
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
     }
@@ -68,11 +84,7 @@ impl std::error::Error for AppError {}
 
 /// Macro that retrieves the last Windows error code and message.
 ///
-/// This macro calls:
-/// - `GetLastError()` to obtain the raw Win32 error code.
-/// - `FormatMessageW()` to convert it into a readable string.
-///
-/// It returns an `AppError::WindowsApi`.
+/// Calls `GetLastError()` and `FormatMessageW()` to build an `AppError::WindowsApi`.
 #[macro_export]
 macro_rules! win_last_error {
     () => {{

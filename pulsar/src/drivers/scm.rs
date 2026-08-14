@@ -1,7 +1,6 @@
-//! Provides functionality for managing Windows kernel drivers.
+//! Provides functionality for managing Windows kernel drivers via the Service Control Manager.
 //!
-//! This module interacts with the Windows Service Control Manager (SCM) to
-//! register, start, stop, and delete kernel drivers dynamically at runtime.
+//! Interacts with the Windows SCM to register, start, stop, query, and delete kernel drivers dynamically.
 
 use crate::error::AppError;
 use crate::win_last_error;
@@ -21,16 +20,13 @@ use windows_sys::Win32::System::Services::{
 
 /// A safe RAII wrapper around Windows Service Control handles.
 ///
-/// Automatically closes the underlying handle when it falls out of scope,
-/// preventing handle leaks.
+/// Automatically closes the underlying handle when dropped to prevent resource leaks.
 struct ScmHandle(*mut c_void);
 
 impl Drop for ScmHandle {
     fn drop(&mut self) {
-        // Enforce that we do not attempt to close invalid/null handles
         if !self.0.is_null() {
-            // SAFETY: The handle is guaranteed to be valid and owned by this struct.
-            // It is safe to close, and doing so prevents resource leaks.
+            // SAFETY: The handle is guaranteed valid and owned by this struct.
             unsafe {
                 CloseServiceHandle(self.0);
             }
@@ -40,22 +36,22 @@ impl Drop for ScmHandle {
 
 /// Registers and starts the kernel driver located at the specified path.
 ///
-/// This function attempts to open the Service Control Manager, create a new
-/// service entry for the driver (or open it if it already exists), and then
-/// starts the service.
+/// # Arguments
+///
+/// * `driver_path` - The absolute filesystem path to the `.sys` driver binary.
+///
+/// # Returns
+///
+/// `Ok(())` on successful start or if already running, otherwise `Err(AppError)`.
 ///
 /// # Errors
 ///
-/// Returns an `AppError` if:
-/// - The Service Control Manager cannot be opened.
-/// - The service creation or opening fails.
-/// - The service fails to start (unless it is already running).
+/// Returns `AppError::WindowsApi` if opening SCM, creating service, or starting service fails.
 pub fn load_driver(driver_path: &str) -> Result<(), AppError> {
-    log::debug!("Opening Service Control Manager...");
+    log::debug!(target: "scm", "Opening Service Control Manager...");
 
     // SAFETY: Passing null pointers for machine name and database name targets the
-    // local machine and the ServicesActive database. SC_MANAGER_ALL_ACCESS is a valid
-    // access right constant.
+    // local machine and the ServicesActive database.
     let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS) };
     if scm.is_null() {
         return Err(win_last_error!());
@@ -64,8 +60,7 @@ pub fn load_driver(driver_path: &str) -> Result<(), AppError> {
 
     let service_name = windows_sys::w!("Singularity");
 
-    // SAFETY: `scm_handle.0` is a valid handle to the SCM. `service_name` is a valid,
-    // statically allocated null-terminated UTF-16 string.
+    // SAFETY: `scm_handle.0` is a valid handle to the SCM. `service_name` is a null-terminated UTF-16 string.
     let service = unsafe {
         OpenServiceW(
             scm_handle.0,
@@ -75,13 +70,13 @@ pub fn load_driver(driver_path: &str) -> Result<(), AppError> {
     };
 
     let service_handle = if service.is_null() {
-        // SAFETY: GetLastError is always safe to call and simply returns the thread-local error code.
+        // SAFETY: GetLastError returns the thread-local error code.
         let err = unsafe { GetLastError() };
         if err != ERROR_SERVICE_DOES_NOT_EXIST {
             return Err(win_last_error!());
         }
 
-        log::info!("Registering Singularity driver...");
+        log::info!(target: "scm", "Registering Singularity driver service...");
 
         // Encode to null-terminated UTF-16 wide string for Win32 API consumption
         let mut wide_path: Vec<u16> = driver_path.encode_utf16().collect();
@@ -89,10 +84,7 @@ pub fn load_driver(driver_path: &str) -> Result<(), AppError> {
 
         // SAFETY:
         // - `scm_handle.0` is a valid SCM handle.
-        // - `service_name` is a valid static null-terminated UTF-16 string.
-        // - `wide_path.as_ptr()` points to a valid, null-terminated UTF-16 string that lives
-        //   for the duration of this call.
-        // - Passing null pointers for the optional configuration parameters is permitted by the Win32 API.
+        // - `service_name` and `wide_path` are valid null-terminated UTF-16 wide strings.
         let new_service = unsafe {
             CreateServiceW(
                 scm_handle.0,
@@ -119,14 +111,12 @@ pub fn load_driver(driver_path: &str) -> Result<(), AppError> {
         ScmHandle(service)
     };
 
-    log::debug!("Starting Singularity driver...");
+    log::debug!(target: "scm", "Starting Singularity driver...");
 
-    // SAFETY: `service_handle.0` is a valid handle to the service. Passing `0` for the argument count
-    // and `ptr::null()` for the argument vector is explicitly permitted for services taking no arguments.
+    // SAFETY: `service_handle.0` is a valid service handle.
     let start_result = unsafe { StartServiceW(service_handle.0, 0, ptr::null()) };
 
     if start_result == 0 {
-        // SAFETY: GetLastError is safe to call to inspect the thread-local error of the previous failure.
         let err = unsafe { GetLastError() };
         if err != ERROR_SERVICE_ALREADY_RUNNING {
             return Err(win_last_error!());
@@ -136,24 +126,19 @@ pub fn load_driver(driver_path: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Stops and unregisters the currently loaded kernel driver.
+/// Stops and unregisters the currently loaded kernel driver from SCM.
 ///
-/// This function attempts to open the Service Control Manager, open the
-/// driver's service, send a stop control code to it, and finally delete
-/// the service registration.
+/// # Returns
+///
+/// `Ok(())` on successful deletion (or if service does not exist), otherwise `Err(AppError)`.
 ///
 /// # Errors
 ///
-/// Returns an `AppError` if:
-/// - The Service Control Manager cannot be opened.
-/// - The service deletion fails.
-///
-/// Note: If the service cannot be found, the function succeeds silently.
+/// Returns `AppError::WindowsApi` if SCM access or service deletion fails.
 pub fn unload_driver() -> Result<(), AppError> {
-    log::debug!("Opening Service Control Manager for driver removal...");
+    log::debug!(target: "scm", "Opening Service Control Manager for driver removal...");
 
-    // SAFETY: Passing null pointers for machine name and database targets the local
-    // computer and active database.
+    // SAFETY: Target local computer and active database.
     let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS) };
     if scm.is_null() {
         return Err(win_last_error!());
@@ -162,8 +147,7 @@ pub fn unload_driver() -> Result<(), AppError> {
 
     let service_name = windows_sys::w!("Singularity");
 
-    // SAFETY: `scm_handle.0` is a valid SCM handle. `service_name` is a valid,
-    // statically allocated null-terminated UTF-16 string.
+    // SAFETY: `scm_handle.0` is a valid SCM handle.
     let service = unsafe {
         OpenServiceW(
             scm_handle.0,
@@ -177,24 +161,20 @@ pub fn unload_driver() -> Result<(), AppError> {
     }
     let service_handle = ScmHandle(service);
 
-    log::debug!("Stopping Singularity driver...");
+    log::debug!(target: "scm", "Stopping Singularity driver service...");
 
-    // SAFETY: SERVICE_STATUS is a C-compatible struct (Plain Old Data) and is safe to zero-initialize.
+    // SAFETY: SERVICE_STATUS is a plain C struct safe to zero-initialize.
     let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
 
-    // SAFETY: `service_handle.0` is a valid service handle. `status` is passed as a mutable
-    // reference to a valid local variable, which the API will populate with status information.
     let control_result =
         unsafe { ControlService(service_handle.0, SERVICE_CONTROL_STOP, &mut status) };
 
-    // It's a good practice to log or check if stopping fails, but kernel drivers often stop abruptly.
     if control_result == 0 {
-        log::warn!("ControlService failed, attempting deletion anyway...");
+        log::warn!(target: "scm", "ControlService stop request failed or service already stopped. Proceeding with deletion.");
     }
 
-    log::debug!("Deleting Singularity driver registration...");
+    log::debug!(target: "scm", "Deleting Singularity driver service registration...");
 
-    // SAFETY: `service_handle.0` is a valid service handle mapped to the Singularity service.
     let delete_result = unsafe { DeleteService(service_handle.0) };
     if delete_result == 0 {
         return Err(win_last_error!());
@@ -204,8 +184,16 @@ pub fn unload_driver() -> Result<(), AppError> {
 }
 
 /// Checks if the driver service is already registered in the Service Control Manager.
+///
+/// # Returns
+///
+/// `Ok(true)` if registered, `Ok(false)` if not found, or `Err(AppError)` on failure.
+///
+/// # Errors
+///
+/// Returns `AppError::WindowsApi` if SCM cannot be opened.
 pub fn is_driver_service_registered() -> Result<bool, AppError> {
-    log::debug!("Checking if Singularity driver service is registered...");
+    log::debug!(target: "scm", "Checking if Singularity driver service is registered...");
 
     let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS) };
     if scm.is_null() {
@@ -235,8 +223,16 @@ pub fn is_driver_service_registered() -> Result<bool, AppError> {
 }
 
 /// Retrieves the configured binary path name for the driver service.
+///
+/// # Returns
+///
+/// `Ok(String)` containing the registered binary path, or `Err(AppError)` on failure.
+///
+/// # Errors
+///
+/// Returns `AppError::WindowsApi` or `AppError::Internal` if query fails.
 pub fn get_service_binary_path() -> Result<String, AppError> {
-    log::debug!("Retrieving Singularity driver service binary path...");
+    log::debug!(target: "scm", "Retrieving Singularity driver service binary path...");
 
     let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS) };
     if scm.is_null() {
@@ -312,9 +308,17 @@ pub fn get_service_binary_path() -> Result<String, AppError> {
     Ok(binary_path)
 }
 
-/// Checks if the driver service is currently running.
+/// Checks if the driver service is currently in the `SERVICE_RUNNING` state.
+///
+/// # Returns
+///
+/// `Ok(true)` if running, `Ok(false)` if stopped or not found, or `Err(AppError)` on failure.
+///
+/// # Errors
+///
+/// Returns `AppError::WindowsApi` if service status query fails.
 pub fn is_service_running() -> Result<bool, AppError> {
-    log::debug!("Checking if Singularity driver service is running...");
+    log::debug!(target: "scm", "Checking if Singularity driver service is running...");
 
     let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS) };
     if scm.is_null() {

@@ -1,3 +1,5 @@
+//! Synchronous Windows DbgHelp symbol resolution wrapper.
+
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::mem::{size_of, zeroed};
@@ -11,20 +13,36 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
 };
 
-/// A basic, synchronous Symbol Resolver using Windows DbgHelp API.
-/// DbgHelp is inherently single-threaded and slow. This is for PoC/Debugging purposes.
+/// A synchronous Symbol Resolver using the Windows DbgHelp API.
+///
+/// Wraps per-process `SymInitialize` sessions and resolves memory addresses to module/symbol names.
 pub struct SymbolResolver {
     /// Cache of process handles initialized with DbgHelp.
     /// Key: Process ID. Value: HANDLE cast to isize (to safely implement Send/Sync).
     process_handles: HashMap<u32, isize>,
 }
 
+/// Represents a resolved memory address with module and symbol information.
+#[derive(Debug, Clone)]
 pub struct ResolvedSymbol {
+    /// The name of the binary module (e.g. `ntdll.dll`, `kernel32.dll`).
     pub module_name: String,
+    /// The decoded function/symbol name if available.
     pub symbol_name: Option<String>,
 }
 
+impl Default for SymbolResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SymbolResolver {
+    /// Creates a new `SymbolResolver` and initializes DbgHelp options with deferred loading and name undecoration.
+    ///
+    /// # Returns
+    ///
+    /// An initialized `SymbolResolver` instance.
     pub fn new() -> Self {
         unsafe {
             // Defer loading symbols until they are actually requested, and undecorate C++ names.
@@ -36,6 +54,15 @@ impl SymbolResolver {
     }
 
     /// Resolves a memory address to a module and symbol name for a specific Process ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - The target Process ID.
+    /// * `address` - The instruction pointer / virtual memory address to resolve.
+    ///
+    /// # Returns
+    ///
+    /// `Some(ResolvedSymbol)` if the address could be queried against DbgHelp module info, or `None`.
     pub fn resolve_address(&mut self, pid: u32, address: u64) -> Option<ResolvedSymbol> {
         let h_process = self.get_or_init_process(pid)?;
 
@@ -45,7 +72,7 @@ impl SymbolResolver {
             module_info.SizeOfStruct = size_of::<IMAGEHLP_MODULE64>() as u32;
 
             let module_name = if SymGetModuleInfo64(h_process, address, &mut module_info) != 0 {
-                CStr::from_ptr(module_info.ModuleName.as_ptr() as *const i8)
+                CStr::from_ptr(module_info.ModuleName.as_ptr())
                     .to_string_lossy()
                     .into_owned()
             } else {
@@ -64,7 +91,7 @@ impl SymbolResolver {
             let mut displacement: u64 = 0;
             let symbol_name = if SymFromAddr(h_process, address, &mut displacement, sym_info) != 0 {
                 Some(
-                    CStr::from_ptr((*sym_info).Name.as_ptr() as *const i8)
+                    CStr::from_ptr((*sym_info).Name.as_ptr())
                         .to_string_lossy()
                         .into_owned(),
                 )
@@ -79,7 +106,15 @@ impl SymbolResolver {
         }
     }
 
-    /// Retrieves a cached DbgHelp session for a PID, or creates a new one if it doesn't exist.
+    /// Retrieves a cached DbgHelp session for a PID, or initializes a new process handle session.
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - The target Process ID.
+    ///
+    /// # Returns
+    ///
+    /// An open `HANDLE` if permissions allow, or `None` if process is inaccessible or terminated.
     fn get_or_init_process(&mut self, pid: u32) -> Option<HANDLE> {
         if let Some(&h_process) = self.process_handles.get(&pid) {
             return Some(h_process as HANDLE);
@@ -105,7 +140,7 @@ impl SymbolResolver {
     }
 }
 
-/// Ensure we clean up kernel handles when the resolver is destroyed.
+/// Cleans up all cached DbgHelp process sessions and OS handles upon drop.
 impl Drop for SymbolResolver {
     fn drop(&mut self) {
         unsafe {
@@ -118,7 +153,7 @@ impl Drop for SymbolResolver {
     }
 }
 
-// SAFETY: DbgHelp is explicitly single-threaded. By marking this Send/Sync, we are placing
-// the burden of thread safety on the struct owner (e.g., using a Mutex in the Sink).
+// SAFETY: DbgHelp is single-threaded. By implementing Send/Sync, thread safety
+// is guaranteed by wrapping this struct inside an Arc<Mutex<SymbolResolver>>.
 unsafe impl Send for SymbolResolver {}
 unsafe impl Sync for SymbolResolver {}
