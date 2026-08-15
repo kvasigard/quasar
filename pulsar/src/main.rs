@@ -1,5 +1,3 @@
-//! Pulsar EDR Agent - Main entry point and orchestration.
-
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -13,6 +11,57 @@ use pulsar::sensors::etw::director::SessionDirector;
 use pulsar::sensors::etw::{EtwSession, KernelSession, KernelSessionBuilder};
 use pulsar::sinks::{direct_sys::DirectSyscallSink, system_context::SystemContextSink};
 use windows_sys::Win32::Foundation::ERROR_SERVICE_DEPENDENCY_FAIL;
+
+/// Application entry point for the Pulsar EDR agent.
+///
+/// Parses command-line arguments, orchestrates driver bootstrap, configures the event pipeline
+/// and ETW session, and manages execution lifecycle until termination.
+fn main() {
+    let cli = Cli::parse();
+    init_logger(&cli);
+
+    log::debug!("Parsed CLI configuration: {:?}", cli);
+
+    if cli.uninstall {
+        handle_uninstall();
+    }
+
+    log::info!("Starting Quasar EDR Engine (Pulsar)...");
+
+    // Initialize driver and request PPL elevation
+    init_driver_and_ppl(cli.skip_driver);
+
+    // Setup event bus and dispatching pipeline
+    let enable_syscalls = !cli.disable_syscalls;
+    let enable_context = !cli.disable_context;
+
+    // TODO: Currently the setup_event_pipline does not follow the Open-Closed
+    // principle; everytime a new functionality is added we need to change the
+    // funtion signature. In the future consider using a global configuration.
+    // To be future-prove that configuration shall be able to change the EDR
+    // behaviour at runtime.
+    let (tx, dispatcher_handle) = setup_event_pipeline(enable_syscalls, enable_context);
+
+    // Build and start NT Kernel Logger ETW session
+    let (kernel_session, consumer_handle) =
+        match start_kernel_session(enable_syscalls, enable_context, tx) {
+            Ok(handles) => handles,
+            Err(e) => {
+                log::error!("Failed to initialize and start ETW session: {}", e);
+                return;
+            }
+        };
+
+    log::info!(
+        "Quasar EDR Engine is active and capturing telemetry. Press Ctrl+C to safely stop..."
+    );
+
+    // Wait for user termination signal
+    wait_for_shutdown();
+
+    // Teardown session and join worker threads
+    teardown_session(kernel_session, consumer_handle, dispatcher_handle);
+}
 
 /// Handles the `--uninstall` CLI flag by requesting SCM to stop and delete the driver service.
 ///
@@ -228,55 +277,4 @@ fn init_logger(cli: &Cli) {
     }
 
     builder.init();
-}
-
-/// Application entry point for the Pulsar EDR agent.
-///
-/// Parses command-line arguments, orchestrates driver bootstrap, configures the event pipeline
-/// and ETW session, and manages execution lifecycle until termination.
-fn main() {
-    let cli = Cli::parse();
-    init_logger(&cli);
-
-    log::debug!("Parsed CLI configuration: {:?}", cli);
-
-    if cli.uninstall {
-        handle_uninstall();
-    }
-
-    log::info!("Starting Quasar EDR Engine (Pulsar)...");
-
-    // Initialize driver and request PPL elevation
-    init_driver_and_ppl(cli.skip_driver);
-
-    // Setup event bus and dispatching pipeline
-    let enable_syscalls = !cli.disable_syscalls;
-    let enable_context = !cli.disable_context;
-
-    // TODO: Currently the setup_event_pipline does not follow the Open-Closed
-    // principle; everytime a new functionality is added we need to change the
-    // funtion signature. In the future consider using a global configuration.
-    // To be future-prove that configuration shall be able to change the EDR
-    // behaviour at runtime.
-    let (tx, dispatcher_handle) = setup_event_pipeline(enable_syscalls, enable_context);
-
-    // Build and start NT Kernel Logger ETW session
-    let (kernel_session, consumer_handle) =
-        match start_kernel_session(enable_syscalls, enable_context, tx) {
-            Ok(handles) => handles,
-            Err(e) => {
-                log::error!("Failed to initialize and start ETW session: {}", e);
-                return;
-            }
-        };
-
-    log::info!(
-        "Quasar EDR Engine is active and capturing telemetry. Press Ctrl+C to safely stop..."
-    );
-
-    // Wait for user termination signal
-    wait_for_shutdown();
-
-    // Teardown session and join worker threads
-    teardown_session(kernel_session, consumer_handle, dispatcher_handle);
 }
