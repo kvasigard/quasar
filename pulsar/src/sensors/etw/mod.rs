@@ -8,5 +8,5 @@ mod session;
 
 // Expose the necessary types to the rest of the crate.
 pub use event::EventRecord;
-pub use kernel::KernelSessionBuilder;
+pub use kernel::{KernelFlag, KernelSession, KernelSessionBuilder};
 pub use session::EtwSession;

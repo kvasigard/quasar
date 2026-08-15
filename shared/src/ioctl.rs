@@ -1,14 +1,18 @@
-/// Standard WDK definitions for IOCTL routing and access
-const METHOD_BUFFERED: u32 = 0;
-const FILE_ANY_ACCESS: u32 = 0;
+//! IOCTL codes, message serialization traits, and payload structures.
 
-/// Custom Device Type (Must be >= 32768 (0x8000) for OEM/Custom drivers)
-const SINGULARITY_DEVICE_TYPE: u32 = 0x8000;
-/// Custom Function Code (Must be >= 2048 (0x800) for OEM/Custom drivers)
-const FUNCTION_ELEVATE: u32 = 0x801;
+/// Standard WDK definitions for IOCTL routing and access methods.
+pub const METHOD_BUFFERED: u32 = 0;
+/// Standard WDK definition for unrestricted device access.
+pub const FILE_ANY_ACCESS: u32 = 0;
 
-/// Macro to generate a standard Windows IOCTL code.
-/// Equivalent to the CTL_CODE macro in the Windows WDK (devioctl.h).
+/// Custom Device Type for OEM/Custom drivers (>= 32768 / 0x8000).
+pub const SINGULARITY_DEVICE_TYPE: u32 = 0x8000;
+/// Custom Function Code for elevation control (>= 2048 / 0x800).
+pub const FUNCTION_ELEVATE: u32 = 0x801;
+
+/// Macro generating a standard Windows IOCTL control code.
+///
+/// Equivalent to the `CTL_CODE` macro in the Windows WDK (`devioctl.h`).
 #[macro_export]
 macro_rules! ctl_code {
     ($device_type:expr, $function:expr, $method:expr, $access:expr) => {
@@ -16,8 +20,7 @@ macro_rules! ctl_code {
     };
 }
 
-/// Instructs the driver to change the privileges of the process
-/// indicated in the associated request payload.
+/// IOCTL control code instructing the driver to change process PPL level.
 pub const IOCTL_CHANGE_PPL_LEVEL: u32 = ctl_code!(
     SINGULARITY_DEVICE_TYPE,
     FUNCTION_ELEVATE,
@@ -25,20 +28,22 @@ pub const IOCTL_CHANGE_PPL_LEVEL: u32 = ctl_code!(
     FILE_ANY_ACCESS
 );
 
-/// Represents a strongly-typed request to the KMDF driver.
+/// Represents a strongly-typed IOCTL request message to the KMDF driver.
 pub trait IoctlMessage {
-    /// The unique IOCTL control code.
+    /// The unique 32-bit IOCTL control code.
     const CODE: u32;
 
-    /// The type of the expected response.
-    /// If the IOCTL does not return data, use `()`.
+    /// The expected response type returned in the output buffer.
     type Response;
 }
 
+/// Request payload to modify the Process Protection Level (PPL) of a target process.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct ChangeProcessPplLevel {
+    /// The target Process ID to elevate.
     pub process_id: u32,
+    /// The bitmask representing the protection level (e.g. 0x31 for PPL-Antimalware).
     pub level: u8,
 }
 

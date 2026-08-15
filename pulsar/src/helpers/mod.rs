@@ -1,4 +1,5 @@
 pub mod stack_correlator;
+pub mod strings;
 pub mod symbol_resolver;
 
 use windows_sys::core::GUID;
