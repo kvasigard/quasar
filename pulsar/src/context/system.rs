@@ -17,17 +17,17 @@ use crate::context::retention::RetentionManager;
 /// Centralized, concurrent execution context container holding all system-wide entity domains.
 pub struct SystemContext {
     /// Process topology, execution lifecycles, and ancestry tree.
-    pub processes: Arc<ProcessTree>,
+    pub(crate) processes: Arc<ProcessTree>,
     /// Filesystem file tracking, path normalization, and access history.
-    pub files: Arc<FileRegistry>,
+    pub(crate) files: Arc<FileRegistry>,
     /// Active network sockets and process connection mapping.
-    pub network: Arc<NetworkRegistry>,
+    pub(crate) network: Arc<NetworkRegistry>,
     /// Cross-entity interaction ledger and activity ring buffer.
-    pub interactions: Arc<InteractionRegistry>,
+    pub(crate) interactions: Arc<InteractionRegistry>,
     /// Multi-step cross-process injection correlator state machine.
-    pub injection_correlator: InjectionCorrelator,
+    pub(crate) injection_correlator: InjectionCorrelator,
     /// Dual-trigger garbage collection and retention manager.
-    pub retention: Arc<RetentionManager>,
+    pub(crate) retention: Arc<RetentionManager>,
 }
 
 impl Default for SystemContext {
@@ -311,6 +311,14 @@ impl SystemContext {
     /// An [`Arc<InteractionRecord>`] reference.
     pub fn record_interaction(&self, record: InteractionRecord) -> Arc<InteractionRecord> {
         self.interactions.record(record)
+    }
+
+    // --- Correlation Operations ---
+
+    /// Returns a reference to the multi-step code injection correlator state machine.
+    #[inline]
+    pub fn injection_correlator(&self) -> &InjectionCorrelator {
+        &self.injection_correlator
     }
 
     // --- Maintenance & GC ---
