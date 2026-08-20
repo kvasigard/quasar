@@ -84,12 +84,12 @@ pub struct Cli {
 
     /// Export Chrome DevTools / Perfetto trace JSON file for visual profiling.
     #[arg(
-        long = "profile-chrome",
-        alias = "trace-chrome",
+        long = "profile",
+        alias = "profile-chrome",
         value_name = "PATH",
         help = "Export Chrome DevTools / Perfetto trace JSON file to visualize thread flame charts and bottlenecks"
     )]
-    pub profile_chrome: Option<PathBuf>,
+    pub profile: Option<PathBuf>,
 
     #[arg(
         long,

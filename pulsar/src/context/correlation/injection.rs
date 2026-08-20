@@ -61,6 +61,7 @@ impl InjectionCorrelator {
     /// * `actor_key` - Synthetic key of the actor process.
     /// * `target_key` - Synthetic key of the target process.
     /// * `timestamp` - Operation timestamp.
+    #[tracing::instrument(name = "correlate_injection_handle_open", skip(self), level = "debug")]
     pub fn on_target_handle_opened(
         &self,
         actor_key: ProcessKey,
@@ -99,6 +100,7 @@ impl InjectionCorrelator {
     /// * `base_address` - Base address of allocated memory.
     /// * `size` - Size of allocation.
     /// * `timestamp` - Operation timestamp.
+    #[tracing::instrument(name = "correlate_injection_memory_alloc", skip(self), level = "debug")]
     pub fn on_remote_memory_alloc(
         &self,
         actor_key: ProcessKey,
@@ -140,6 +142,7 @@ impl InjectionCorrelator {
     /// * `target_key` - Synthetic key of the target process.
     /// * `base_address` - Base address written to.
     /// * `timestamp` - Operation timestamp.
+    #[tracing::instrument(name = "correlate_injection_memory_write", skip(self), level = "debug")]
     pub fn on_remote_memory_write(
         &self,
         actor_key: ProcessKey,
@@ -178,6 +181,7 @@ impl InjectionCorrelator {
     ///
     /// `Some(Arc<InteractionRecord>)` if a valid cross-process injection was confirmed.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(name = "correlate_injection_execution_trigger", skip(self, interactions, processes), level = "debug")]
     pub fn on_remote_execution(
         &self,
         actor_key: ProcessKey,

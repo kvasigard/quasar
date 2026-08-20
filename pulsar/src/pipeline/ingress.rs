@@ -70,7 +70,7 @@ impl IngressParser {
     /// # Returns
     ///
     /// `Some(Event)` if the record produced a complete domain event, or `None` if incomplete/buffered.
-    #[tracing::instrument(name = "ingress_process_record", skip(self, record), level = "trace", fields(pid = record.process_id, opcode = record.opcode))]
+    #[tracing::instrument(name = "ingress_process_record", skip(self, record), level = "debug", fields(pid = record.process_id, opcode = record.opcode))]
     pub fn process_raw_record(&self, record: EventRecord) -> Option<Event> {
         let prefix = record.provider_id.data1;
         let opcode = record.opcode;

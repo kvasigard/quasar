@@ -86,6 +86,7 @@ impl StackCorrelator {
     }
 
     /// Ingests a syscall enter trigger event.
+    #[tracing::instrument(name = "correlate_syscall_trigger", skip(self), level = "debug")]
     pub fn process_syscall_trigger(
         &mut self,
         pid: u32,
@@ -123,6 +124,7 @@ impl StackCorrelator {
     }
 
     /// Ingests a `Stack_Walk` payload event.
+    #[tracing::instrument(name = "correlate_stack_walk", skip(self, payload), level = "debug")]
     pub fn process_stack_walk(&mut self, payload: StackWalkPayload) -> Option<CorrelatedSyscallEvent> {
         let key = payload.event_timestamp;
 

@@ -23,7 +23,7 @@ fn main() {
     let _profiling_guard = init_profiling(
         cli.log_mode,
         cli.log_file.as_ref(),
-        cli.profile_chrome.as_ref(),
+        cli.profile.as_ref(),
     );
 
     log::debug!("Parsed CLI configuration: {:?}", cli);

@@ -33,10 +33,7 @@ pub fn init_profiling(
     log_file: Option<impl AsRef<Path>>,
     chrome_trace_path: Option<impl AsRef<Path>>,
 ) -> ProfilingGuard {
-    // 1. Bridge legacy log::* macros to tracing events
-    let _ = tracing_log::LogTracer::init();
-
-    // 2. Determine default filter
+    // 1. Determine default filter
     let default_level = log_mode
         .map(tracing_subscriber::filter::LevelFilter::from)
         .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO);
@@ -45,7 +42,7 @@ pub fn init_profiling(
         .with_default_directive(default_level.into())
         .from_env_lossy();
 
-    // 3. Set up Chrome DevTools Profiling Layer (if requested)
+    // 2. Set up Chrome DevTools Profiling Layer (if requested)
     let (chrome_layer, chrome_guard) = if let Some(path) = chrome_trace_path {
         let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
             .file(path.as_ref())
@@ -58,7 +55,7 @@ pub fn init_profiling(
     let registry = tracing_subscriber::registry().with(env_filter);
     let chrome_boxed = chrome_layer.map(|l| l.boxed());
 
-    // 4. Set up Formatted Output Layer (Console or File)
+    // 3. Set up Formatted Output Layer (Console or File)
     if let Some(file_path) = log_file {
         let file = File::create(file_path).expect("Failed to create log output file");
         let fmt_layer = fmt::layer()
@@ -68,7 +65,7 @@ pub fn init_profiling(
             .with_writer(file)
             .boxed();
 
-        registry.with(fmt_layer).with(chrome_boxed).init();
+        let _ = registry.with(fmt_layer).with(chrome_boxed).try_init();
     } else {
         let fmt_layer = fmt::layer()
             .with_ansi(true)
@@ -77,7 +74,7 @@ pub fn init_profiling(
             .with_writer(std::io::stdout)
             .boxed();
 
-        registry.with(fmt_layer).with(chrome_boxed).init();
+        let _ = registry.with(fmt_layer).with(chrome_boxed).try_init();
     }
 
     ProfilingGuard {

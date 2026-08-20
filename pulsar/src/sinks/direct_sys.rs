@@ -25,7 +25,7 @@ impl DirectSyscallSink {
     /// When an attacker executes Direct Syscalls (e.g. Hell's Gate, SysWhispers),
     /// the instruction pointer immediately preceding kernel transition originates from
     /// an unbacked memory stub or directly from non-system binaries.
-    #[tracing::instrument(name = "analyze_direct_syscall", skip(self, event), level = "trace")]
+    #[tracing::instrument(name = "analyze_direct_syscall", skip(self, event), level = "debug")]
     fn analyze_direct_syscall(&self, event: &CorrelatedSyscallEvent) {
         // In 64-bit Windows, User Space ends at 0x00007FFFFFFFFFFF.
         const USER_SPACE_MAX: u64 = 0x00007FFFFFFFFFFF;
@@ -51,10 +51,11 @@ impl DirectSyscallSink {
                         );
                     }
                 } else {
+                    // Suppress loud terminal warnings for now until FP heuristics are refined
                     let sym = resolved.symbol_name.as_deref().unwrap_or("Unknown");
-                    log::warn!(
+                    log::debug!(
                         target: "direct_sys",
-                        "Direct syscall detected: PID {} TID {} Addr {:#x} Module {} Symbol {}",
+                        "Direct syscall candidate: PID {} TID {} Addr {:#x} Module {} Symbol {}",
                         event.pid,
                         event.tid,
                         user_ptr,
@@ -63,9 +64,10 @@ impl DirectSyscallSink {
                     );
                 }
             } else {
-                log::warn!(
+                // Suppress loud terminal warnings for now until FP heuristics are refined
+                log::debug!(
                     target: "direct_sys",
-                    "Unbacked memory direct syscall detected: PID {} TID {} Addr {:#x}",
+                    "Unbacked memory direct syscall candidate: PID {} TID {} Addr {:#x}",
                     event.pid,
                     event.tid,
                     user_ptr
