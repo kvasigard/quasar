@@ -143,7 +143,7 @@ All detection and telemetry features are **enabled by default**. You can pass CL
 | :--- | :--- |
 | `-l, --log-mode <LEVEL>` | Sets the logging verbosity level (`off`, `error`, `warn`, `info`, `debug`, `trace`). |
 | `-f, --log-file <PATH>` | Redirects log output to the specified file in append mode instead of the console. |
-| `--profile-chrome <PATH>`| Exports interactive Chrome DevTools / Perfetto flame chart JSON trace data. |
+| `--profile <PATH>` | Exports interactive Chrome DevTools / Perfetto flame chart JSON trace data. |
 | `--disable-syscalls` | Disables direct syscall anomaly detection and ETW kernel stack tracing. |
 | `--disable-context` | Disables process tree and module mapping context tracking. |
 | `--skip-driver` | Skips Singularity kernel driver loading and PPL elevation (useful for standalone ETW inspection). |
@@ -162,7 +162,7 @@ All detection and telemetry features are **enabled by default**. You can pass CL
 .\target\release\pulsar.exe -l trace -f C:\logs\pulsar.log
 
 # Export Chrome DevTools / Perfetto interactive flame chart
-.\target\release\pulsar.exe --profile-chrome trace.json
+.\target\release\pulsar.exe --profile trace.json
 
 # Run in standalone ETW mode without driver/PPL elevation
 .\target\release\pulsar.exe --skip-driver

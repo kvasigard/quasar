@@ -568,7 +568,9 @@ impl EtwSession for KernelSession {
 
         let session_name_owned = Self::SESSION_NAME.to_string();
 
-        let handle = std::thread::spawn(move || {
+        let handle = std::thread::Builder::new()
+            .name("pulsar-etw-consumer".into())
+            .spawn(move || {
             let mut name_wide: Vec<u16> =
                 session_name_owned.encode_utf16().chain(Some(0)).collect();
             let mut context = TraceContext::new(sender);
@@ -602,7 +604,8 @@ impl EtwSession for KernelSession {
 
             log::info!(target: "etw_kernel", "ETW consumer thread exited gracefully.");
             Ok(())
-        });
+        })
+        .map_err(|e| AppError::Internal(format!("Failed to spawn ETW consumer thread: {e}")))?;
 
         Ok(handle)
     }
