@@ -3,6 +3,10 @@ members = ["pulsar", "shared"]
 exclude = ["singularity"]
 resolver = "3"
 
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+
 [workspace.dependencies]
 clap = { version = "4.5.31", features = ["derive"] }
 env_logger = "0.11.9"
