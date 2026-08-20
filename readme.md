@@ -13,19 +13,32 @@ Quasar is designed as a multi-component workspace, split between user-mode analy
 ## Project Structure
 ```text
 quasar/
+├── docs/                     # Comprehensive multi-file documentation suite (v0.2)
+│   ├── index.md              # Master documentation roadmap
+│   ├── sensors/              # Dedicated sensor docs (ETW, Driver Callbacks)
+│   ├── detections/           # Dedicated detection docs (Direct Syscalls, Injection)
+│   └── *.md                  # Architecture, Context, Pipeline, PPL, Errors, Profiling, Tests
 ├── shared/                   # Common definitions between um and km (IOCTLs, Structs)
 ├── pulsar/                   # Core EDR Engine (User-Mode)
+│   ├── tests/                # End-to-end synthetic pipeline replay integration tests
 │   └── src/
 │       ├── main.rs           # Orchestration & lifecycle management
 │       ├── cli.rs            # Command-line interface definitions and LogMode
 │       ├── lib.rs            # Library core
-│       ├── error.rs          # Centralized error handling (AppError, HandlerError)
-│       ├── comm/             # Inter-process communication and transport primitives
-│       ├── context/          # Context database from system events
+│       ├── error.rs          # Domain-partitioned error taxonomy (Win32, Driver, ETW, Handler)
+│       ├── profiling.rs      # Structured tracing, spans & Chrome DevTools flame chart export
+│       ├── context/          # Real-time knowledge graph (processes, files, network, injections)
+│       │   ├── correlation/  # Stateful injection correlation state machine
+│       │   ├── identity.rs   # Synthetic monotonic entity keys (ProcessKey, etc.)
+│       │   ├── models/       # Fine-grained process, module, handle & network models
+│       │   ├── query/        # Lock-free query wrappers and ancestry graph walking
+│       │   ├── registries/   # Concurrent ProcessTree, FileRegistry, NetworkRegistry
+│       │   ├── retention/    # Dual-trigger GC & ancestry tombstones
+│       │   └── tests.rs      # In-place mutability and context state machine unit tests
 │       ├── drivers/          # Driver lifecycle management and SCM control
-│       ├── pipeline/         # Event dispatcher and routing logic
+│       ├── pipeline/         # Two-stage telemetry pipeline (IngressParser + EventDispatcher)
 │       ├── sensors/          # Telemetry ingestion (ETW NT Kernel Logger)
-│       ├── sinks/            # Analytical detection modules (DirectSyscallSink, SystemContextSink)
+│       ├── sinks/            # Analytical detection sinks (DirectSyscallSink)
 │       └── helpers/          # Stack correlator, symbol resolver, string decoding
 └── singularity/              # KMDF Driver (Kernel-Mode)
     ├── .cargo/config.toml    # Compiler flags for kernel environment
@@ -38,7 +51,7 @@ quasar/
         ├── raii.rs           # Safe Resource Acquisition Is Initialization wrappers
         ├── internals/        # Implementation logic
         │   ├── mod.rs
-        │   └── dkom.rs       # Direct Kernel Object Manipulation logic
+        │   └── dkom.rs       # Direct Kernel Object Manipulation logic (PPL elevation)
         └── ioctls/           # IOCTL dispatching and handlers
             ├── mod.rs
             └── elevate.rs    # Token elevation handler
@@ -46,14 +59,29 @@ quasar/
 
 ## Features
 
-At the time of writing this, the project features are aligned with only one purpose: detect stack anomalies. More features will be added hopefully in the future.
-
 ### Telemetry Sources
-* **ETW (Event Tracing for Windows):** Programmatically builds, starts, and consumes NT Kernel Logger ETW sessions. This allows the engine to capture real-time, high-fidelity, and verbose system events (like system calls and process/image lifecycles) directly from the Windows kernel.
+* **ETW (Event Tracing for Windows):** Programmatically builds, starts, and consumes NT Kernel Logger ETW sessions with dedicated 1MB non-paged pool ring buffers. Captures real-time system calls, process lifecycles, and DLL module loads directly from the Windows kernel.
 
 ### Detections & Analytics
-* **Direct Syscall Detection:** Identifies processes attempting to bypass standard user-land API hooking by executing `syscall` instructions directly. It achieves this by capturing kernel-level system call events and utilizing stack unwinding/correlation to verify if the execution origin is legitimate.
-* **Process & Context Tracking:** Maintains an in-memory graph (`SystemContext` / `ProcessTree`) mapping active process lifecycles, DLL image loads, and ancestry hierarchies with $O(1)$ lookups and historical retention.
+* **Direct Syscall Detection:** Identifies processes attempting to bypass standard user-land API hooks (SysWhispers, Hell's Gate, Tartarus' Gate) by executing `syscall` instructions directly from unbacked memory or unauthorized modules. Achieves this via return address boundary filtering and dynamic PE export symbol resolution.
+* **Stateful Code Injection Tracking:** Correlates multi-step cross-process memory tampering across time (`OpenProcess` $\rightarrow$ `VirtualAllocEx` $\rightarrow$ `WriteProcessMemory` $\rightarrow$ `NtCreateThreadEx`), escalating confidence to `Confirmed` and pinning entities in RAM for forensic preservation.
+* **Process & Context Tracking:** Real-time knowledge graph (`SystemContext`) with synthetic `ProcessKey` temporal isolation against PID recycling, lock-free in-place interior mutability, and dual-trigger garbage collection with ancestry tombstones.
+* **Execution Profiling & Flame Charts:** Structured span timing with `--profile-chrome` JSON export for visual bottleneck diagnostics in Chrome DevTools (`chrome://tracing`) and [Perfetto](https://ui.perfetto.dev).
+
+## Documentation
+
+Comprehensive documentation for all subsystems is available in the [`/docs`](docs/index.md) directory:
+* [Architecture Overview](docs/01-architecture-overview.md)
+* [System Context Engine](docs/02-context-engine.md)
+* [Telemetry Ingress & Dispatcher Pipeline](docs/03-pipeline-and-dispatcher.md)
+* [Sensors Subsystem](docs/sensors/overview.md)
+* [Driver & PPL Elevation](docs/04-driver-and-ppl.md)
+* [Bootstrap, Lifecycle & Teardown](docs/05-bootstrap-and-lifecycle.md)
+* [Detection Sinks](docs/detections/overview.md)
+* [Error Handling Taxonomy](docs/06-error-taxonomy.md)
+* [Structured Tracing & Profiling](docs/07-tracing-and-profiling.md)
+* [Testing Strategy & Verification](docs/08-testing-strategy.md)
+* [System Expansion Notes](docs/09-system-expansion-notes.md)
 
 ## Prerequisites
 
@@ -77,6 +105,13 @@ cd quasar
 
 # Build the release version
 cargo build --release
+```
+
+### Running the Test Suite
+The automated test suite runs locally in $< 0.5$s with zero driver dependencies:
+
+```bash
+cargo test --workspace
 ```
 
 ### Building Singularity (KMDF Driver)
@@ -108,6 +143,7 @@ All detection and telemetry features are **enabled by default**. You can pass CL
 | :--- | :--- |
 | `-l, --log-mode <LEVEL>` | Sets the logging verbosity level (`off`, `error`, `warn`, `info`, `debug`, `trace`). |
 | `-f, --log-file <PATH>` | Redirects log output to the specified file in append mode instead of the console. |
+| `--profile <PATH>` | Exports interactive Chrome DevTools / Perfetto flame chart JSON trace data. |
 | `--disable-syscalls` | Disables direct syscall anomaly detection and ETW kernel stack tracing. |
 | `--disable-context` | Disables process tree and module mapping context tracking. |
 | `--skip-driver` | Skips Singularity kernel driver loading and PPL elevation (useful for standalone ETW inspection). |
@@ -124,6 +160,9 @@ All detection and telemetry features are **enabled by default**. You can pass CL
 
 # Write trace logs directly to a file
 .\target\release\pulsar.exe -l trace -f C:\logs\pulsar.log
+
+# Export Chrome DevTools / Perfetto interactive flame chart
+.\target\release\pulsar.exe --profile trace.json
 
 # Run in standalone ETW mode without driver/PPL elevation
 .\target\release\pulsar.exe --skip-driver

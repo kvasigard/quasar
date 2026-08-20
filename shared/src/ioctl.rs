@@ -51,3 +51,32 @@ impl IoctlMessage for ChangeProcessPplLevel {
     const CODE: u32 = IOCTL_CHANGE_PPL_LEVEL;
     type Response = ();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::{align_of, size_of};
+
+    /// Tests IOCTL control code bit calculation matching Windows WDK CTL_CODE macro.
+    #[test]
+    fn test_ioctl_code_calculation() {
+        let expected_code = (0x8000 << 16) | (0 << 14) | (0x801 << 2) | 0;
+        assert_eq!(IOCTL_CHANGE_PPL_LEVEL, expected_code);
+        assert_eq!(ChangeProcessPplLevel::CODE, expected_code);
+    }
+
+    /// Verifies C-ABI layout, size, and field alignment to prevent kernel memory corruption.
+    #[test]
+    fn test_change_process_ppl_layout() {
+        // process_id (u32, 4B) + level (u8, 1B) + 3B padding = 8 bytes total on x86_64
+        assert_eq!(size_of::<ChangeProcessPplLevel>(), 8);
+        assert_eq!(align_of::<ChangeProcessPplLevel>(), 4);
+
+        let req = ChangeProcessPplLevel {
+            process_id: 1337,
+            level: 0x31,
+        };
+        assert_eq!(req.process_id, 1337);
+        assert_eq!(req.level, 0x31);
+    }
+}
