@@ -157,3 +157,37 @@ impl Drop for SymbolResolver {
 // is guaranteed by wrapping this struct inside an Arc<Mutex<SymbolResolver>>.
 unsafe impl Send for SymbolResolver {}
 unsafe impl Sync for SymbolResolver {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tests creation and cleanup of the SymbolResolver instance.
+    #[test]
+    fn test_symbol_resolver_lifecycle() {
+        let resolver = SymbolResolver::new();
+        assert!(resolver.process_handles.is_empty());
+    }
+
+    /// Tests querying symbols for a non-existent or invalid process ID.
+    #[test]
+    fn test_symbol_resolver_invalid_pid() {
+        let mut resolver = SymbolResolver::new();
+        // PID 0 or non-existent PID should gracefully return None
+        let res = resolver.resolve_address(0, 0x12345678);
+        assert!(res.is_none());
+    }
+
+    /// Tests querying symbols for the current running process.
+    #[test]
+    fn test_symbol_resolver_current_process() {
+        let mut resolver = SymbolResolver::new();
+        let current_pid = std::process::id();
+        let func_ptr = test_symbol_resolver_lifecycle as *const () as usize as u64;
+
+        let res = resolver.resolve_address(current_pid, func_ptr);
+        if let Some(resolved) = res {
+            assert!(!resolved.module_name.is_empty());
+        }
+    }
+}

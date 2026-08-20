@@ -5,10 +5,6 @@
 //! privileges, locating and loading the underlying kernel driver via INF-based
 //! installation, and establishing the required Process Protection Level (PPL).
 
-use crate::drivers::kmdf;
-use crate::drivers::scm;
-use crate::error::AppError;
-use crate::win_last_error;
 use std::env;
 use std::mem;
 
@@ -23,6 +19,10 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessInformation, OpenProcessToken,
     PROCESS_PROTECTION_LEVEL_INFORMATION, ProcessProtectionLevelInfo,
 };
+
+use crate::drivers::kmdf;
+use crate::drivers::scm;
+use crate::error::{AppError, BootstrapError, Win32Error};
 
 /// Executes the pre-flight checks and driver initialization sequence.
 ///
@@ -42,7 +42,7 @@ use windows_sys::Win32::System::Threading::{
 ///
 /// # Errors
 ///
-/// Returns an `AppError` if non-elevated, if package files cannot be located,
+/// Returns an [`AppError`] if non-elevated, if package files cannot be located,
 /// if driver loading fails, or if PPL elevation cannot be confirmed.
 pub fn initialize() -> Result<(), AppError> {
     log::debug!(target: "bootstrap", "Starting bootstrap sequence...");
@@ -50,7 +50,7 @@ pub fn initialize() -> Result<(), AppError> {
     // Check if the program is running as administrator
     log::debug!(target: "bootstrap", "Verifying Administrator privileges...");
     if !is_running_as_admin() {
-        return Err(AppError::internal("Process must be run as Administrator."));
+        return Err(BootstrapError::AdminPrivilegesRequired.into());
     }
 
     // Resolve the dynamic paths to both package configuration and binary files
@@ -95,36 +95,19 @@ pub fn initialize() -> Result<(), AppError> {
 
         // Start the driver service using SCM module
         log::debug!(target: "bootstrap", "Loading Singularity kernel driver via SCM orchestration...");
-        if let Err(e) = scm::load_driver(&sys_path) {
-            return Err(AppError::internal(format!(
-                "Error while starting the driver service: {e}"
-            )));
-        }
+        scm::load_driver(&sys_path)?;
     } else {
         // If already registered and up-to-date, check if running. Start if stopped.
         if !scm::is_service_running()? {
             log::debug!(target: "bootstrap", "Starting Singularity driver service (registered but stopped)...");
-            if let Err(e) = scm::load_driver(&sys_path) {
-                return Err(AppError::internal(format!(
-                    "Error while starting the driver service: {e}"
-                )));
-            }
+            scm::load_driver(&sys_path)?;
         } else {
             log::debug!(target: "bootstrap", "Singularity driver service is already running.");
         }
     }
 
     log::debug!(target: "bootstrap", "Connecting to the Singularity driver...");
-    // kmdf_client goes out of scope here when this function returns, and its RAII
-    // Drop implementation will call CloseHandle(), detaching from the driver.
-    let kmdf_client = match kmdf::Singularity::connect() {
-        Ok(client) => client,
-        Err(e) => {
-            return Err(AppError::internal(format!(
-                "Failed to connect to Singularity KMDF driver: {e}"
-            )));
-        }
-    };
+    let kmdf_client = kmdf::Singularity::connect()?;
 
     log::debug!(target: "bootstrap", "Requesting PPL-Antimalware elevation from the driver...");
     let ppl_request = shared::ioctl::ChangeProcessPplLevel {
@@ -132,18 +115,12 @@ pub fn initialize() -> Result<(), AppError> {
         level: 0x31, // PPL-Antimalware (Signer: 0x3 | Type: 0x1)
     };
 
-    if let Err(e) = kmdf_client.send(&ppl_request) {
-        return Err(AppError::internal(format!(
-            "Failed to acquire PPL privileges: {e}"
-        )));
-    }
+    kmdf_client.send(&ppl_request)?;
 
     // Verify applied Process Protection Level (PPL)
     log::debug!(target: "bootstrap", "Verifying applied Process Protection Level...");
     if !is_ppl_antimalware() {
-        return Err(AppError::internal(
-            "Failed to verify PPL-Antimalware token status.",
-        ));
+        return Err(BootstrapError::PplVerificationFailed.into());
     }
 
     log::info!(target: "bootstrap", "Bootstrap successful. Running with PPL-Antimalware protection.");
@@ -190,7 +167,7 @@ fn clean_driver_path(path: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns `AppError::WindowsApi` if `DiInstallDriverW` returns zero.
+/// Returns [`AppError`] if `DiInstallDriverW` fails.
 fn install_inf_driver(inf_path: &str) -> Result<(), AppError> {
     let mut wide_inf: Vec<u16> = inf_path.encode_utf16().collect();
     wide_inf.push(0);
@@ -198,15 +175,11 @@ fn install_inf_driver(inf_path: &str) -> Result<(), AppError> {
     let mut need_reboot: i32 = 0i32;
     let flags: DIINSTALLDRIVER_FLAGS = 0;
 
-    // SAFETY:
-    // - `hwndparent` is 0 (NULL handle) since installation runs headlessly.
-    // - `infpath` points to a null-terminated UTF-16 wide character array.
-    // - `needreboot` is a valid pointer to a stack-allocated BOOL.
     let success =
         unsafe { DiInstallDriverW(0 as HWND, wide_inf.as_ptr(), flags, &mut need_reboot) };
 
     if success == 0 {
-        return Err(win_last_error!());
+        return Err(BootstrapError::DriverInstallationFailed(Win32Error::last()).into());
     }
 
     if need_reboot != 0 {
@@ -226,10 +199,10 @@ fn install_inf_driver(inf_path: &str) -> Result<(), AppError> {
 ///
 /// # Errors
 ///
-/// Returns `AppError::Internal` if package pairing cannot be found on disk.
+/// Returns [`BootstrapError::PackageFilesNotFound`] if package pairing cannot be found on disk.
 fn resolve_package_paths() -> Result<(String, String), AppError> {
     let exe_path = env::current_exe()
-        .map_err(|e| AppError::internal(format!("Failed to get executable path: {}", e)))?;
+        .map_err(|e| AppError::internal(format!("Failed to get executable path: {e}")))?;
 
     let exe_dir = exe_path
         .parent()
@@ -259,10 +232,10 @@ fn resolve_package_paths() -> Result<(String, String), AppError> {
         ));
     }
 
-    Err(AppError::internal(format!(
-        "Could not find a valid deployment pairing of '{}' and '{}' in the executable directory or 'singularity_package\\' subdirectory.",
-        inf_name, sys_name
-    )))
+    Err(BootstrapError::PackageFilesNotFound {
+        expected_path: exe_dir.display().to_string(),
+    }
+    .into())
 }
 
 /// Checks if the current process token has the Administrator elevation flag set.
@@ -274,7 +247,6 @@ fn is_running_as_admin() -> bool {
     unsafe {
         let mut token: HANDLE = std::ptr::null_mut();
 
-        // SAFETY: `GetCurrentProcess()` returns a valid pseudo-handle.
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
             return false;
         }

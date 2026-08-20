@@ -1,2 +1,5 @@
+//! Analytical detection sinks and event subscribers.
+
 pub mod direct_sys;
-pub mod system_context;
+
+pub use direct_sys::DirectSyscallSink;

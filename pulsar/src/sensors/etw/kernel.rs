@@ -2,13 +2,11 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
-use std::sync::mpsc::TrySendError;
 use std::thread::JoinHandle;
+use crossbeam_channel::{Sender, TrySendError};
 
 use super::event::EventRecord;
 use super::session::{EtwSession, EtwSessionBuilder, EventTraceProperties, TraceContext};
-use crate::pipeline::Event;
 use crate::{AppError, win_last_error};
 
 // Windows System APIs
@@ -121,24 +119,22 @@ unsafe extern "system" fn etw_callback(record: *mut EVENT_RECORD) {
                 return;
             }
 
-            // Parse and send the event to the Dispatcher.
-            if let Some(event_record) = EventRecord::from_raw(record) {
-                let event = Event::Etw(event_record);
-
-                if let Err(err) = (*ctx_ptr).sender.try_send(event) {
-                    match err {
-                        TrySendError::Full(_) => {
-                            // Warn only once if the channel is full
-                            if !(*ctx_ptr).channel_full_warned.swap(true, Ordering::Relaxed) {
-                                log::warn!(
-                                    target: "etw_kernel",
-                                    "The event channel reached its maximum capacity. Some events might be dropped."
-                                );
-                            }
+            // Send the raw event record to the Ingress Pipeline.
+            if let Some(event_record) = EventRecord::from_raw(record)
+                && let Err(err) = (*ctx_ptr).sender.try_send(event_record)
+            {
+                match err {
+                    TrySendError::Full(_) => {
+                        // Warn only once if the channel is full
+                        if !(*ctx_ptr).channel_full_warned.swap(true, Ordering::Relaxed) {
+                            log::warn!(
+                                target: "etw_kernel",
+                                "The event channel reached its maximum capacity. Some events might be dropped."
+                            );
                         }
-                        TrySendError::Disconnected(_) => {
-                            // Channel dropped, gracefully ignore as shutdown is in progress
-                        }
+                    }
+                    TrySendError::Disconnected(_) => {
+                        // Channel dropped, gracefully ignore as shutdown is in progress
                     }
                 }
             }
@@ -559,7 +555,7 @@ impl EtwSession for KernelSession {
     /// Returns `AppError::Internal` if the session is not started, or `AppError::WindowsApi` if `OpenTraceW` fails.
     fn consume(
         &self,
-        sender: SyncSender<Event>,
+        sender: Sender<EventRecord>,
     ) -> Result<JoinHandle<Result<(), AppError>>, AppError> {
         if self.handle.is_none() {
             log::warn!(target: "etw_kernel", "Attempted to consume events from an unstarted ETW session.");

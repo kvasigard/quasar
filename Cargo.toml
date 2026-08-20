@@ -7,6 +7,13 @@ resolver = "3"
 clap = { version = "4.5.31", features = ["derive"] }
 env_logger = "0.11.9"
 log = "0.4.29"
+dashmap = "6.1"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-log = "0.2"
+tracing-chrome = "0.7"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Etw",

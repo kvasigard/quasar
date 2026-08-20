@@ -33,6 +33,19 @@ impl From<LogMode> for log::LevelFilter {
     }
 }
 
+impl From<LogMode> for tracing_subscriber::filter::LevelFilter {
+    fn from(mode: LogMode) -> Self {
+        match mode {
+            LogMode::Off => tracing_subscriber::filter::LevelFilter::OFF,
+            LogMode::Error => tracing_subscriber::filter::LevelFilter::ERROR,
+            LogMode::Warn => tracing_subscriber::filter::LevelFilter::WARN,
+            LogMode::Info => tracing_subscriber::filter::LevelFilter::INFO,
+            LogMode::Debug => tracing_subscriber::filter::LevelFilter::DEBUG,
+            LogMode::Trace => tracing_subscriber::filter::LevelFilter::TRACE,
+        }
+    }
+}
+
 /// Pulsar Endpoint Detection and Response (EDR) Telemetry Agent.
 #[derive(Parser, Debug)]
 #[command(
@@ -68,6 +81,15 @@ pub struct Cli {
         help = "Write log output to the specified file instead of the console"
     )]
     pub log_file: Option<PathBuf>,
+
+    /// Export Chrome DevTools / Perfetto trace JSON file for visual profiling.
+    #[arg(
+        long = "profile-chrome",
+        alias = "trace-chrome",
+        value_name = "PATH",
+        help = "Export Chrome DevTools / Perfetto trace JSON file to visualize thread flame charts and bottlenecks"
+    )]
+    pub profile_chrome: Option<PathBuf>,
 
     #[arg(
         long,

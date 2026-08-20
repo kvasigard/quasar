@@ -1,10 +1,11 @@
 //! Common ETW session traits and configuration properties.
 
-use crate::error::AppError;
-use crate::pipeline::Event;
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::SyncSender;
 use std::thread::JoinHandle;
+use crossbeam_channel::Sender;
+
+use crate::error::AppError;
+use crate::sensors::etw::EventRecord;
 
 /// A common trait defining how to build ETW session properties.
 ///
@@ -30,54 +31,21 @@ pub trait EtwSessionBuilder {
 }
 
 /// Defines the lifecycle and consumption interface for an active ETW session.
-///
-/// Implementors are responsible for starting the trace session,
-/// routing OS event records into the pipeline channel, and stopping the trace.
 pub trait EtwSession {
     /// Starts the ETW trace session with Windows.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` on success, or `Err(AppError)` if session creation fails.
-    ///
-    /// # Errors
-    ///
-    /// Returns `AppError::WindowsApi` if `StartTraceW` or `ControlTraceW` fails.
     fn start(&mut self) -> Result<(), AppError>;
 
     /// Stops and closes the ETW trace session.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` on success, or `Err(AppError)` on failure.
-    ///
-    /// # Errors
-    ///
-    /// Returns `AppError::WindowsApi` if `ControlTraceW` fails.
     fn stop(&mut self) -> Result<(), AppError>;
 
     /// Spawns a background thread consuming event records via `ProcessTrace`.
-    ///
-    /// # Arguments
-    ///
-    /// * `sender` - Synchronous channel sender pushing decoded `Event` records to the dispatcher.
-    ///
-    /// # Returns
-    ///
-    /// A `JoinHandle` for the consumer thread.
-    ///
-    /// # Errors
-    ///
-    /// Returns `AppError::WindowsApi` if `OpenTraceW` fails.
     fn consume(
         &self,
-        sender: SyncSender<Event>,
+        sender: Sender<EventRecord>,
     ) -> Result<JoinHandle<Result<(), AppError>>, AppError>;
 }
 
 /// Properties controlling the buffering and logging behavior of the ETW session.
-///
-/// Reference: <https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties>
 #[derive(Debug, Clone, Default)]
 pub struct EventTraceProperties {
     /// Amount of memory allocated for each event tracing session buffer, in kilobytes.
@@ -99,8 +67,8 @@ pub struct EventTraceProperties {
 
 /// Context passed to the ETW C-callback function.
 pub struct TraceContext {
-    /// Sender channel forwarding parsed events to the event dispatcher.
-    pub sender: std::sync::mpsc::SyncSender<Event>,
+    /// Sender channel forwarding raw event records to the ingress pipeline.
+    pub sender: Sender<EventRecord>,
     /// Process ID of the tracer to filter out self-generated telemetry.
     pub current_pid: u32,
     /// Flag ensuring the channel saturation warning is only emitted once.
@@ -109,15 +77,7 @@ pub struct TraceContext {
 
 impl TraceContext {
     /// Creates a new `TraceContext`, caching the current process ID.
-    ///
-    /// # Arguments
-    ///
-    /// * `sender` - The channel sender for pipeline events.
-    ///
-    /// # Returns
-    ///
-    /// An initialized `TraceContext`.
-    pub fn new(sender: std::sync::mpsc::SyncSender<Event>) -> Self {
+    pub fn new(sender: Sender<EventRecord>) -> Self {
         Self {
             sender,
             current_pid: std::process::id(),

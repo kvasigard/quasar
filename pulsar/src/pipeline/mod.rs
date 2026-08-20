@@ -1,9 +1,12 @@
-//! The event routing backbone of the EDR.
+//! The event routing backbone and telemetry pipeline of the EDR.
 
 pub mod dispatcher;
 pub mod event;
+pub mod ingress;
 
-// Expose only the types that other modules need to interact with.
-// The internal implementation details remain private to the `pipeline` module.
-pub use dispatcher::{EventDispatcher, Subscriber};
-pub use event::Event;
+pub use dispatcher::{DispatcherHandle, EventDispatcher, Subscriber};
+pub use event::{
+    CorrelatedSyscallEvent, Event, ImageLoadEvent, ImageUnloadEvent, ProcessExitEvent,
+    ProcessStartEvent, SyscallEvent,
+};
+pub use ingress::IngressParser;
