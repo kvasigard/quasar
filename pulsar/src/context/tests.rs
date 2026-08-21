@@ -72,15 +72,16 @@ fn test_concurrent_in_place_interior_mutability() {
     let p1 = Arc::clone(&proc_arc);
     handles.push(thread::spawn(move || {
         for i in 0..100 {
-            p1.record_module_load(LoadedModule {
-                base_address: 0x7FFF_0000_0000 + (i * 0x10000),
-                image_size: 0x10000,
-                image_name: format!("module_{}.dll", i),
-                load_time: 100 + i as i64,
-                checksum: 0,
-                default_base: 0x7FFF_0000_0000,
-                is_unbacked: false,
-            });
+            p1.record_module_load(LoadedModule::new(
+                0x7FFF_0000_0000 + (i * 0x10000),
+                0x10000,
+                format!("module_{}.dll", i),
+                None,
+                100 + i as i64,
+                0,
+                0x7FFF_0000_0000,
+                false,
+            ));
         }
     }));
 
@@ -352,4 +353,89 @@ fn test_multi_source_deduplication_and_merging() {
     let event2 = crate::context::handlers::handle_process_start(&record1)
         .expect("Must deduplicate and merge");
     assert_eq!(event2.key, event1.key); // Merged into existing context entity!
+}
+
+/// Tests per-process memory address search across interior intervals, boundary conditions,
+/// unmapped gaps, system module identification, and centralized FileRegistry linkage.
+#[test]
+fn test_module_address_resolution_and_boundaries() {
+    let ctx = SystemContext::new_for_test(ContextConfig::for_test());
+    let pid = 7777;
+    let proc_key = ProcessKey::new();
+
+    let proc = ProcessContext::new(proc_key, None, pid, 1000, 100);
+    let proc_arc = ctx.insert_process(proc);
+
+    // Register backing files in FileRegistry
+    let file_ntdll = ctx.get_or_create_file(r"C:\Windows\System32\ntdll.dll", 100);
+    let file_app = ctx.get_or_create_file(r"C:\Program Files\App\app.dll", 100);
+
+    // Module 1: ntdll.dll at [0x7FFE_0000_0000 .. 0x7FFE_0010_0000) (size 0x100000, 1MB)
+    let mod1 = LoadedModule::new(
+        0x7FFE_0000_0000,
+        0x10_0000,
+        r"C:\Windows\System32\ntdll.dll",
+        Some(file_ntdll.key),
+        100,
+        0x1234,
+        0x7FFE_0000_0000,
+        false,
+    );
+
+    // Module 2: app.dll at [0x7FFE_0020_0000 .. 0x7FFE_0025_0000) (size 0x50000)
+    let mod2 = LoadedModule::new(
+        0x7FFE_0020_0000,
+        0x5_0000,
+        r"C:\Program Files\App\app.dll",
+        Some(file_app.key),
+        110,
+        0x5678,
+        0x7FFE_0020_0000,
+        false,
+    );
+
+    proc_arc.record_module_load(mod1);
+    proc_arc.record_module_load(mod2);
+
+    // 1. Inside Module 1
+    let resolved = ctx.resolve_module_by_address(pid, 0x7FFE_0005_1234).expect("Should resolve ntdll");
+    assert_eq!(resolved.image_name, r"C:\Windows\System32\ntdll.dll");
+    assert!(resolved.is_system);
+    assert_eq!(resolved.file_key, Some(file_ntdll.key));
+
+    // 2. Exact lower boundary (inclusive)
+    let at_start = ctx.resolve_module_by_address(pid, 0x7FFE_0000_0000).expect("Base address must resolve");
+    assert_eq!(at_start.base_address, 0x7FFE_0000_0000);
+
+    // 3. Exact upper boundary minus 1 (inclusive)
+    let at_last_byte = ctx.resolve_module_by_address(pid, 0x7FFE_000F_FFFF).expect("Last byte must resolve");
+    assert_eq!(at_last_byte.base_address, 0x7FFE_0000_0000);
+
+    // 4. Exact upper boundary (exclusive -> out of bounds)
+    assert!(ctx.resolve_module_by_address(pid, 0x7FFE_0010_0000).is_none());
+
+    // 5. In unmapped memory gap between Module 1 and Module 2
+    assert!(ctx.resolve_module_by_address(pid, 0x7FFE_0015_0000).is_none());
+
+    // 6. Address before lowest module
+    assert!(ctx.resolve_module_by_address(pid, 0x1000).is_none());
+
+    // 7. Address after highest module
+    assert!(ctx.resolve_module_by_address(pid, 0x7FFF_FFFF_FFFF).is_none());
+
+    // 8. Inside Module 2 (Non-system module)
+    let resolved_app = ctx.resolve_module_by_address(pid, 0x7FFE_0021_0000).expect("Should resolve app.dll");
+    assert_eq!(resolved_app.image_name, r"C:\Program Files\App\app.dll");
+    assert!(!resolved_app.is_system);
+    assert_eq!(resolved_app.file_key, Some(file_app.key));
+
+    // 9. Query via ProcessRef DSL
+    let proc_ref = ctx.process(pid).expect("Process must be active");
+    assert!(proc_ref.find_module_by_address(0x7FFE_0000_1000).is_some());
+
+    // 10. Module Unload: unmap app.dll and ensure address no longer resolves
+    proc_arc.record_module_unload(0x7FFE_0020_0000);
+    assert!(ctx.resolve_module_by_address(pid, 0x7FFE_0021_0000).is_none());
+    // ntdll.dll remains mapped and resolvable
+    assert!(ctx.resolve_module_by_address(pid, 0x7FFE_0000_1000).is_some());
 }

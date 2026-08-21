@@ -3,6 +3,7 @@
 pub mod file;
 pub mod handle;
 pub mod interaction;
+pub mod module;
 pub mod network;
 pub mod process;
 pub mod thread;
@@ -14,7 +15,8 @@ pub use interaction::{
     ConfidenceLevel, ExecutionTrigger, HandleDupDetails, InjectionDetails, InjectionTechnique,
     InteractionKind, InteractionRecord, MemoryTamperingDetails, TokenImpersonationDetails,
 };
+pub use module::LoadedModule;
 pub use network::{NetworkConnection, SocketProtocol};
-pub use process::{LoadedModule, ProcessContext};
+pub use process::ProcessContext;
 pub use thread::{ThreadContext, ThreadExecutionState};
 pub use token::{IntegrityLevel, PrivilegeState, TokenContext};

@@ -5,11 +5,14 @@
 //! records into existing context entities rather than creating redundant allocations.
 
 use crate::context::identity::ProcessKey;
-use crate::context::models::process::{LoadedModule, ProcessContext};
+use crate::context::models::module::LoadedModule;
+use crate::context::models::process::ProcessContext;
 use crate::context::CONTEXT;
 use crate::error::HandlerError;
 use crate::helpers::strings::*;
-use crate::pipeline::event::{ImageLoadEvent, ImageUnloadEvent, ProcessExitEvent, ProcessStartEvent};
+use crate::pipeline::event::{
+    ImageLoadEvent, ImageUnloadEvent, ProcessExitEvent, ProcessStartEvent,
+};
 use crate::sensors::etw::EventRecord;
 
 /// Handles and idempotently ingests process creation and rundown events.
@@ -188,15 +191,26 @@ pub fn handle_image_load(record: &EventRecord) -> Result<ImageLoadEvent, Handler
     let (image_name, _) = extract_utf16_string(data, 32);
     let resolved_name = image_name.unwrap_or_default();
 
-    let module = LoadedModule {
-        base_address: image_base,
+    let file_key = if !resolved_name.is_empty() {
+        Some(
+            CONTEXT
+                .get_or_create_file(&resolved_name, record.timestamp)
+                .key,
+        )
+    } else {
+        None
+    };
+
+    let module = LoadedModule::new(
+        image_base,
         image_size,
-        image_name: resolved_name,
-        load_time: record.timestamp,
+        resolved_name,
+        file_key,
+        record.timestamp,
         checksum,
         default_base,
-        is_unbacked: false,
-    };
+        false,
+    );
 
     let process_key = if let Some(ctx) = CONTEXT.get_process(pid) {
         ctx.record_module_load(module.clone());

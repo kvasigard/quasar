@@ -2,13 +2,14 @@
 
 use std::sync::Arc;
 
+use crate::context::SystemContext;
 use crate::context::identity::{FileKey, ProcessKey};
 use crate::context::models::handle::HandleObject;
 use crate::context::models::interaction::InteractionRecord;
+use crate::context::models::module::LoadedModule;
 use crate::context::models::network::NetworkConnection;
-use crate::context::models::process::{LoadedModule, ProcessContext};
+use crate::context::models::process::ProcessContext;
 use crate::context::models::token::TokenContext;
-use crate::context::SystemContext;
 
 /// Ergonomic, fluent query wrapper around an `Arc<ProcessContext>` snapshot.
 ///
@@ -223,7 +224,7 @@ impl<'a> ProcessRef<'a> {
     ///
     /// A vector of [`LoadedModule`] descriptors.
     pub fn loaded_modules(&self) -> Vec<LoadedModule> {
-        self.inner.loaded_modules.read().values().cloned().collect()
+        self.inner.loaded_modules.read().clone()
     }
 
     /// Checks if this process has loaded a specific module by name (case-insensitive).
@@ -240,8 +241,22 @@ impl<'a> ProcessRef<'a> {
         self.inner
             .loaded_modules
             .read()
-            .values()
+            .iter()
             .any(|m| m.image_name.to_lowercase().contains(&lower))
+    }
+
+    /// Resolves a virtual memory address to its owning loaded module within this process.
+    ///
+    /// # Arguments
+    ///
+    /// * `addr` - The 64-bit virtual memory address to resolve.
+    ///
+    /// # Returns
+    ///
+    /// `Some(LoadedModule)` if the address is within mapped module bounds, otherwise `None`.
+    #[inline]
+    pub fn find_module_by_address(&self, addr: u64) -> Option<LoadedModule> {
+        self.inner.find_module_by_address(addr)
     }
 
     /// Returns a snapshot list of open kernel handles tracked for this process.
