@@ -29,6 +29,12 @@ Stage 1 also handles multi-source event deduplication. In a live system, telemet
 
 Another critical responsibility of Stage 1 is call stack correlation. When Windows traces system calls through ETW, it splits the information across two separate events: first, a `SyscallEnter` event fired directly on the CPU core when a thread issues a system call, and second, an asynchronous `Stack_Walk` event delivered a short time later by the kernel stack unwinder containing the array of return addresses. The `StackCorrelator` pairs these asynchronous events in a small, time-ordered ring buffer. By performing this correlation in Stage 1, all downstream detection sinks receive a unified event containing both the syscall details and its complete call stack without having to duplicate buffering logic in every sink.
 
+## Asynchronous Metadata Enrichment Offloading
+
+To ensure Stage 1 Ingress processing latency remains under 100 nanoseconds per event, heavy disk I/O and synchronous Win32 API calls (such as Authenticode signature verification via `WinVerifyTrust` or full PE header inspection) are strictly prohibited on the Ingress and Dispatcher worker threads.
+
+When `IngressParser` processes a process creation or image load, `SystemContext::get_or_create_file` registers the image path in `FileRegistry` and dispatches an `EnrichmentTask::NewFile(FileKey)` to the background `pulsar-context-enrichment` worker via a non-blocking `.try_send()` channel handoff. This completely isolates the real-time kernel event pipeline from disk latency and OS certificate validation overhead.
+
 ## Stage 2: Concurrent Work Distribution with Crossbeam Channels
 
 Once Stage 1 produces a strongly-typed domain event and updates the context, the event is wrapped in a shared pointer (`Arc<Event>`) and dispatched across the worker pool.

@@ -50,6 +50,7 @@ impl LoadedModule {
 
     /// Instantiates a new [`LoadedModule`], automatically evaluating whether the path points to a Windows system binary.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_address: u64,
         image_size: u64,

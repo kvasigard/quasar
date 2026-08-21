@@ -13,6 +13,8 @@ pub struct ContextConfig {
     pub gc_interval_ms: u64,
     /// Whether to preserve parent ancestry chains by converting expired parents into lightweight tombstones.
     pub enable_tombstones: bool,
+    /// Total capacity of the queued enrichment tasks (default: 2048)
+    pub enrichment_queue_capacity: usize,
 }
 
 impl Default for ContextConfig {
@@ -28,6 +30,7 @@ impl Default for ContextConfig {
             max_interaction_capacity: 100_000,
             gc_interval_ms: 5_000,
             enable_tombstones: true,
+            enrichment_queue_capacity: 2048,
         }
     }
 }
@@ -45,6 +48,7 @@ impl ContextConfig {
             max_interaction_capacity: 50,
             gc_interval_ms: 20,
             enable_tombstones: true,
+            enrichment_queue_capacity: 24,
         }
     }
 }
