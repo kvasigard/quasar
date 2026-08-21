@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::context::LoadedModule;
 use crate::context::config::ContextConfig;
 use crate::context::correlation::InjectionCorrelator;
 use crate::context::identity::{FileKey, ProcessKey};
@@ -9,9 +10,7 @@ use crate::context::models::file::FileContext;
 use crate::context::models::interaction::InteractionRecord;
 use crate::context::models::process::ProcessContext;
 use crate::context::query::{InteractionQuery, ProcessRef};
-use crate::context::registries::{
-    FileRegistry, InteractionRegistry, NetworkRegistry, ProcessTree,
-};
+use crate::context::registries::{FileRegistry, InteractionRegistry, NetworkRegistry, ProcessTree};
 use crate::context::retention::RetentionManager;
 
 /// Centralized, concurrent execution context container holding all system-wide entity domains.
@@ -334,5 +333,47 @@ impl SystemContext {
     /// A tuple `(evicted_count, tombstones_created)`.
     pub fn run_gc_pass(&self, now: i64) -> (usize, usize) {
         self.retention.run_gc_pass(&self.processes, now)
+    }
+
+    /// Resolves a mapped [`LoadedModule`] for a given OS Process ID and virtual memory address.
+    ///
+    /// Searches the process table by PID, delegating to the underlying binary search
+    /// over mapped address spaces if the process exists.
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - Target operating system Process ID.
+    /// * `addr` - Virtual memory address within the process space to resolve.
+    ///
+    /// # Returns
+    ///
+    /// An [`Option<LoadedModule>`] containing the module metadata if both the process
+    /// is registered and the address falls within an active module boundary.
+    #[must_use]
+    pub fn resolve_module_by_address(&self, pid: u32, addr: u64) -> Option<LoadedModule> {
+        self.get_process(pid)?.find_module_by_address(addr)
+    }
+
+    /// Resolves a mapped [`LoadedModule`] for a synthetic [`ProcessKey`] and virtual memory address.
+    ///
+    /// Uses the synthetic key to look up the process context before searching
+    /// its mapped virtual address space.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Monotonically increasing synthetic identifier for the target process.
+    /// * `addr` - Virtual memory address within the process space to resolve.
+    ///
+    /// # Returns
+    ///
+    /// An [`Option<LoadedModule>`] containing the module metadata if the process key
+    /// is valid and the address falls within an active module boundary.
+    #[must_use]
+    pub fn resolve_module_by_process_key(
+        &self,
+        key: ProcessKey,
+        addr: u64,
+    ) -> Option<LoadedModule> {
+        self.get_process_by_key(key)?.find_module_by_address(addr)
     }
 }

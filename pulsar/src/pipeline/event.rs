@@ -1,7 +1,7 @@
 //! Normalized pipeline domain events and telemetry types.
 
 use crate::context::identity::ProcessKey;
-use crate::context::models::process::LoadedModule;
+use crate::context::models::module::LoadedModule;
 
 /// Strongly-typed event representing a process creation or initial rundown discovery.
 #[derive(Debug, Clone)]

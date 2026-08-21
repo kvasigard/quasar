@@ -1,34 +1,18 @@
 //! Process entity models, interior mutability state, and loaded module tracking.
 
+use parking_lot::RwLock;
 use std::{
     collections::{HashMap, HashSet},
     sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering},
 };
-use parking_lot::RwLock;
 use windows_sys::Win32::Foundation::STILL_ACTIVE;
 
-use crate::context::identity::{ConnectionKey, FileKey, ProcessKey};
 use crate::context::models::handle::HandleObject;
 use crate::context::models::token::TokenContext;
-
-/// Metadata representing an executable binary or DLL mapped into virtual memory.
-#[derive(Debug, Clone)]
-pub struct LoadedModule {
-    /// Virtual base address where the image was mapped.
-    pub base_address: u64,
-    /// Size of the mapped image in bytes.
-    pub image_size: u64,
-    /// Module name or full image path.
-    pub image_name: String,
-    /// Timestamp when the module was loaded (FILETIME 100ns ticks).
-    pub load_time: i64,
-    /// Checksum extracted from the PE header.
-    pub checksum: u32,
-    /// Preferred default base address from the PE header.
-    pub default_base: u64,
-    /// Whether this module image is unbacked by a physical file on disk (memory-only/reflective DLL).
-    pub is_unbacked: bool,
-}
+use crate::context::{
+    identity::{ConnectionKey, FileKey, ProcessKey},
+    module::LoadedModule,
+};
 
 /// Complete execution context for a single process lifecycle instance.
 ///
@@ -90,9 +74,9 @@ pub struct ProcessContext {
     // --- In-Place Mutable Sub-Tables (Fine-grained Interior Mutability) ---
     /// Security token context.
     pub token: RwLock<TokenContext>,
-    /// Dynamic libraries mapped in virtual memory: `BaseAddress -> LoadedModule`.
-    pub loaded_modules: RwLock<HashMap<u64, LoadedModule>>,
-    /// Active and observed kernel handles: `HandleValue -> HandleObject`.
+    /// Dynamic libraries mapped in virtual memory..
+    pub loaded_modules: RwLock<Vec<LoadedModule>>,
+    /// Active and observed kernel handles
     pub handles: RwLock<HashMap<u64, HandleObject>>,
     /// Active thread IDs (TIDs) owned by this process.
     pub threads: RwLock<HashSet<u32>>,
@@ -144,12 +128,40 @@ impl ProcessContext {
             package_full_name: None,
             application_id: None,
             token: RwLock::new(TokenContext::default()),
-            loaded_modules: RwLock::new(HashMap::new()),
+            loaded_modules: RwLock::new(Vec::new()),
             handles: RwLock::new(HashMap::new()),
             threads: RwLock::new(HashSet::new()),
             touched_files: RwLock::new(HashSet::new()),
             network_connections: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Resolves the [`LoadedModule`] whose mapped virtual address range contains `addr`.
+    ///
+    /// Performs an $O(\log n)$ lookup via binary search over the sorted module list.
+    ///
+    /// # Arguments
+    ///
+    /// * `addr` - The virtual memory address to resolve.
+    ///
+    /// # Returns
+    ///
+    /// An [`Option<LoadedModule>`] containing a clone of the matching module metadata,
+    /// or [`None`] if the address falls outside all mapped module ranges.
+    pub fn find_module_by_address(&self, addr: u64) -> Option<LoadedModule> {
+        let modules = self.loaded_modules.read();
+
+        // Binary search identifies either the exact base address match or the insertion index
+        // immediately following the preceding module candidate.
+        let candidate_idx = match modules.binary_search_by_key(&addr, |m| m.base_address) {
+            Ok(exact_idx) => exact_idx,
+            Err(idx) => idx.checked_sub(1)?,
+        };
+
+        modules
+            .get(candidate_idx)
+            .filter(|module| module.contains_address(addr))
+            .cloned()
     }
 
     /// Checks whether the process is currently running.
@@ -208,20 +220,46 @@ impl ProcessContext {
 
     /// Records a newly mapped DLL or binary image into this process context in-place.
     ///
+    /// Maintains the internal [`Vec<LoadedModule>`] in ascending order by base address.
+    /// If a module already exists at `module.base_address`, its metadata is overwritten;
+    /// otherwise, it is inserted at the sorted position in $O(n)$ time.
+    ///
     /// # Arguments
     ///
-    /// * `module` - The loaded module metadata.
+    /// * `module` - The loaded module metadata to record.
     pub fn record_module_load(&self, module: LoadedModule) {
-        self.loaded_modules.write().insert(module.base_address, module);
+        let mut modules = self.loaded_modules.write();
+        match modules.binary_search_by_key(&module.base_address, |m| m.base_address) {
+            Ok(idx) => modules[idx] = module,
+            Err(insert_idx) => modules.insert(insert_idx, module),
+        }
     }
 
     /// Unmaps a module when an image unload event occurs in-place.
     ///
+    /// Locates the module by its base address in $O(\log n)$ time using binary search
+    /// and shifts subsequent elements to maintain continuous sorted storage.
+    ///
     /// # Arguments
     ///
     /// * `base_address` - The virtual base address of the unmapped image.
-    pub fn record_module_unload(&self, base_address: u64) {
-        self.loaded_modules.write().remove(&base_address);
+    ///
+    /// # Returns
+    ///
+    /// An [`Option<LoadedModule>`] containing the removed module metadata, or [`None`]
+    /// if no module was mapped at `base_address`.
+    pub fn record_module_unload(&self, base_address: u64) -> Option<LoadedModule> {
+        let mut modules = self.loaded_modules.write();
+        match modules.binary_search_by_key(&base_address, |m| m.base_address) {
+            Ok(idx) => Some(modules.remove(idx)),
+            Err(_) => {
+                log::debug!(
+                    "Attempted to unload unmapped module at address {:#x}",
+                    base_address
+                );
+                None
+            }
+        }
     }
 
     /// Records an opened kernel handle in-place.
