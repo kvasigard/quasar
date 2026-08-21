@@ -54,15 +54,16 @@ impl FileRegistry {
     ///
     /// # Returns
     ///
-    /// A shared [`Arc<FileContext>`] reference.
-    pub fn get_or_create(&self, raw_path: &str, timestamp: i64) -> Arc<FileContext> {
+    /// A tuple containing the shared [`Arc<FileContext>`] reference and a `bool` indicating
+    /// whether this file was newly created (`true`) or already existed (`false`).
+    pub fn get_or_create(&self, raw_path: &str, timestamp: i64) -> (Arc<FileContext>, bool) {
         let normalized = normalize_file_path(raw_path);
 
         if let Some(key_ref) = self.path_to_key.get(&normalized)
             && let Some(file_ref) = self.files.get(key_ref.value())
         {
             file_ref.touch(timestamp);
-            return Arc::clone(file_ref.value());
+            return (Arc::clone(file_ref.value()), false);
         }
 
         let key = FileKey::new();
@@ -71,7 +72,7 @@ impl FileRegistry {
         self.files.insert(key, Arc::clone(&file_ctx));
         self.path_to_key.insert(normalized, key);
 
-        file_ctx
+        (file_ctx, true)
     }
 
     /// Looks up a file context by its synthetic FileKey.

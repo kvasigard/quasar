@@ -71,6 +71,15 @@ To eliminate this overhead, `ProcessContext` maintains an in-memory interval arr
 - **System Binary Classification**: Modules located under recognized Windows system directories (such as `\System32\` or `\SysWOW64\`) are classified with the `is_system` flag for fast anomaly filtering.
 - **Sub-50ns Execution**: Lookups execute purely in-memory under lightweight `parking_lot::RwLock` read guards in less than 50 nanoseconds, without issuing Win32 debug or disk API calls.
 
+## Asynchronous Context Background Enrichment
+
+Performing heavy metadata extraction (such as Authenticode signature verification via `WinVerifyTrust`, PE header export directory parsing, and memory VAD scans) directly on the Stage 1 Ingress or Stage 2 Dispatcher worker threads introduces queue latency spikes. Under heavy event volume, this can cause ETW kernel ring buffers to overflow and drop telemetry.
+
+To prevent telemetry drops, Quasar includes a dedicated background enrichment pipeline:
+- **Event-Driven Reactive Worker**: The `pulsar-context-enrichment` background thread consumes jobs from a bounded lock-free Crossbeam channel, sleeping at zero percent CPU usage when idle and waking instantly when tasks arrive.
+- **Non-Blocking Ingress Handoff**: When a new file is registered in `FileRegistry` (via `get_or_create_file`), `SystemContext` dispatches an `EnrichmentTask::NewFile(FileKey)` using non-blocking `.try_send()`. If the queue is saturated during massive process storms, the task is safely dropped rather than stalling kernel ingestion.
+- **Single-Source Caching**: Extracted intelligence (PE exported syscall RVAs and Authenticode digital signature trust states) is populated directly onto the shared `FileRecord` in `FileRegistry`, allowing all processes referencing that `FileKey` to share the enriched metadata with zero redundant disk reads.
+
 ## Context System Expansion Notes
 
 When you want to expand the System Context with new capabilities, keep the following guidelines in mind to preserve performance and thread safety:

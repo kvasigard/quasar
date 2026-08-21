@@ -4,10 +4,10 @@
 //! or user-mode hooks), these handlers ensure idempotent state updates by merging duplicate
 //! records into existing context entities rather than creating redundant allocations.
 
+use crate::context::CONTEXT;
 use crate::context::identity::ProcessKey;
 use crate::context::models::module::LoadedModule;
 use crate::context::models::process::ProcessContext;
-use crate::context::CONTEXT;
 use crate::error::HandlerError;
 use crate::helpers::strings::*;
 use crate::pipeline::event::{
@@ -94,6 +94,9 @@ pub fn handle_process_start(record: &EventRecord) -> Result<ProcessStartEvent, H
     context.application_id = application_id;
 
     let inserted = CONTEXT.insert_process(context);
+    if !image_file_name.is_empty() {
+        CONTEXT.get_or_create_file(&image_file_name, record.timestamp);
+    }
 
     Ok(ProcessStartEvent {
         key: inserted.key,

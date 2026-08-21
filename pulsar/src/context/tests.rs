@@ -278,8 +278,10 @@ fn test_file_and_network_registries() {
     let ctx = SystemContext::new_for_test(ContextConfig::for_test());
 
     // Normalized paths map to identical FileKey
-    let f1 = ctx.files.get_or_create(r"\??\C:\Windows\System32\cmd.exe", 100);
-    let f2 = ctx.files.get_or_create(r"c:/windows/system32/cmd.exe", 100);
+    let (f1, created1) = ctx.files.get_or_create(r"\??\C:\Windows\System32\cmd.exe", 100);
+    let (f2, created2) = ctx.files.get_or_create(r"c:/windows/system32/cmd.exe", 100);
+    assert!(created1);
+    assert!(!created2);
     assert_eq!(f1.key, f2.key);
 
     f1.set_sha256([0xAA; 32]);
@@ -438,4 +440,38 @@ fn test_module_address_resolution_and_boundaries() {
     assert!(ctx.resolve_module_by_address(pid, 0x7FFE_0021_0000).is_none());
     // ntdll.dll remains mapped and resolvable
     assert!(ctx.resolve_module_by_address(pid, 0x7FFE_0000_1000).is_some());
+}
+
+/// Tests that the enrichment queue handles non-blocking capacity saturation and automatic trigger on new file creation.
+#[test]
+fn test_context_enrichment_queue_and_worker() {
+    use crate::context::enrichment::{EnrichmentQueue, EnrichmentTask};
+    use crate::context::identity::FileKey;
+
+    // 1. Test queue non-blocking try_send and capacity saturation
+    let (queue, rx) = EnrichmentQueue::new(2);
+    let k1 = FileKey::new();
+    let k2 = FileKey::new();
+    let k3 = FileKey::new();
+
+    assert!(queue.queue_task(EnrichmentTask::NewFile(k1)));
+    assert!(queue.queue_task(EnrichmentTask::NewFile(k2)));
+    // Queue is full at capacity 2 -> drops task gracefully without blocking
+    assert!(!queue.queue_task(EnrichmentTask::NewFile(k3)));
+
+    // Drain one item and test that queue accepts new task
+    assert_eq!(rx.recv().unwrap(), EnrichmentTask::NewFile(k1));
+    assert!(queue.queue_task(EnrichmentTask::NewFile(k3)));
+
+    // 2. Test worker lifecycle and clean shutdown
+    let (queue, rx) = EnrichmentQueue::new(16);
+    let enrichment = Arc::new(queue);
+    let worker_handle = Arc::clone(&enrichment).spawn_worker(rx);
+
+    // Enqueue via facade
+    assert!(enrichment.queue_task(EnrichmentTask::ScanMemoryVad(ProcessKey::new())));
+
+    // Drop sender to allow worker thread to terminate cleanly
+    drop(enrichment);
+    worker_handle.join().expect("Enrichment worker should exit cleanly when queue drops");
 }

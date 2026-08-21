@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::context::LoadedModule;
 use crate::context::config::ContextConfig;
 use crate::context::correlation::InjectionCorrelator;
+use crate::context::enrichment::{EnrichmentQueue, EnrichmentTask};
 use crate::context::identity::{FileKey, ProcessKey};
 use crate::context::models::file::FileContext;
 use crate::context::models::interaction::InteractionRecord;
@@ -27,6 +28,8 @@ pub struct SystemContext {
     pub(crate) injection_correlator: InjectionCorrelator,
     /// Dual-trigger garbage collection and retention manager.
     pub(crate) retention: Arc<RetentionManager>,
+    /// Enrichment task for heavy operation to populate context structures.
+    pub(crate) enrichment: Arc<EnrichmentQueue>,
 }
 
 impl Default for SystemContext {
@@ -56,17 +59,23 @@ impl SystemContext {
     /// An initialized [`SystemContext`] instance with active background GC.
     pub fn new_with_config(config: ContextConfig) -> Self {
         let max_interactions = config.max_interaction_capacity;
+        let enrichment_capacity = config.enrichment_queue_capacity;
         let processes = Arc::new(ProcessTree::new());
         let files = Arc::new(FileRegistry::new());
         let network = Arc::new(NetworkRegistry::new());
         let interactions = Arc::new(InteractionRegistry::new(max_interactions));
         let injection_correlator = InjectionCorrelator::new();
+        let (enrichment_queue, enrichment_rx) = EnrichmentQueue::new(enrichment_capacity);
         let retention = Arc::new(RetentionManager::new(config));
 
         // Spawn background GC worker thread
         let retention_clone = Arc::clone(&retention);
         let processes_clone = Arc::clone(&processes);
         retention_clone.spawn_gc_thread(processes_clone);
+
+        let enrichment = Arc::new(enrichment_queue);
+        let enrichment_clone = Arc::clone(&enrichment);
+        enrichment_clone.spawn_worker(enrichment_rx);
 
         log::info!(
             target: "system_context",
@@ -80,6 +89,7 @@ impl SystemContext {
             interactions,
             injection_correlator,
             retention,
+            enrichment,
         }
     }
 
@@ -94,13 +104,15 @@ impl SystemContext {
     /// An isolated [`SystemContext`] without background worker threads.
     pub fn new_for_test(config: ContextConfig) -> Self {
         let max_interactions = config.max_interaction_capacity;
+        let enrichment_capacity = config.enrichment_queue_capacity;
         let processes = Arc::new(ProcessTree::new());
         let files = Arc::new(FileRegistry::new());
         let network = Arc::new(NetworkRegistry::new());
         let interactions = Arc::new(InteractionRegistry::new(max_interactions));
         let injection_correlator = InjectionCorrelator::new();
+        let (enrichment_queue, _rx) = EnrichmentQueue::new(enrichment_capacity);
         let retention = Arc::new(RetentionManager::new(config));
-
+        let enrichment = Arc::new(enrichment_queue);
         Self {
             processes,
             files,
@@ -108,6 +120,7 @@ impl SystemContext {
             interactions,
             injection_correlator,
             retention,
+            enrichment,
         }
     }
 
@@ -238,7 +251,11 @@ impl SystemContext {
     ///
     /// An [`Arc<FileContext>`] reference.
     pub fn get_or_create_file(&self, path: &str, timestamp: i64) -> Arc<FileContext> {
-        self.files.get_or_create(path, timestamp)
+        let (file, created) = self.files.get_or_create(path, timestamp);
+        if created {
+            self.queue_enrichment_task(EnrichmentTask::NewFile(file.key));
+        }
+        file
     }
 
     /// Looks up a tracked file by path if already observed.
@@ -375,5 +392,11 @@ impl SystemContext {
         addr: u64,
     ) -> Option<LoadedModule> {
         self.get_process_by_key(key)?.find_module_by_address(addr)
+    }
+
+    /// Enqueues an asynchronous enrichment task to the background worker.
+    #[inline]
+    pub fn queue_enrichment_task(&self, task: EnrichmentTask) -> bool {
+        self.enrichment.queue_task(task)
     }
 }

@@ -23,6 +23,7 @@
 
 pub mod config;
 pub mod correlation;
+pub mod enrichment;
 pub mod handlers;
 pub mod identity;
 pub mod models;
