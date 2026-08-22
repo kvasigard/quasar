@@ -18,15 +18,25 @@ pub const PERFINFO_GUID: GUID = GUID {
     data4: [0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc],
 };
 
+/// Defines the GUID for File I/O events (`{90cbdc39-4a3e-11d1-84f4-0000f80464e3}`).
+///
+/// Reference: <https://learn.microsoft.com/en-us/windows/win32/etw/nt-kernel-logger-constants>
+pub const FILE_IO_GUID: GUID = GUID {
+    data1: 0x90cbdc39,
+    data2: 0x4a3e,
+    data3: 0x11d1,
+    data4: [0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3],
+};
+
 /// Event ID for System Call Entry (`SysClEnter`) used in ETW stack tracing.
 pub const EVENT_ID_SYSCALL_ENTER: u8 = 51;
 
-/// Default buffer size in kilobytes for high-throughput kernel telemetry.
+/// Default buffer size in kilobytes for high-throughput kernel telemetry (1 MB).
 pub const DEFAULT_BUFFER_SIZE_KB: u32 = 1024;
 /// Default minimum number of buffers in the ETW ring-buffer pool.
-pub const DEFAULT_MIN_BUFFERS: u32 = 64;
-/// Default maximum number of buffers in the ETW ring-buffer pool.
-pub const DEFAULT_MAX_BUFFERS: u32 = 128;
+pub const DEFAULT_MIN_BUFFERS: u32 = 128;
+/// Default maximum number of buffers in the ETW ring-buffer pool (up to 512 MB memory pool).
+pub const DEFAULT_MAX_BUFFERS: u32 = 512;
 /// Default forced buffer flush timer in seconds.
 pub const DEFAULT_FLUSH_TIMER_SECS: u32 = 1;
 
@@ -91,14 +101,25 @@ impl SessionDirector {
         builder.enable_flag(KernelFlag::ImageLoad);
     }
 
+    /// Enables real-time filesystem I/O telemetry (file creations, writes, deletions, and name mappings).
+    ///
+    /// # Arguments
+    ///
+    /// * `builder` - A mutable reference to the `KernelSessionBuilder`.
+    pub fn enable_file_monitoring(builder: &mut KernelSessionBuilder) {
+        builder
+            .enable_flag(KernelFlag::DiskFileIo)
+            .enable_flag(KernelFlag::FileIoInit);
+    }
+
     /// Composes a tailored EDR kernel trace session based on active feature toggles
-    /// using standard internal ring-buffer configurations.
+    /// using scaled ring-buffer configurations to absorb high-throughput file bursts.
     ///
     /// # Arguments
     ///
     /// * `builder` - A mutable reference to the `KernelSessionBuilder`.
     /// * `enable_syscalls` - Whether to enable system call monitoring and stack tracing.
-    /// * `enable_context` - Whether to enable process and image load lifecycle telemetry.
+    /// * `enable_context` - Whether to enable process, image load, and file lifecycle telemetry.
     pub fn construct_edr_session(
         builder: &mut KernelSessionBuilder,
         enable_syscalls: bool,
@@ -119,6 +140,7 @@ impl SessionDirector {
         if enable_context {
             Self::enable_process_monitoring(builder);
             Self::enable_image_monitoring(builder);
+            Self::enable_file_monitoring(builder);
         }
     }
 }

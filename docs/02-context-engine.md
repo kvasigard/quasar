@@ -80,6 +80,54 @@ To prevent telemetry drops, Quasar includes a dedicated background enrichment pi
 - **Non-Blocking Ingress Handoff**: When a new file is registered in `FileRegistry` (via `get_or_create_file`), `SystemContext` dispatches an `EnrichmentTask::NewFile(FileKey)` using non-blocking `.try_send()`. If the queue is saturated during massive process storms, the task is safely dropped rather than stalling kernel ingestion.
 - **Single-Source Caching**: Extracted intelligence (PE exported syscall RVAs and Authenticode digital signature trust states) is populated directly onto the shared `FileRecord` in `FileRegistry`, allowing all processes referencing that `FileKey` to share the enriched metadata with zero redundant disk reads.
 
+## Real-Time Filesystem Telemetry Ingestion & FileRegistry Population
+
+Without real-time filesystem telemetry, `FileRegistry` would only track binaries loaded at process startup or DLL load time. Real-time NT Kernel Logger ingestion (`EVENT_TRACE_FLAG_DISK_FILE_IO` and `EVENT_TRACE_FLAG_FILE_IO_INIT`) gives detection sinks full visibility into file creations, writes, renames, deletions, and non-execution disk interactions.
+
+```
+ ┌────────────────────────────────────────────────────────┐
+ │           Windows NT Kernel Logger ETW                 │
+ │   • EVENT_TRACE_FLAG_DISK_FILE_IO | FILE_IO_INIT       │
+ └───────────────────────────┬────────────────────────────┘
+                             │ (0x90cbdc39 FileIoGuid)
+                             ▼
+ ┌────────────────────────────────────────────────────────┐
+ │           Stage 1 IngressParser Dispatch               │
+ │ • FileIo_Create (64), FileIo_Name (0, 32, 36)          │
+ │ • FileIo_ReadWrite (67, 68), FileIo_SimpleOp (65, 66)  │
+ └───────────────────────────┬────────────────────────────┘
+                             │
+            ┌────────────────┴────────────────┐
+            ▼                                 ▼
+ ┌──────────────────────┐          ┌──────────────────────┐
+ │     FileRegistry     │          │    ProcessContext    │
+ │ • normalize_path     │          │ • touched_files      │
+ │ • FileObject -> Key  │          │ • in-place record    │
+ │ • bounded history    │          └──────────────────────┘
+ └──────────────────────┘
+```
+
+### 1. NT Device Path Normalization
+File I/O events from the kernel arrive with diverse path formats including NT object manager prefixes (`\??\C:\...`, `\\?\C:\...`) and NT device volume paths (`\Device\HarddiskVolumeX\...`).
+* `normalize_file_path()` strips leading `\??\` and `\\?\` prefixes.
+* Converts forward slashes to standard Windows backslashes (`\`).
+* Lowercases the path string so case differences in Windows APIs resolve to identical canonical `FileKey` identifiers in `FileRegistry`.
+
+### 2. Kernel `FileObject` Pointer Lifecycle & Memory Retention
+ETW file read, write, and simple operation events identify files using 64-bit kernel `FileObject` / `FileKey` pointers rather than path strings.
+* **Association**: When a `FileIo_Create` (opcode 64) or `FileIo_Name` (opcode 0/32/36) event is processed, `FileRegistry` maps `FileObject -> FileKey` in a concurrent `DashMap`.
+* **Fast Operation Resolution**: Subsequent `FileIo_ReadWrite` (read/write) and `FileIo_Info` events resolve the `FileKey` and canonical path instantly in memory without parsing file path strings.
+* **Unmapping on Close**: When `FileIo_SimpleOp` (opcode 66 `Close`) arrives, `FileRegistry::unmap_file_object` deletes the entry, preventing unbounded memory growth as file handles open and close across the OS.
+
+### 3. Bounded Access History & Write Tracking
+Each `FileContext` maintains:
+* **Atomic `last_accessed`**: Monotonically updated with relaxed atomic max operations, recording the latest access timestamp without acquiring write locks.
+* **Write Flag (`is_modified`)**: Set atomically to `true` whenever mutation operations (writes, deletes, renames, set-info) occur.
+* **Bounded History Ring Buffer**: A `VecDeque<FileAccessRecord>` capped at 32 entries per file, storing `(OperationKind, timestamp, bytes_transferred, is_write)` without memory bloat.
+
+### 4. Process Context touched_files Linkage
+Whenever a process creates, opens, or writes to a file, the resulting `FileKey` is recorded into the originating process's `ProcessContext::touched_files` set. Detection sinks can query `proc.touched_files()`, `proc.recent_file_writes()`, and `proc.modified_files()` through the `ProcessRef` fluent query DSL.
+
 ## Context System Expansion Notes
 
 When you want to expand the System Context with new capabilities, keep the following guidelines in mind to preserve performance and thread safety:

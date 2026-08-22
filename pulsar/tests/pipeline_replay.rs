@@ -135,11 +135,98 @@ fn test_end_to_end_synthetic_pipeline_replay() {
     tx.send(syscall_record).unwrap();
     tx.send(stack_record).unwrap();
 
-    // 3. Drop sender to trigger channel close and drain all events through the worker pool
+    // 3. Synthesize FileIo_Create (Opcode 64) + FileIo_Write (Opcode 68) + FileIo_Close (Opcode 66)
+    let file_obj: u64 = 0xFFFF_E000_5555_4444;
+    let mut file_create_payload = Vec::new();
+    file_create_payload.extend_from_slice(&0u64.to_ne_bytes());
+    file_create_payload.extend_from_slice(&0u64.to_ne_bytes());
+    file_create_payload.extend_from_slice(&file_obj.to_ne_bytes());
+    file_create_payload.extend_from_slice(&0u32.to_ne_bytes());
+    file_create_payload.extend_from_slice(&0u32.to_ne_bytes());
+    file_create_payload.extend_from_slice(&0u32.to_ne_bytes());
+    let path: Vec<u16> = "C:\\Windows\\System32\\drivers\\etc\\hosts\0".encode_utf16().collect();
+    for u in path {
+        file_create_payload.extend_from_slice(&u.to_ne_bytes());
+    }
+
+    let file_create_record = EventRecord {
+        event_id: 64,
+        version: 2,
+        opcode: 64, // FileIo_Create
+        level: 0,
+        provider_id: windows_sys::core::GUID {
+            data1: 0x90cbdc39,
+            data2: 0x4a3e,
+            data3: 0x11d1,
+            data4: [0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3],
+        },
+        process_id: 7777,
+        thread_id: 8888,
+        timestamp: 30_000,
+        user_data: file_create_payload,
+        stack_trace: None,
+    };
+
+    let mut file_write_payload = Vec::new();
+    file_write_payload.extend_from_slice(&0u64.to_ne_bytes());         // Offset
+    file_write_payload.extend_from_slice(&0u64.to_ne_bytes());         // IrpPtr
+    file_write_payload.extend_from_slice(&0u64.to_ne_bytes());         // TTID
+    file_write_payload.extend_from_slice(&file_obj.to_ne_bytes());     // FileObject
+    file_write_payload.extend_from_slice(&0u64.to_ne_bytes());         // FileKey
+    file_write_payload.extend_from_slice(&2048u32.to_ne_bytes());      // IoSize
+    file_write_payload.extend_from_slice(&0u32.to_ne_bytes());         // IoFlags
+
+    let file_write_record = EventRecord {
+        event_id: 68,
+        version: 2,
+        opcode: 68, // FileIo_Write
+        level: 0,
+        provider_id: windows_sys::core::GUID {
+            data1: 0x90cbdc39,
+            data2: 0x4a3e,
+            data3: 0x11d1,
+            data4: [0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3],
+        },
+        process_id: 7777,
+        thread_id: 8888,
+        timestamp: 30_500,
+        user_data: file_write_payload,
+        stack_trace: None,
+    };
+
+    let mut file_close_payload = Vec::new();
+    file_close_payload.extend_from_slice(&0u64.to_ne_bytes());
+    file_close_payload.extend_from_slice(&0u64.to_ne_bytes());
+    file_close_payload.extend_from_slice(&file_obj.to_ne_bytes());
+    file_close_payload.extend_from_slice(&0u64.to_ne_bytes());
+
+    let file_close_record = EventRecord {
+        event_id: 66,
+        version: 2,
+        opcode: 66, // FileIo_Close
+        level: 0,
+        provider_id: windows_sys::core::GUID {
+            data1: 0x90cbdc39,
+            data2: 0x4a3e,
+            data3: 0x11d1,
+            data4: [0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3],
+        },
+        process_id: 7777,
+        thread_id: 8888,
+        timestamp: 31_000,
+        user_data: file_close_payload,
+        stack_trace: None,
+    };
+
+    tx.send(file_create_record).unwrap();
+    tx.send(file_write_record).unwrap();
+    tx.send(file_close_record).unwrap();
+
+    // 4. Drop sender to trigger channel close and drain all events through the worker pool
     drop(tx);
     dispatcher_handle.join().expect("Worker pool must exit cleanly");
 
-    // 4. Verify SystemContext was populated
+    // 5. Verify SystemContext was populated
     let ctx = system_context();
     let proc = ctx.process(7777).expect("Process 7777 must be indexed in SystemContext");
     assert_eq!(proc.image_file_name(), "svchost.exe");
@@ -148,6 +235,19 @@ fn test_end_to_end_synthetic_pipeline_replay() {
         Some("svchost.exe -k netsvcs")
     );
 
-    // 5. Verify dispatcher delivered all events
-    assert!(recorded_events.load(Ordering::SeqCst) >= 2);
+    // Verify FileRegistry and ProcessContext touched files
+    let touched = proc.touched_files();
+    assert_eq!(touched.len(), 1);
+    assert_eq!(touched[0].path, r"c:\windows\system32\drivers\etc\hosts");
+    assert!(touched[0].has_writes());
+
+    let modified = proc.modified_files();
+    assert_eq!(modified.len(), 1);
+    assert_eq!(modified[0].path, r"c:\windows\system32\drivers\etc\hosts");
+
+    let file_in_registry = ctx.file(r"c:\windows\system32\drivers\etc\hosts");
+    assert!(file_in_registry.is_some());
+
+    // 6. Verify dispatcher delivered all events
+    assert!(recorded_events.load(Ordering::SeqCst) >= 5);
 }

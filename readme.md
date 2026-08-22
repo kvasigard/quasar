@@ -29,14 +29,18 @@ quasar/
 │       ├── profiling.rs      # Structured tracing, spans & Chrome DevTools flame chart export
 │       ├── context/          # Real-time knowledge graph (processes, files, network, injections)
 │       │   ├── correlation/  # Stateful injection correlation state machine
-│       │   ├── identity.rs   # Synthetic monotonic entity keys (ProcessKey, etc.)
-│       │   ├── models/       # Fine-grained process, module, handle & network models
+│       │   ├── handlers/     # Domain-partitioned telemetry ingestion handlers (process, image, file)
+│       │   ├── identity.rs   # Synthetic monotonic entity keys (ProcessKey, FileKey, etc.)
+│       │   ├── models/       # Fine-grained process, module, file, handle & network models
 │       │   ├── query/        # Lock-free query wrappers and ancestry graph walking
 │       │   ├── registries/   # Concurrent ProcessTree, FileRegistry, NetworkRegistry
 │       │   ├── retention/    # Dual-trigger GC & ancestry tombstones
 │       │   └── tests.rs      # In-place mutability and context state machine unit tests
 │       ├── drivers/          # Driver lifecycle management and SCM control
 │       ├── pipeline/         # Two-stage telemetry pipeline (IngressParser + EventDispatcher)
+│       │   ├── event/        # Strongly-typed domain events (process, image, syscall, file)
+│       │   ├── dispatcher.rs # Fan-out worker pool & subscriber dispatching
+│       │   └── ingress.rs    # Stage 1 binary deserialization & single-source ingestion
 │       ├── sensors/          # Telemetry ingestion (ETW NT Kernel Logger)
 │       ├── sinks/            # Analytical detection sinks (DirectSyscallSink)
 │       └── helpers/          # Stack correlator, symbol resolver, string decoding

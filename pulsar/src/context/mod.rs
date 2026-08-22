@@ -40,7 +40,11 @@ use std::sync::LazyLock;
 // Re-export common types for ergonomics across sink implementations and detection rules
 pub use config::ContextConfig;
 pub use correlation::{InFlightInjection, InjectionCorrelator};
-pub use handlers::*;
+pub use handlers::{
+    handle_file_create, handle_file_name, handle_file_operation, handle_file_read_write,
+    handle_file_write, handle_image_load, handle_image_unload, handle_process_exit,
+    handle_process_start,
+};
 pub use identity::{ConnectionKey, EntityId, FileKey, InteractionId, ProcessKey, ThreadKey};
 pub use models::*;
 pub use query::{AncestorIterator, InteractionQuery, ProcessRef};

@@ -475,3 +475,325 @@ fn test_context_enrichment_queue_and_worker() {
     drop(enrichment);
     worker_handle.join().expect("Enrichment worker should exit cleanly when queue drops");
 }
+
+/// Tests that NT device path prefixes (`\??\`, `\\?\`, `\Device\HarddiskVolumeX\`)
+/// are cleaned, forward-slashes converted to backslashes, and paths lowercased.
+#[test]
+fn test_file_path_normalization_nt_prefixes() {
+    use crate::context::registries::file_registry::normalize_file_path;
+
+    assert_eq!(
+        normalize_file_path(r"\??\C:\Windows\System32\notepad.exe"),
+        r"c:\windows\system32\notepad.exe"
+    );
+    assert_eq!(
+        normalize_file_path(r"\\?\C:\Users\Admin/AppData/Local/Temp/malware.exe"),
+        r"c:\users\admin\appdata\local\temp\malware.exe"
+    );
+    assert_eq!(
+        normalize_file_path(r"\Device\HarddiskVolume2\Windows\explorer.exe"),
+        r"\device\harddiskvolume2\windows\explorer.exe"
+    );
+    assert_eq!(
+        normalize_file_path("C:/Program Files/Quasar/agent.exe"),
+        r"c:\program files\quasar\agent.exe"
+    );
+}
+
+/// Tests binary deserialization of `FileIo_Create` (Opcode 64) and `FileIo_Name` (Opcode 0) ETW records.
+#[test]
+fn test_fileio_create_and_name_parsing() {
+    use crate::context::handlers::{handle_file_create, handle_file_name};
+    use crate::context::CONTEXT;
+
+    let pid = 8812;
+    let proc_key = ProcessKey::new();
+    let mut proc = ProcessContext::new(proc_key, None, pid, 1000, 100);
+    proc.image_file_name = "powershell.exe".to_string();
+    CONTEXT.insert_process(proc);
+
+    // 1. Synthesize FileIo_Create record (36 bytes header + UTF-16 path)
+    let file_obj_1: u64 = 0xFFFF_E000_1234_5678;
+    let mut create_payload = Vec::new();
+    create_payload.extend_from_slice(&0x1111_0000u64.to_ne_bytes()); // IrpPtr (8B)
+    create_payload.extend_from_slice(&0x2222_0000u64.to_ne_bytes()); // TTID (8B)
+    create_payload.extend_from_slice(&file_obj_1.to_ne_bytes());     // FileObject (8B)
+    create_payload.extend_from_slice(&0x0000_0020u32.to_ne_bytes()); // CreateOptions (4B)
+    create_payload.extend_from_slice(&0x0000_0080u32.to_ne_bytes()); // FileAttributes (4B)
+    create_payload.extend_from_slice(&0x0000_0001u32.to_ne_bytes()); // ShareAccess (4B)
+
+    let path_str1: Vec<u16> = "\\??\\C:\\Users\\Target\\secret.docx\0".encode_utf16().collect();
+    for u in path_str1 {
+        create_payload.extend_from_slice(&u.to_ne_bytes());
+    }
+
+    let create_record = EventRecord {
+        event_id: 64,
+        version: 2,
+        opcode: 64,
+        level: 0,
+        provider_id: windows_sys::core::GUID {
+            data1: 0x90cbdc39,
+            data2: 0x4a3e,
+            data3: 0x11d1,
+            data4: [0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3],
+        },
+        process_id: pid,
+        thread_id: 1234,
+        timestamp: 1000,
+        user_data: create_payload,
+        stack_trace: None,
+    };
+
+    let create_event = handle_file_create(&create_record).expect("Must parse FileIo_Create");
+    assert_eq!(create_event.pid, pid);
+    assert_eq!(create_event.file_object, file_obj_1);
+    assert_eq!(create_event.file_path, r"c:\users\target\secret.docx");
+
+    // Verify FileObject mapping in FileRegistry
+    let resolved_key = CONTEXT.files.get_key_by_file_object(file_obj_1);
+    assert_eq!(resolved_key, Some(create_event.file_key));
+
+    // Verify process touched_files
+    let proc_ref = CONTEXT.get_process(pid).unwrap();
+    assert!(proc_ref.touched_files.read().contains(&create_event.file_key));
+
+    // 2. Synthesize FileIo_Name record (8 bytes FileObject + UTF-16 path)
+    let file_obj_2: u64 = 0xFFFF_E000_9876_5432;
+    let mut name_payload = Vec::new();
+    name_payload.extend_from_slice(&file_obj_2.to_ne_bytes()); // FileObject (8B)
+
+    let path_str2: Vec<u16> = "C:\\Windows\\System32\\drivers\\etc\\hosts\0".encode_utf16().collect();
+    for u in path_str2 {
+        name_payload.extend_from_slice(&u.to_ne_bytes());
+    }
+
+    let name_record = EventRecord {
+        event_id: 0,
+        version: 2,
+        opcode: 0,
+        level: 0,
+        provider_id: windows_sys::core::GUID {
+            data1: 0x90cbdc39,
+            data2: 0x4a3e,
+            data3: 0x11d1,
+            data4: [0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3],
+        },
+        process_id: pid,
+        thread_id: 1234,
+        timestamp: 1100,
+        user_data: name_payload,
+        stack_trace: None,
+    };
+
+    let name_event = handle_file_name(&name_record)
+        .expect("Must parse FileIo_Name")
+        .expect("Must produce FileCreateEvent");
+    assert_eq!(name_event.file_object, file_obj_2);
+    assert_eq!(name_event.file_path, r"c:\windows\system32\drivers\etc\hosts");
+}
+
+/// Tests the end-to-end lifecycle of `FileObject -> FileKey` correlation and unmapping on Close.
+#[test]
+fn test_file_object_mapping_and_lifecycle() {
+    use crate::context::handlers::{handle_file_create, handle_file_operation, handle_file_write};
+    use crate::context::models::file::FileOperationKind;
+    use crate::context::CONTEXT;
+
+    let pid = 9999;
+    let proc_key = ProcessKey::new();
+    let mut proc = ProcessContext::new(proc_key, None, pid, 1000, 100);
+    proc.image_file_name = "ransomware.exe".to_string();
+    CONTEXT.insert_process(proc);
+
+    let file_obj: u64 = 0xFFFF_ABCD_0000_1111;
+
+    // 1. Create file
+    let mut create_payload = Vec::new();
+    create_payload.extend_from_slice(&0u64.to_ne_bytes());
+    create_payload.extend_from_slice(&0u64.to_ne_bytes());
+    create_payload.extend_from_slice(&file_obj.to_ne_bytes());
+    create_payload.extend_from_slice(&0u32.to_ne_bytes());
+    create_payload.extend_from_slice(&0u32.to_ne_bytes());
+    create_payload.extend_from_slice(&0u32.to_ne_bytes());
+    let path: Vec<u16> = "C:\\Data\\database.kdbx\0".encode_utf16().collect();
+    for u in path {
+        create_payload.extend_from_slice(&u.to_ne_bytes());
+    }
+
+    let create_rec = EventRecord {
+        event_id: 64,
+        version: 2,
+        opcode: 64,
+        level: 0,
+        provider_id: windows_sys::core::GUID {
+            data1: 0x90cbdc39,
+            data2: 0x4a3e,
+            data3: 0x11d1,
+            data4: [0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3],
+        },
+        process_id: pid,
+        thread_id: 1,
+        timestamp: 1000,
+        user_data: create_payload,
+        stack_trace: None,
+    };
+
+    let create_evt = handle_file_create(&create_rec).expect("Create must succeed");
+    assert_eq!(CONTEXT.files.get_key_by_file_object(file_obj), Some(create_evt.file_key));
+
+    // 2. Write 65536 bytes to file
+    let mut write_payload = Vec::new();
+    write_payload.extend_from_slice(&0u64.to_ne_bytes());         // Offset (8B)
+    write_payload.extend_from_slice(&0u64.to_ne_bytes());         // IrpPtr (8B)
+    write_payload.extend_from_slice(&0u64.to_ne_bytes());         // TTID (8B)
+    write_payload.extend_from_slice(&file_obj.to_ne_bytes());     // FileObject (8B)
+    write_payload.extend_from_slice(&0u64.to_ne_bytes());         // FileKey (8B)
+    write_payload.extend_from_slice(&65536u32.to_ne_bytes());     // IoSize (4B)
+    write_payload.extend_from_slice(&0u32.to_ne_bytes());         // IoFlags (4B)
+
+    let write_rec = EventRecord {
+        event_id: 68,
+        version: 2,
+        opcode: 68,
+        level: 0,
+        provider_id: windows_sys::core::GUID {
+            data1: 0x90cbdc39,
+            data2: 0x4a3e,
+            data3: 0x11d1,
+            data4: [0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3],
+        },
+        process_id: pid,
+        thread_id: 1,
+        timestamp: 1050,
+        user_data: write_payload,
+        stack_trace: None,
+    };
+
+    let write_evt = handle_file_write(&write_rec).expect("Write must succeed");
+    assert_eq!(write_evt.file_key, Some(create_evt.file_key));
+    assert_eq!(write_evt.io_size, 65536);
+    assert!(write_evt.is_write);
+
+    let file_ctx = CONTEXT.files.get_by_key(create_evt.file_key).unwrap();
+    assert!(file_ctx.has_writes());
+
+    // 3. Close file (Opcode 66)
+    let mut close_payload = Vec::new();
+    close_payload.extend_from_slice(&0u64.to_ne_bytes());     // IrpPtr
+    close_payload.extend_from_slice(&0u64.to_ne_bytes());     // TTID
+    close_payload.extend_from_slice(&file_obj.to_ne_bytes()); // FileObject
+    close_payload.extend_from_slice(&0u64.to_ne_bytes());     // FileKey
+
+    let close_rec = EventRecord {
+        event_id: 66,
+        version: 2,
+        opcode: 66,
+        level: 0,
+        provider_id: windows_sys::core::GUID {
+            data1: 0x90cbdc39,
+            data2: 0x4a3e,
+            data3: 0x11d1,
+            data4: [0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3],
+        },
+        process_id: pid,
+        thread_id: 1,
+        timestamp: 1100,
+        user_data: close_payload,
+        stack_trace: None,
+    };
+
+    let close_evt = handle_file_operation(&close_rec).expect("Close must succeed");
+    assert_eq!(close_evt.operation, FileOperationKind::Close);
+    assert_eq!(close_evt.file_key, Some(create_evt.file_key));
+
+    // FileObject must be unmapped upon Close
+    assert_eq!(CONTEXT.files.get_key_by_file_object(file_obj), None);
+}
+
+/// Tests ProcessRef and SystemContext query APIs for inspecting touched files, writes, and history.
+#[test]
+fn test_file_query_dsl() {
+    let ctx = SystemContext::new_for_test(ContextConfig::for_test());
+    let pid = 3333;
+    let proc_key = ProcessKey::new();
+
+    let proc = ProcessContext::new(proc_key, None, pid, 1000, 100);
+    let proc_arc = ctx.insert_process(proc);
+
+    let f1 = ctx.get_or_create_file(r"C:\Test\doc1.txt", 100);
+    let f2 = ctx.get_or_create_file(r"C:\Test\doc2.txt", 110);
+
+    // Record access
+    proc_arc.record_file_access(f1.key);
+    proc_arc.record_file_access(f2.key);
+
+    // f2 receives write
+    f2.record_access(crate::context::models::file::FileAccessRecord {
+        operation: crate::context::models::file::FileOperationKind::Write,
+        timestamp: 120,
+        bytes_transferred: 1024,
+        is_write: true,
+    });
+
+    // 1. SystemContext touched_files by PID
+    let touched_pid = ctx.touched_files(pid);
+    assert_eq!(touched_pid.len(), 2);
+
+    // 2. SystemContext touched_files by key
+    let touched_key = ctx.touched_files_by_key(proc_key);
+    assert_eq!(touched_key.len(), 2);
+
+    // 3. ProcessRef fluent query
+    let proc_ref = ctx.process(pid).expect("Process must exist");
+    assert_eq!(proc_ref.touched_file_keys().len(), 2);
+    assert_eq!(proc_ref.touched_files().len(), 2);
+
+    let modified = proc_ref.modified_files();
+    assert_eq!(modified.len(), 1);
+    assert_eq!(modified[0].path, r"c:\test\doc2.txt");
+
+    // 4. File access history
+    let history = ctx.file_access_history(f2.key);
+    assert_eq!(history.len(), 1);
+    assert!(history[0].is_write);
+    assert_eq!(history[0].bytes_transferred, 1024);
+}
+
+/// Tests defensive handling and error rejection on truncated binary payloads.
+#[test]
+fn test_truncated_file_payload_rejection() {
+    use crate::context::handlers::{handle_file_create, handle_file_operation, handle_file_read_write};
+    use crate::error::HandlerError;
+
+    let short_record = EventRecord {
+        event_id: 64,
+        version: 2,
+        opcode: 64,
+        level: 0,
+        provider_id: windows_sys::core::GUID {
+            data1: 0x90cbdc39,
+            data2: 0x4a3e,
+            data3: 0x11d1,
+            data4: [0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3],
+        },
+        process_id: 100,
+        thread_id: 200,
+        timestamp: 100,
+        user_data: vec![0u8; 10], // Too short for all structs
+        stack_trace: None,
+    };
+
+    assert!(matches!(
+        handle_file_create(&short_record),
+        Err(HandlerError::PayloadTooShort { expected: 36, actual: 10 })
+    ));
+    assert!(matches!(
+        handle_file_read_write(&short_record, true),
+        Err(HandlerError::PayloadTooShort { expected: 48, actual: 10 })
+    ));
+    assert!(matches!(
+        handle_file_operation(&short_record),
+        Err(HandlerError::PayloadTooShort { expected: 32, actual: 10 })
+    ));
+}
