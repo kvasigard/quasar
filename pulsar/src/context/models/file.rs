@@ -1,7 +1,11 @@
 //! File entity, operations, and access history model.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use crate::context::identity::FileKey;
+
+/// Maximum number of file access records retained per file context.
+const MAX_ACCESS_HISTORY_ENTRIES: usize = 32;
 
 /// Type of file interaction observed by sensors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -13,14 +17,17 @@ pub enum FileOperationKind {
     Delete,
     Rename,
     SetInformation,
+    Close,
+    Cleanup,
+    Flush,
 }
 
 /// Record of an individual file access event.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileAccessRecord {
     /// The operation performed.
     pub operation: FileOperationKind,
-    /// Timestamp of the file operation.
+    /// Timestamp of the file operation (FILETIME 100ns ticks).
     pub timestamp: i64,
     /// Number of bytes read or written.
     pub bytes_transferred: u64,
@@ -43,6 +50,10 @@ pub struct FileContext {
     pub first_seen: i64,
     /// Timestamp of the most recent interaction.
     pub last_accessed: AtomicI64,
+    /// Indicates whether any write or mutation operation was observed for this file.
+    pub is_modified: AtomicBool,
+    /// Bounded ring buffer of recent access operations.
+    pub access_history: parking_lot::RwLock<VecDeque<FileAccessRecord>>,
 }
 
 impl FileContext {
@@ -65,7 +76,27 @@ impl FileContext {
             signer_name: parking_lot::RwLock::new(None),
             first_seen: timestamp,
             last_accessed: AtomicI64::new(timestamp),
+            is_modified: AtomicBool::new(false),
+            access_history: parking_lot::RwLock::new(VecDeque::with_capacity(MAX_ACCESS_HISTORY_ENTRIES)),
         }
+    }
+
+    /// Records an access event, updating the last accessed timestamp and appending to bounded access history.
+    ///
+    /// # Arguments
+    ///
+    /// * `record` - The file access record to append.
+    pub fn record_access(&self, record: FileAccessRecord) {
+        self.last_accessed.fetch_max(record.timestamp, Ordering::Relaxed);
+        if record.is_write {
+            self.is_modified.store(true, Ordering::Relaxed);
+        }
+
+        let mut history = self.access_history.write();
+        if history.len() >= MAX_ACCESS_HISTORY_ENTRIES {
+            history.pop_front();
+        }
+        history.push_back(record);
     }
 
     /// Records an access event, updating the last accessed timestamp.
@@ -75,6 +106,24 @@ impl FileContext {
     /// * `timestamp` - Access timestamp in FILETIME format.
     pub fn touch(&self, timestamp: i64) {
         self.last_accessed.fetch_max(timestamp, Ordering::Relaxed);
+    }
+
+    /// Returns a snapshot of recent file access records.
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`FileAccessRecord`] items.
+    pub fn access_history(&self) -> Vec<FileAccessRecord> {
+        self.access_history.read().iter().cloned().collect()
+    }
+
+    /// Checks whether any write or modification operations were observed on this file.
+    ///
+    /// # Returns
+    ///
+    /// `true` if writes have occurred.
+    pub fn has_writes(&self) -> bool {
+        self.is_modified.load(Ordering::Relaxed)
     }
 
     /// Sets the cached SHA-256 hash.

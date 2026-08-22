@@ -13,10 +13,11 @@
 use parking_lot::Mutex;
 
 use crate::context::handlers::{
+    handle_file_create, handle_file_name, handle_file_operation, handle_file_read_write,
     handle_image_load, handle_image_unload, handle_process_exit, handle_process_start,
 };
 use crate::helpers::stack_correlator::{StackCorrelator, StackWalkPayload};
-use crate::pipeline::event::Event;
+use crate::pipeline::event::{Event, FileIoEvent};
 use crate::sensors::etw::EventRecord;
 
 /// 32-bit prefix for the Kernel Process Provider GUID `{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}`.
@@ -31,6 +32,9 @@ const PERFINFO_GUID_PREFIX: u32 = 0xce1dbfb4;
 /// 32-bit prefix for the StackWalk Provider GUID `{def2fe46-7bd6-4b80-bd94-f57fe20d0ce3}`.
 const STACKWALK_GUID_PREFIX: u32 = 0xdef2fe46;
 
+/// 32-bit prefix for the FileIo Provider GUID `{90cbdc39-4a3e-11d1-84f4-0000f80464e3}`.
+const FILEIO_GUID_PREFIX: u32 = 0x90cbdc39;
+
 const OPCODE_PROCESS_START: u8 = 1;
 const OPCODE_PROCESS_END: u8 = 2;
 const OPCODE_PROCESS_DC_START: u8 = 3;
@@ -43,6 +47,25 @@ const OPCODE_IMAGE_DC_END: u8 = 4;
 
 const OPCODE_SYSCALL_ENTER: u8 = 51;
 const OPCODE_STACKWALK: u8 = 32;
+
+const OPCODE_FILEIO_NAME: u8 = 0;
+const OPCODE_FILEIO_FILE_CREATE_V1: u8 = 32;
+const OPCODE_FILEIO_FILE_DELETE_V1: u8 = 35;
+const OPCODE_FILEIO_FILE_RUNDOWN_V1: u8 = 36;
+const OPCODE_FILEIO_CREATE: u8 = 64;
+const OPCODE_FILEIO_CLEANUP: u8 = 65;
+const OPCODE_FILEIO_CLOSE: u8 = 66;
+const OPCODE_FILEIO_READ: u8 = 67;
+const OPCODE_FILEIO_WRITE: u8 = 68;
+const OPCODE_FILEIO_SET_INFO: u8 = 69;
+const OPCODE_FILEIO_DELETE: u8 = 70;
+const OPCODE_FILEIO_RENAME: u8 = 71;
+const OPCODE_FILEIO_DIR_ENUM: u8 = 72;
+const OPCODE_FILEIO_FLUSH: u8 = 73;
+const OPCODE_FILEIO_QUERY_INFO: u8 = 74;
+const OPCODE_FILEIO_FS_CONTROL: u8 = 75;
+const OPCODE_FILEIO_OP_END: u8 = 76;
+const OPCODE_FILEIO_DIR_NOTIFY: u8 = 77;
 
 /// Ingress parser & telemetry pre-processor holding the ETW stack correlator.
 pub struct IngressParser {
@@ -166,7 +189,98 @@ impl IngressParser {
                 }
             }
 
-            // Rundown completion markers
+            // File creation or open
+            (FILEIO_GUID_PREFIX, OPCODE_FILEIO_CREATE) => {
+                match handle_file_create(&record) {
+                    Ok(event) => Some(Event::FileIo(FileIoEvent::Create(event))),
+                    Err(e) => {
+                        log::warn!(
+                            target: "ingress",
+                            "Failed to parse file create event for PID {}: {e}",
+                            record.process_id
+                        );
+                        None
+                    }
+                }
+            }
+
+            // File name mapping and rundown
+            (
+                FILEIO_GUID_PREFIX,
+                OPCODE_FILEIO_NAME
+                | OPCODE_FILEIO_FILE_CREATE_V1
+                | OPCODE_FILEIO_FILE_DELETE_V1
+                | OPCODE_FILEIO_FILE_RUNDOWN_V1,
+            ) => match handle_file_name(&record) {
+                Ok(Some(event)) => Some(Event::FileIo(FileIoEvent::Create(event))),
+                Ok(None) => None,
+                Err(e) => {
+                    log::warn!(
+                        target: "ingress",
+                        "Failed to parse file name event for PID {}: {e}",
+                        record.process_id
+                    );
+                    None
+                }
+            },
+
+            // File read operation
+            (FILEIO_GUID_PREFIX, OPCODE_FILEIO_READ) => {
+                match handle_file_read_write(&record, false) {
+                    Ok(event) => Some(Event::FileIo(FileIoEvent::ReadWrite(event))),
+                    Err(e) => {
+                        log::warn!(
+                            target: "ingress",
+                            "Failed to parse file read event for PID {}: {e}",
+                            record.process_id
+                        );
+                        None
+                    }
+                }
+            }
+
+            // File write operation
+            (FILEIO_GUID_PREFIX, OPCODE_FILEIO_WRITE) => {
+                match handle_file_read_write(&record, true) {
+                    Ok(event) => Some(Event::FileIo(FileIoEvent::ReadWrite(event))),
+                    Err(e) => {
+                        log::warn!(
+                            target: "ingress",
+                            "Failed to parse file write event for PID {}: {e}",
+                            record.process_id
+                        );
+                        None
+                    }
+                }
+            }
+
+            // File lifecycle and metadata operations (SetInfo, Delete, Rename, Close, Cleanup, Flush, DirEnum, DirNotify)
+            (
+                FILEIO_GUID_PREFIX,
+                OPCODE_FILEIO_CLEANUP
+                | OPCODE_FILEIO_CLOSE
+                | OPCODE_FILEIO_SET_INFO
+                | OPCODE_FILEIO_DELETE
+                | OPCODE_FILEIO_RENAME
+                | OPCODE_FILEIO_FLUSH
+                | OPCODE_FILEIO_QUERY_INFO
+                | OPCODE_FILEIO_FS_CONTROL
+                | OPCODE_FILEIO_DIR_ENUM
+                | OPCODE_FILEIO_DIR_NOTIFY,
+            ) => match handle_file_operation(&record) {
+                Ok(event) => Some(Event::FileIo(FileIoEvent::Operation(event))),
+                Err(e) => {
+                    log::warn!(
+                        target: "ingress",
+                        "Failed to parse file operation event for PID {}: {e}",
+                        record.process_id
+                    );
+                    None
+                }
+            },
+
+            // Operation end and rundown completion markers
+            (FILEIO_GUID_PREFIX, OPCODE_FILEIO_OP_END) => None,
             (KERNEL_PROCESS_GUID_PREFIX, OPCODE_PROCESS_DC_END) => None,
 
             _ => None,

@@ -6,7 +6,8 @@ pub mod ingress;
 
 pub use dispatcher::{DispatcherHandle, EventDispatcher, Subscriber};
 pub use event::{
-    CorrelatedSyscallEvent, Event, ImageLoadEvent, ImageUnloadEvent, ProcessExitEvent,
-    ProcessStartEvent, SyscallEvent,
+    CorrelatedSyscallEvent, Event, FileCreateEvent, FileIoEvent, FileOperationEvent,
+    FileReadWriteEvent, ImageLoadEvent, ImageUnloadEvent, ProcessExitEvent, ProcessStartEvent,
+    SyscallEvent,
 };
 pub use ingress::IngressParser;

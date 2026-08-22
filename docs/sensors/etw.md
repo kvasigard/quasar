@@ -5,7 +5,7 @@ The NT Kernel Logger ETW Sensor in `pulsar/src/sensors/etw` is Quasar's primary 
 ```
  [Windows NT Kernel Logger Provider]
          │
-         │ Real-Time Ring Buffers (64 to 128 buffers of 1024 KB in Non-Paged Pool)
+         │ Real-Time Ring Buffers (128 to 512 buffers of 1024 KB in Non-Paged Pool)
          ▼
  [KernelSession Real-Time Consumer]
          │
@@ -28,14 +28,14 @@ Event Tracing for Windows operates in real time at the kernel level. When a proc
 
 ## Managing Kernel Ring Buffers and the Session Director
 
-System call and process tracing generates immense amounts of data, frequently reaching between 50,000 and 200,000 events per second during software compilation or heavy disk I/O. If user-mode software does not allocate sufficient kernel buffers, the Windows kernel will run out of space and silently drop events, causing blind spots in security monitoring.
+System call, process lifecycle, and filesystem I/O tracing generate immense amounts of telemetry, frequently reaching between 50,000 and 200,000 events per second during software compilation, application updates, or heavy disk I/O. If user-mode software does not allocate sufficient kernel buffers, the Windows kernel will run out of space and silently drop events, causing blind spots in security monitoring.
 
 Quasar addresses this by configuring large, dedicated non-paged pool ring buffers:
-* Buffer Size: Set to 1024 KB (1 MB) per buffer, allowing the kernel to write batches of telemetry efficiently without frequent page allocations.
-* Buffer Count: Dynamically managed between 64 and 128 buffers, reserving 64 MB to 128 MB of memory to absorb sudden micro-bursts of high system activity.
-* Flush Timer: Configured to 1 second, guaranteeing that even during quiet periods with low event volume, telemetry is flushed to user mode within one second.
+* **Buffer Size**: Set to 1024 KB (1 MB) per buffer, allowing the kernel to write batches of telemetry efficiently without frequent page allocations.
+* **Buffer Count**: Dynamically managed between 128 and 512 buffers (up to 512 MB memory pool capacity), reserving ample memory to absorb sudden micro-bursts of high filesystem and syscall activity without dropping trace buffers.
+* **Flush Timer**: Configured to 1 second, guaranteeing that even during quiet periods with low event volume, telemetry is flushed to user mode within one second.
 
-To keep the low-level Win32 structure initialization clean and maintainable, we use the Session Director pattern in `sensors/etw/director.rs`. The director provides pre-configured recipes (like `construct_edr_session`) that enable the required kernel flags (Process, ImageLoad, PerfInfo syscalls, and StackWalk) on the session builder without cluttering main application logic with raw Windows FFI structs.
+To keep the low-level Win32 structure initialization clean and maintainable, we use the Session Director pattern in `sensors/etw/director.rs`. The director provides pre-configured recipes (like `construct_edr_session`) that enable the required kernel flags (`EVENT_TRACE_FLAG_PROCESS`, `EVENT_TRACE_FLAG_IMAGE_LOAD`, `EVENT_TRACE_FLAG_DISK_FILE_IO`, `EVENT_TRACE_FLAG_FILE_IO_INIT`, `EVENT_TRACE_FLAG_SYSTEMCALL`, and StackWalk) on the session builder without cluttering main application logic with raw Windows FFI structs.
 
 ## Real-Time Consumption and Non-Blocking Ingestion
 

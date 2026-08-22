@@ -7,7 +7,7 @@ use crate::context::config::ContextConfig;
 use crate::context::correlation::InjectionCorrelator;
 use crate::context::enrichment::{EnrichmentQueue, EnrichmentTask};
 use crate::context::identity::{FileKey, ProcessKey};
-use crate::context::models::file::FileContext;
+use crate::context::models::file::{FileAccessRecord, FileContext};
 use crate::context::models::interaction::InteractionRecord;
 use crate::context::models::process::ProcessContext;
 use crate::context::query::{InteractionQuery, ProcessRef};
@@ -312,6 +312,87 @@ impl SystemContext {
     #[inline]
     pub fn get_file_by_key(&self, key: FileKey) -> Option<Arc<FileContext>> {
         self.file_by_key(key)
+    }
+
+    /// Resolves the [`FileContext`] associated with an active kernel `FileObject` pointer.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_object` - Kernel `FileObject` descriptor pointer.
+    ///
+    /// # Returns
+    ///
+    /// `Some(Arc<FileContext>)` if actively mapped, otherwise `None`.
+    #[inline]
+    pub fn file_by_object(&self, file_object: u64) -> Option<Arc<FileContext>> {
+        self.files.get_by_file_object(file_object)
+    }
+
+    /// Returns the snapshot list of [`FileContext`] references accessed by an active process PID.
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - Operating system Process ID.
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`Arc<FileContext>`] references.
+    pub fn touched_files(&self, pid: u32) -> Vec<Arc<FileContext>> {
+        let Some(proc) = self.get_process(pid) else {
+            return Vec::new();
+        };
+        let keys = proc.touched_files.read();
+        keys.iter()
+            .filter_map(|key| self.files.get_by_key(*key))
+            .collect()
+    }
+
+    /// Returns the snapshot list of [`FileContext`] references accessed by a process key.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Synthetic process key.
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`Arc<FileContext>`] references.
+    pub fn touched_files_by_key(&self, key: ProcessKey) -> Vec<Arc<FileContext>> {
+        let Some(proc) = self.get_process_by_key(key) else {
+            return Vec::new();
+        };
+        let keys = proc.touched_files.read();
+        keys.iter()
+            .filter_map(|k| self.files.get_by_key(*k))
+            .collect()
+    }
+
+    /// Returns the recorded access history for a specific tracked file.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_key` - Synthetic file key.
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`FileAccessRecord`] items.
+    pub fn file_access_history(&self, file_key: FileKey) -> Vec<FileAccessRecord> {
+        if let Some(file_ctx) = self.files.get_by_key(file_key) {
+            file_ctx.access_history()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Returns the number of currently mapped kernel `FileObject` pointers.
+    #[inline]
+    pub fn active_file_objects_count(&self) -> usize {
+        self.files.active_file_object_count()
+    }
+
+    /// Returns the total number of distinct normalized files tracked in memory.
+    #[inline]
+    pub fn total_files_count(&self) -> usize {
+        self.files.len()
     }
 
     // --- Interaction Domain Operations ---

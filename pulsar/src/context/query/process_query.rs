@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::context::SystemContext;
 use crate::context::identity::{FileKey, ProcessKey};
+use crate::context::models::file::FileContext;
 use crate::context::models::handle::HandleObject;
 use crate::context::models::interaction::InteractionRecord;
 use crate::context::models::module::LoadedModule;
@@ -273,8 +274,42 @@ impl<'a> ProcessRef<'a> {
     /// # Returns
     ///
     /// A vector of [`FileKey`] identifiers.
-    pub fn touched_files(&self) -> Vec<FileKey> {
+    pub fn touched_file_keys(&self) -> Vec<FileKey> {
         self.inner.touched_files.read().iter().copied().collect()
+    }
+
+    /// Returns a snapshot of all [`FileContext`] entities touched by this process.
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`Arc<FileContext>`] references.
+    pub fn touched_files(&self) -> Vec<Arc<FileContext>> {
+        let keys = self.inner.touched_files.read();
+        keys.iter()
+            .filter_map(|key| self.ctx.files.get_by_key(*key))
+            .collect()
+    }
+
+    /// Returns all files accessed by this process that have observed write operations.
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`Arc<FileContext>`] references with write activity.
+    pub fn recent_file_writes(&self) -> Vec<Arc<FileContext>> {
+        self.touched_files()
+            .into_iter()
+            .filter(|f| f.has_writes())
+            .collect()
+    }
+
+    /// Returns all files modified by this process.
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`Arc<FileContext>`] references.
+    #[inline]
+    pub fn modified_files(&self) -> Vec<Arc<FileContext>> {
+        self.recent_file_writes()
     }
 
     /// Returns all network connections initiated or accepted by this process.

@@ -64,6 +64,6 @@ This ensures bounded, predictable CPU utilization while providing more than enou
 
 When adding new event types or registering new analytical sinks, follow these practical steps:
 
-To add a new domain event, define the event struct in `pipeline/event.rs` and add it as a new variant to the central `Event` enum. In `IngressParser::process_raw_record()`, match on the corresponding kernel provider GUID and opcode, perform any necessary context updates, and return your new event variant.
+To add a new domain event, define the event struct in the appropriate domain module in `pipeline/event/` (such as `process.rs`, `image.rs`, `file.rs`, or `syscall.rs`) and re-export it in `pipeline/event/mod.rs` as a new variant of the central `Event` enum. In `IngressParser::process_raw_record()`, match on the corresponding kernel provider GUID and opcode, invoke the dedicated handler in `context/handlers/`, and return your new event variant.
 
 To create and attach a new detection sink, define a struct that implements the `Subscriber` trait in `pipeline/dispatcher.rs`. In `is_interested(&self, event: &Event)`, return `true` only for the event variants your sink cares about. In `on_event(&self, event: &Arc<Event>)`, write your detection logic. Finally, register the sink with the dispatcher in `main.rs` by calling `dispatcher.add_subscriber(Box::new(YourNewSink))`.

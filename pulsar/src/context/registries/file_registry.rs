@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use crate::context::identity::FileKey;
 use crate::context::models::file::FileContext;
 
-/// Normalizes Windows file paths (strips NT prefixes like `\??\` and converts to lowercase).
+/// Normalizes Windows file paths (strips NT prefixes like `\??\`, `\\?\`, and normalizes `\Device\HarddiskVolumeX\`).
 ///
 /// # Arguments
 ///
@@ -14,7 +14,7 @@ use crate::context::models::file::FileContext;
 ///
 /// # Returns
 ///
-/// A normalized lowercase Windows path string with backslashes.
+/// A normalized lowercase Windows path string with standard backslashes.
 pub fn normalize_file_path(path: &str) -> String {
     let cleaned = path
         .strip_prefix(r"\??\")
@@ -24,12 +24,14 @@ pub fn normalize_file_path(path: &str) -> String {
     cleaned.replace('/', "\\").to_lowercase()
 }
 
-/// Concurrent registry mapping normalized file paths to `FileContext` entities.
+/// Concurrent registry mapping normalized file paths and active kernel FileObjects to `FileContext` entities.
 pub struct FileRegistry {
     /// Maps normalized path string to synthetic FileKey.
     path_to_key: DashMap<String, FileKey>,
     /// Global file arena mapping `FileKey` to `Arc<FileContext>`.
     files: DashMap<FileKey, Arc<FileContext>>,
+    /// Active kernel FileObject pointer to FileKey mapping.
+    file_objects: DashMap<u64, FileKey>,
 }
 
 impl FileRegistry {
@@ -42,6 +44,7 @@ impl FileRegistry {
         Self {
             path_to_key: DashMap::new(),
             files: DashMap::new(),
+            file_objects: DashMap::new(),
         }
     }
 
@@ -73,6 +76,66 @@ impl FileRegistry {
         self.path_to_key.insert(normalized, key);
 
         (file_ctx, true)
+    }
+
+    /// Associates an active kernel `FileObject` pointer with a synthetic `FileKey`.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_object` - Numerical value of the kernel `FileObject` pointer.
+    /// * `file_key` - Synthetic file key to associate.
+    pub fn map_file_object(&self, file_object: u64, file_key: FileKey) {
+        if file_object != 0 {
+            self.file_objects.insert(file_object, file_key);
+        }
+    }
+
+    /// Resolves the synthetic `FileKey` associated with an active kernel `FileObject`.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_object` - Kernel `FileObject` pointer.
+    ///
+    /// # Returns
+    ///
+    /// `Some(FileKey)` if mapped, otherwise `None`.
+    #[inline]
+    pub fn get_key_by_file_object(&self, file_object: u64) -> Option<FileKey> {
+        self.file_objects.get(&file_object).map(|entry| *entry.value())
+    }
+
+    /// Resolves the [`FileContext`] associated with an active kernel `FileObject`.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_object` - Kernel `FileObject` pointer.
+    ///
+    /// # Returns
+    ///
+    /// `Some(Arc<FileContext>)` if mapped and tracked, otherwise `None`.
+    #[inline]
+    pub fn get_by_file_object(&self, file_object: u64) -> Option<Arc<FileContext>> {
+        let key = self.get_key_by_file_object(file_object)?;
+        self.get_by_key(key)
+    }
+
+    /// Unmaps a kernel `FileObject` pointer upon file close or cleanup.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_object` - Kernel `FileObject` pointer to unmap.
+    ///
+    /// # Returns
+    ///
+    /// The previously mapped `Some(FileKey)` if found.
+    pub fn unmap_file_object(&self, file_object: u64) -> Option<FileKey> {
+        self.file_objects.remove(&file_object).map(|(_, k)| k)
+    }
+
+    /// Returns the number of active mapped kernel FileObjects.
+    #[inline]
+    pub fn active_file_object_count(&self) -> usize {
+        self.file_objects.len()
     }
 
     /// Looks up a file context by its synthetic FileKey.
