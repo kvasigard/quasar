@@ -1,6 +1,8 @@
+pub mod pe;
 pub mod stack_correlator;
 pub mod strings;
-pub mod symbol_resolver;
+
+pub use pe::{PeExport, PeExportDirectory, PeInfo, PeParser, PeSection};
 
 use windows_sys::core::GUID;
 

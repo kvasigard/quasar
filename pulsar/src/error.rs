@@ -1,9 +1,10 @@
 //! Centralized error taxonomy, subsystem error enums, and Windows API error decoding.
 
-use std::fmt;
+use thiserror::Error;
 
 /// Native Windows OS error code and human-readable message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("Win32 Error (0x{code:08X} / {code}): {message}")]
 pub struct Win32Error {
     /// Raw numeric error code (`GetLastError` or NTSTATUS).
     pub code: u32,
@@ -66,165 +67,92 @@ impl Win32Error {
     }
 }
 
-impl fmt::Display for Win32Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Win32 Error (0x{:08X} / {}): {}", self.code, self.code, self.message)
-    }
-}
-
-impl std::error::Error for Win32Error {}
-
 /// Errors encountered during the pre-flight checks and bootstrap initialization sequence.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum BootstrapError {
     /// EDR process is not running with elevated Administrator privileges.
+    #[error("process requires elevated Administrator privileges to initialize")]
     AdminPrivilegesRequired,
     /// Package configuration files (`.inf` or `.sys`) were not found on disk.
+    #[error("driver package files (.inf/.sys) not found at: {expected_path}")]
     PackageFilesNotFound {
         /// The path where files were expected to reside.
         expected_path: String,
     },
     /// Process Protection Light (PPL-Antimalware) elevation verification failed.
+    #[error("process protection level (PPL-Antimalware) elevation verification failed")]
     PplVerificationFailed,
     /// Windows Driver installation API failure (`DiInstallDriverW`).
-    DriverInstallationFailed(Win32Error),
-}
-
-impl fmt::Display for BootstrapError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AdminPrivilegesRequired => {
-                write!(f, "process requires elevated Administrator privileges to initialize")
-            }
-            Self::PackageFilesNotFound { expected_path } => {
-                write!(f, "driver package files (.inf/.sys) not found at: {expected_path}")
-            }
-            Self::PplVerificationFailed => {
-                write!(f, "process protection level (PPL-Antimalware) elevation verification failed")
-            }
-            Self::DriverInstallationFailed(err) => {
-                write!(f, "driver installation via DiInstallDriverW failed: {err}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for BootstrapError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::DriverInstallationFailed(err) => Some(err),
-            _ => None,
-        }
-    }
+    #[error("driver installation via DiInstallDriverW failed: {0}")]
+    DriverInstallationFailed(#[from] Win32Error),
 }
 
 /// Errors encountered while interacting with the Windows Service Control Manager or KMDF device.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DriverError {
     /// Failed to open Service Control Manager database.
+    #[error("failed to open Service Control Manager: {0}")]
     ScmOpenFailed(Win32Error),
     /// Failed to open existing driver service in SCM.
+    #[error("failed to open service '{service_name}': {source}")]
     ServiceOpenFailed {
         /// Name of the target driver service.
         service_name: String,
         /// Underlying Win32 error.
+        #[source]
         source: Win32Error,
     },
     /// Failed to create driver service in SCM.
+    #[error("failed to create service '{service_name}': {source}")]
     ServiceCreateFailed {
         /// Name of the target driver service.
         service_name: String,
         /// Underlying Win32 error.
+        #[source]
         source: Win32Error,
     },
     /// Failed to start driver service in SCM.
+    #[error("failed to start service '{service_name}': {source}")]
     ServiceStartFailed {
         /// Name of the target driver service.
         service_name: String,
         /// Underlying Win32 error.
+        #[source]
         source: Win32Error,
     },
     /// Failed to query service status or configuration.
+    #[error("failed to query service: {0}")]
     ServiceQueryFailed(Win32Error),
-    /// Failed to acquire handle to `\Device\SingularityDevice`.
+    /// Failed to acquire handle to `\\Device\\SingularityDevice`.
+    #[error("failed to open kernel device handle: {0}")]
     DeviceHandleFailed(Win32Error),
     /// IOCTL communication failed.
+    #[error("driver IOCTL communication failed: {0}")]
     IoctlFailed(Win32Error),
 }
 
-impl fmt::Display for DriverError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ScmOpenFailed(err) => write!(f, "failed to open Service Control Manager: {err}"),
-            Self::ServiceOpenFailed { service_name, source } => {
-                write!(f, "failed to open service '{service_name}': {source}")
-            }
-            Self::ServiceCreateFailed { service_name, source } => {
-                write!(f, "failed to create service '{service_name}': {source}")
-            }
-            Self::ServiceStartFailed { service_name, source } => {
-                write!(f, "failed to start service '{service_name}': {source}")
-            }
-            Self::ServiceQueryFailed(err) => write!(f, "failed to query service: {err}"),
-            Self::DeviceHandleFailed(err) => write!(f, "failed to open kernel device handle: {err}"),
-            Self::IoctlFailed(err) => write!(f, "driver IOCTL communication failed: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for DriverError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::ScmOpenFailed(err)
-            | Self::ServiceQueryFailed(err)
-            | Self::DeviceHandleFailed(err)
-            | Self::IoctlFailed(err) => Some(err),
-            Self::ServiceOpenFailed { source, .. }
-            | Self::ServiceCreateFailed { source, .. }
-            | Self::ServiceStartFailed { source, .. } => Some(source),
-        }
-    }
-}
-
 /// Errors encountered while managing ETW trace sessions and consumers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum EtwError {
     /// Trace session failed to start via `StartTraceW`.
+    #[error("failed to start ETW session: {0}")]
     SessionStartFailed(Win32Error),
     /// Trace session failed to stop via `ControlTraceW`.
+    #[error("failed to stop ETW session: {0}")]
     SessionStopFailed(Win32Error),
     /// Trace consumer failed to open via `OpenTraceW`.
+    #[error("failed to open ETW trace consumer: {0}")]
     OpenTraceFailed(Win32Error),
     /// Background trace processing failed via `ProcessTrace`.
+    #[error("ETW ProcessTrace loop failed: {0}")]
     ProcessTraceFailed(Win32Error),
 }
 
-impl fmt::Display for EtwError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SessionStartFailed(err) => write!(f, "failed to start ETW session: {err}"),
-            Self::SessionStopFailed(err) => write!(f, "failed to stop ETW session: {err}"),
-            Self::OpenTraceFailed(err) => write!(f, "failed to open ETW trace consumer: {err}"),
-            Self::ProcessTraceFailed(err) => write!(f, "ETW ProcessTrace loop failed: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for EtwError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::SessionStartFailed(err)
-            | Self::SessionStopFailed(err)
-            | Self::OpenTraceFailed(err)
-            | Self::ProcessTraceFailed(err) => Some(err),
-        }
-    }
-}
-
 /// Deserialization and resolution errors encountered during telemetry handling.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum HandlerError {
     /// Payload buffer length is smaller than the required fixed structure header.
+    #[error("payload buffer too short: expected at least {expected} bytes, got {actual}")]
     PayloadTooShort {
         /// Expected minimum length in bytes.
         expected: usize,
@@ -232,41 +160,33 @@ pub enum HandlerError {
         actual: usize,
     },
     /// Process ID does not exist in the active process tree.
+    #[error("process not found in system tree: PID {0}")]
     ProcessNotFound(u32),
 }
 
-impl fmt::Display for HandlerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PayloadTooShort { expected, actual } => {
-                write!(
-                    f,
-                    "payload buffer too short: expected at least {expected} bytes, got {actual}"
-                )
-            }
-            Self::ProcessNotFound(pid) => {
-                write!(f, "process not found in system tree: PID {pid}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for HandlerError {}
-
 /// Central unified application error type for the Pulsar EDR agent.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum AppError {
     /// Low-level Windows OS API failure.
-    Win32(Win32Error),
+    #[error("system error: {0}")]
+    Win32(#[from] Win32Error),
     /// Pre-flight initialization / bootstrap failure.
-    Bootstrap(BootstrapError),
+    #[error("bootstrap failure: {0}")]
+    Bootstrap(#[from] BootstrapError),
     /// Kernel driver or SCM communication failure.
-    Driver(DriverError),
+    #[error("driver failure: {0}")]
+    Driver(#[from] DriverError),
     /// ETW telemetry sensor failure.
-    Etw(EtwError),
+    #[error("ETW sensor failure: {0}")]
+    Etw(#[from] EtwError),
     /// Ingress handler deserialization failure.
-    Handler(HandlerError),
+    #[error("telemetry parser error: {0}")]
+    Handler(#[from] HandlerError),
+    /// Portable Executable (PE) header parser error.
+    #[error("PE parser error: {0}")]
+    Pe(#[from] crate::helpers::pe::PeError),
     /// Internal application logic failure.
+    #[error("internal error: {0}")]
     Internal(String),
 }
 
@@ -279,62 +199,6 @@ impl AppError {
     /// Creates a generic internal error variant.
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
-    }
-}
-
-impl From<Win32Error> for AppError {
-    fn from(err: Win32Error) -> Self {
-        Self::Win32(err)
-    }
-}
-
-impl From<BootstrapError> for AppError {
-    fn from(err: BootstrapError) -> Self {
-        Self::Bootstrap(err)
-    }
-}
-
-impl From<DriverError> for AppError {
-    fn from(err: DriverError) -> Self {
-        Self::Driver(err)
-    }
-}
-
-impl From<EtwError> for AppError {
-    fn from(err: EtwError) -> Self {
-        Self::Etw(err)
-    }
-}
-
-impl From<HandlerError> for AppError {
-    fn from(err: HandlerError) -> Self {
-        Self::Handler(err)
-    }
-}
-
-impl fmt::Display for AppError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Win32(err) => write!(f, "system error: {err}"),
-            Self::Bootstrap(err) => write!(f, "bootstrap failure: {err}"),
-            Self::Driver(err) => write!(f, "driver failure: {err}"),
-            Self::Etw(err) => write!(f, "ETW sensor failure: {err}"),
-            Self::Handler(err) => write!(f, "telemetry parser error: {err}"),
-            Self::Internal(msg) => write!(f, "internal error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for AppError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Win32(err) => Some(err),
-            Self::Bootstrap(err) => Some(err),
-            Self::Driver(err) => Some(err),
-            Self::Etw(err) => Some(err),
-            Self::Handler(err) => Some(err),
-            Self::Internal(_) => None,
-        }
     }
 }
 

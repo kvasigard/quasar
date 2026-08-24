@@ -248,7 +248,7 @@ pub fn handle_file_write(record: &EventRecord) -> Result<FileReadWriteEvent, Han
 /// Returns [`HandlerError::PayloadTooShort`] if the user data buffer is smaller than the minimum struct size.
 #[tracing::instrument(name = "handle_file_operation", skip(record), level = "debug")]
 pub fn handle_file_operation(record: &EventRecord) -> Result<FileOperationEvent, HandlerError> {
-    const MIN_SIMPLEOP_STRUCT_SIZE: usize = 32;
+    const MIN_SIMPLEOP_STRUCT_SIZE: usize = 24;
 
     if record.user_data.len() < MIN_SIMPLEOP_STRUCT_SIZE {
         return Err(HandlerError::PayloadTooShort {

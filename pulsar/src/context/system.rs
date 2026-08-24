@@ -2,15 +2,15 @@
 
 use std::sync::Arc;
 
-use crate::context::LoadedModule;
+use crate::context::{LoadedModule, ModuleInfo};
 use crate::context::config::ContextConfig;
 use crate::context::correlation::InjectionCorrelator;
 use crate::context::enrichment::{EnrichmentQueue, EnrichmentTask};
 use crate::context::identity::{FileKey, ProcessKey};
-use crate::context::models::file::{FileAccessRecord, FileContext};
+use crate::context::models::file::{FileAccessRecord, FileContext, FileFormatInfo};
 use crate::context::models::interaction::InteractionRecord;
 use crate::context::models::process::ProcessContext;
-use crate::context::query::{InteractionQuery, ProcessRef};
+use crate::context::query::{FileRef, InteractionQuery, NetworkQuery, ProcessRef};
 use crate::context::registries::{FileRegistry, InteractionRegistry, NetworkRegistry, ProcessTree};
 use crate::context::retention::RetentionManager;
 
@@ -30,6 +30,10 @@ pub struct SystemContext {
     pub(crate) retention: Arc<RetentionManager>,
     /// Enrichment task for heavy operation to populate context structures.
     pub(crate) enrichment: Arc<EnrichmentQueue>,
+    /// System-wide modules (ntdll.dll, win32u.dll, kernel32.dll, user32.dll) mapped identically across all processes.
+    pub(crate) system_modules: parking_lot::RwLock<Vec<LoadedModule>>,
+    /// Global cache of immutable module metadata shared across processes via `Arc<ModuleInfo>`.
+    pub(crate) module_info_cache: dashmap::DashMap<FileKey, Arc<ModuleInfo>>,
 }
 
 impl Default for SystemContext {
@@ -67,6 +71,7 @@ impl SystemContext {
         let injection_correlator = InjectionCorrelator::new();
         let (enrichment_queue, enrichment_rx) = EnrichmentQueue::new(enrichment_capacity);
         let retention = Arc::new(RetentionManager::new(config));
+        let system_modules = parking_lot::RwLock::new(Vec::new());
 
         // Spawn background GC worker thread
         let retention_clone = Arc::clone(&retention);
@@ -90,6 +95,8 @@ impl SystemContext {
             injection_correlator,
             retention,
             enrichment,
+            system_modules,
+            module_info_cache: dashmap::DashMap::new(),
         }
     }
 
@@ -101,7 +108,7 @@ impl SystemContext {
     ///
     /// # Returns
     ///
-    /// An isolated [`SystemContext`] without background worker threads.
+    /// An isolated [`SystemContext`] instance without background threads.
     pub fn new_for_test(config: ContextConfig) -> Self {
         let max_interactions = config.max_interaction_capacity;
         let enrichment_capacity = config.enrichment_queue_capacity;
@@ -110,9 +117,10 @@ impl SystemContext {
         let network = Arc::new(NetworkRegistry::new());
         let interactions = Arc::new(InteractionRegistry::new(max_interactions));
         let injection_correlator = InjectionCorrelator::new();
-        let (enrichment_queue, _rx) = EnrichmentQueue::new(enrichment_capacity);
+        let (enrichment_queue, _) = EnrichmentQueue::new(enrichment_capacity);
         let retention = Arc::new(RetentionManager::new(config));
-        let enrichment = Arc::new(enrichment_queue);
+        let system_modules = parking_lot::RwLock::new(Vec::new());
+
         Self {
             processes,
             files,
@@ -120,7 +128,9 @@ impl SystemContext {
             interactions,
             injection_correlator,
             retention,
-            enrichment,
+            enrichment: Arc::new(enrichment_queue),
+            system_modules,
+            module_info_cache: dashmap::DashMap::new(),
         }
     }
 
@@ -213,6 +223,74 @@ impl SystemContext {
         Some(ProcessRef::new(self, inner))
     }
 
+    /// Resolves an active process context using its OS PID, or creates a placeholder context if missing.
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - Operating system Process ID.
+    /// * `timestamp` - Current telemetry timestamp.
+    ///
+    /// # Returns
+    ///
+    /// An `Arc<ProcessContext>` stored in the process tree.
+    #[inline]
+    pub fn get_or_create_process(&self, pid: u32, timestamp: i64) -> Arc<ProcessContext> {
+        self.processes.get_or_create_by_pid(pid, timestamp)
+    }
+
+    /// Gets or creates a deduplicated [`Arc<ModuleInfo>`] cached globally across all processes.
+    pub fn get_or_create_module_info(
+        &self,
+        file_key: Option<FileKey>,
+        image_name: &str,
+        image_size: u64,
+        checksum: u32,
+        default_base: u64,
+    ) -> Arc<ModuleInfo> {
+        if let Some(key) = file_key
+            && let Some(existing) = self.module_info_cache.get(&key)
+        {
+            return Arc::clone(existing.value());
+        }
+
+        let info = Arc::new(ModuleInfo::new(
+            image_name,
+            image_size,
+            file_key,
+            checksum,
+            default_base,
+        ));
+
+        if let Some(key) = file_key {
+            self.module_info_cache.insert(key, Arc::clone(&info));
+        }
+
+        info
+    }
+
+    /// Records a system module globally so any process can resolve system addresses even before its private rundown.
+    pub fn record_system_module(&self, module: LoadedModule) {
+        let mut modules = self.system_modules.write();
+        match modules.binary_search_by_key(&module.base_address, |m| m.base_address) {
+            Ok(idx) => modules[idx] = module,
+            Err(insert_idx) => modules.insert(insert_idx, module),
+        }
+    }
+
+    /// Resolves a system module by virtual address from the global system module cache.
+    pub fn find_system_module_by_address(&self, addr: u64) -> Option<LoadedModule> {
+        let modules = self.system_modules.read();
+        let candidate_idx = match modules.binary_search_by_key(&addr, |m| m.base_address) {
+            Ok(exact_idx) => exact_idx,
+            Err(idx) => idx.checked_sub(1)?,
+        };
+
+        modules
+            .get(candidate_idx)
+            .filter(|module| module.contains_address(addr))
+            .cloned()
+    }
+
     /// Returns a fluent query handle for any tracked process by its `ProcessKey`.
     ///
     /// # Arguments
@@ -266,10 +344,11 @@ impl SystemContext {
     ///
     /// # Returns
     ///
-    /// `Some(Arc<FileContext>)` if tracked, otherwise `None`.
+    /// `Some(FileRef)` query wrapper if tracked, otherwise `None`.
     #[inline]
-    pub fn file(&self, path: &str) -> Option<Arc<FileContext>> {
-        self.files.get_by_path(path)
+    pub fn file(&self, path: &str) -> Option<FileRef<'_>> {
+        let inner = self.files.get_by_path(path)?;
+        Some(FileRef::new(self, inner))
     }
 
     /// Alias for `file`.
@@ -280,9 +359,9 @@ impl SystemContext {
     ///
     /// # Returns
     ///
-    /// `Some(Arc<FileContext>)` if tracked, otherwise `None`.
+    /// `Some(FileRef)` query wrapper if tracked, otherwise `None`.
     #[inline]
-    pub fn get_file(&self, path: &str) -> Option<Arc<FileContext>> {
+    pub fn get_file(&self, path: &str) -> Option<FileRef<'_>> {
         self.file(path)
     }
 
@@ -294,10 +373,17 @@ impl SystemContext {
     ///
     /// # Returns
     ///
-    /// `Some(Arc<FileContext>)` if tracked, otherwise `None`.
+    /// `Some(FileRef)` query wrapper if tracked, otherwise `None`.
     #[inline]
-    pub fn file_by_key(&self, key: FileKey) -> Option<Arc<FileContext>> {
-        self.files.get_by_key(key)
+    pub fn file_by_key(&self, key: FileKey) -> Option<FileRef<'_>> {
+        let inner = self.files.get_by_key(key)?;
+        Some(FileRef::new(self, inner))
+    }
+
+    /// Returns a fluent query builder for filtering and inspecting network connections.
+    #[inline]
+    pub fn network_query(&self) -> NetworkQuery<'_> {
+        NetworkQuery::new(self)
     }
 
     /// Alias for `file_by_key`.
@@ -308,9 +394,9 @@ impl SystemContext {
     ///
     /// # Returns
     ///
-    /// `Some(Arc<FileContext>)` if tracked, otherwise `None`.
+    /// `Some(FileRef)` query wrapper if tracked, otherwise `None`.
     #[inline]
-    pub fn get_file_by_key(&self, key: FileKey) -> Option<Arc<FileContext>> {
+    pub fn get_file_by_key(&self, key: FileKey) -> Option<FileRef<'_>> {
         self.file_by_key(key)
     }
 
@@ -381,6 +467,31 @@ impl SystemContext {
         } else {
             Vec::new()
         }
+    }
+
+    /// Sets the format-specific metadata for a tracked file entity.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_key` - Synthetic file key.
+    /// * `info` - Parsed [`FileFormatInfo`] descriptor.
+    pub fn set_file_format_info(&self, file_key: FileKey, info: FileFormatInfo) {
+        if let Some(file_ctx) = self.files.get_by_key(file_key) {
+            file_ctx.set_format_info(info);
+        }
+    }
+
+    /// Returns a shared reference to the parsed PE metadata if this file is a Portable Executable.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_key` - Synthetic file key.
+    ///
+    /// # Returns
+    ///
+    /// `Some(Arc<PeInfo>)` if PE format info is present, or `None`.
+    pub fn file_pe_info(&self, file_key: FileKey) -> Option<Arc<crate::helpers::pe::PeInfo>> {
+        self.files.get_by_key(file_key).and_then(|f| f.pe_info())
     }
 
     /// Returns the number of currently mapped kernel `FileObject` pointers.

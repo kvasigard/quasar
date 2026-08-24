@@ -26,7 +26,7 @@ pub struct InFlightInjection {
     /// Allocated virtual memory base address.
     pub allocated_base: Option<u64>,
     /// Number of bytes allocated.
-    pub allocated_size: Option<usize>,
+    pub allocated_size: Option<u64>,
     /// Whether memory write occurred.
     pub memory_written: bool,
     /// Total sequential attack stages observed.
@@ -106,7 +106,7 @@ impl InjectionCorrelator {
         actor_key: ProcessKey,
         target_key: ProcessKey,
         base_address: u64,
-        size: usize,
+        size: u64,
         timestamp: i64,
     ) {
         if actor_key == target_key {

@@ -68,6 +68,12 @@ impl InteractionRegistry {
             && let Some(old) = records.pop_front()
         {
             self.by_id.remove(&old.id);
+            if let Some(mut src_entry) = self.source_index.get_mut(&old.source) {
+                src_entry.retain(|&i| i != old.id);
+            }
+            if let Some(mut tgt_entry) = self.target_index.get_mut(&old.target) {
+                tgt_entry.retain(|&i| i != old.id);
+            }
         }
         records.push_back(Arc::clone(&record_arc));
 

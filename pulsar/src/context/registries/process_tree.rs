@@ -128,6 +128,40 @@ impl ProcessTree {
         self.get_by_key(*key_ref.value())
     }
 
+    /// Resolves an active process context using its OS PID, or creates a placeholder context if missing.
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - Operating system Process ID.
+    /// * `timestamp` - Current telemetry timestamp.
+    ///
+    /// # Returns
+    ///
+    /// An `Arc<ProcessContext>` stored in the process tree.
+    pub fn get_or_create_by_pid(&self, pid: u32, timestamp: i64) -> Arc<ProcessContext> {
+        match self.active_pids.entry(pid) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                let key = *occupied.get();
+                if let Some(proc) = self.get_by_key(key) {
+                    proc
+                } else {
+                    let key = ProcessKey::new();
+                    let context = Arc::new(ProcessContext::new(key, None, pid, 0, timestamp));
+                    self.processes.insert(key, Arc::clone(&context));
+                    *occupied.get_mut() = key;
+                    context
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                let key = ProcessKey::new();
+                let context = Arc::new(ProcessContext::new(key, None, pid, 0, timestamp));
+                self.processes.insert(key, Arc::clone(&context));
+                vacant.insert(key);
+                context
+            }
+        }
+    }
+
     /// Resolves any known process context (active, retained, or tombstone) by its unique `ProcessKey`.
     ///
     /// # Arguments
@@ -216,6 +250,11 @@ impl ProcessTree {
     #[inline]
     pub fn active_process_count(&self) -> usize {
         self.active_pids.len()
+    }
+
+    /// Returns a snapshot list of all active operating system PIDs currently tracked.
+    pub fn all_active_pids(&self) -> Vec<u32> {
+        self.active_pids.iter().map(|entry| *entry.key()).collect()
     }
 
     /// Returns all process keys currently tracked in the arena.

@@ -569,7 +569,7 @@ impl EtwSession for KernelSession {
         let session_name_owned = Self::SESSION_NAME.to_string();
 
         let handle = std::thread::Builder::new()
-            .name("pulsar-etw-consumer".into())
+            .name("pulsar-etw-rx".into())
             .spawn(move || {
             let mut name_wide: Vec<u16> =
                 session_name_owned.encode_utf16().chain(Some(0)).collect();

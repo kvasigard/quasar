@@ -43,7 +43,7 @@ quasar/
 │       │   └── ingress.rs    # Stage 1 binary deserialization & single-source ingestion
 │       ├── sensors/          # Telemetry ingestion (ETW NT Kernel Logger)
 │       ├── sinks/            # Analytical detection sinks (DirectSyscallSink)
-│       └── helpers/          # Stack correlator, symbol resolver, string decoding
+│       └── helpers/          # Pure-Rust PE parser, stack correlator, symbol resolver, string decoding
 └── singularity/              # KMDF Driver (Kernel-Mode)
     ├── .cargo/config.toml    # Compiler flags for kernel environment
     ├── Makefile.toml         # cargo-make configuration for driver packaging

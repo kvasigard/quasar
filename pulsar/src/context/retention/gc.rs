@@ -13,6 +13,27 @@ use crate::context::config::ContextConfig;
 use crate::context::identity::ProcessKey;
 use crate::context::registries::ProcessTree;
 
+/// Number of 100-nanosecond intervals (FILETIME ticks) in one millisecond.
+pub const FILETIME_TICKS_PER_MS: i64 = 10_000;
+
+/// Converts a `SystemTime` into Windows `FILETIME` format (100-nanosecond intervals since Jan 1, 1601).
+pub fn system_time_to_filetime(time: std::time::SystemTime) -> i64 {
+    const UNIX_TO_FILETIME_TICKS: u64 = 116_444_736_000_000_000;
+    const TICKS_PER_SEC: u64 = 10_000_000;
+    const NANOS_PER_TICK: u64 = 100;
+
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(dur) => {
+            let ticks_from_secs = dur.as_secs().saturating_mul(TICKS_PER_SEC);
+            let ticks_from_nanos = (dur.subsec_nanos() as u64) / NANOS_PER_TICK;
+            UNIX_TO_FILETIME_TICKS
+                .saturating_add(ticks_from_secs)
+                .saturating_add(ticks_from_nanos) as i64
+        }
+        Err(_) => 0,
+    }
+}
+
 /// Manages eviction queues and orchestrates dual-trigger garbage collection sweeps.
 pub struct RetentionManager {
     /// Time-ordered FIFO queue of exited processes: `(ProcessKey, ExitTimestamp)`.
@@ -70,7 +91,8 @@ impl RetentionManager {
         let mut tombstones_created = 0;
         let mut evicted_count = 0;
 
-        let cutoff_time = current_time - self.config.retention_ttl_ms;
+        let ttl_ticks = self.config.retention_ttl_ms.saturating_mul(FILETIME_TICKS_PER_MS);
+        let cutoff_time = current_time.saturating_sub(ttl_ticks);
         let is_over_capacity = processes.total_process_count() > self.config.max_process_capacity;
 
         let mut queue = self.exit_queue.write();
@@ -152,7 +174,7 @@ impl RetentionManager {
         let interval = Duration::from_millis(self.config.gc_interval_ms);
 
         thread::Builder::new()
-            .name("pulsar-context-gc".to_string())
+            .name("pulsar-ctx-gc".into())
             .spawn(move || {
                 log::info!(target: "system_gc", "Background Context GC worker thread started");
 
@@ -162,11 +184,7 @@ impl RetentionManager {
                             break;
                         }
                         recv(crossbeam_channel::after(interval)) -> _ => {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as i64)
-                                .unwrap_or(0);
-
+                            let now = system_time_to_filetime(std::time::SystemTime::now());
                             self.run_gc_pass(&processes, now);
                         }
                     }

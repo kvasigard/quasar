@@ -60,7 +60,7 @@ mod tests {
     /// Tests IOCTL control code bit calculation matching Windows WDK CTL_CODE macro.
     #[test]
     fn test_ioctl_code_calculation() {
-        let expected_code = (0x8000 << 16) | (0 << 14) | (0x801 << 2) | 0;
+        let expected_code = (0x8000 << 16) | (0x801 << 2);
         assert_eq!(IOCTL_CHANGE_PPL_LEVEL, expected_code);
         assert_eq!(ChangeProcessPplLevel::CODE, expected_code);
     }
