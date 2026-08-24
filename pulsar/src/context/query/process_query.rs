@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use crate::context::SystemContext;
 use crate::context::identity::{FileKey, ProcessKey};
-use crate::context::models::file::FileContext;
 use crate::context::models::handle::HandleObject;
 use crate::context::models::interaction::InteractionRecord;
 use crate::context::models::module::LoadedModule;
 use crate::context::models::network::NetworkConnection;
 use crate::context::models::process::ProcessContext;
 use crate::context::models::token::TokenContext;
+use crate::context::query::file_query::FileRef;
 
 /// Ergonomic, fluent query wrapper around an `Arc<ProcessContext>` snapshot.
 ///
@@ -81,45 +81,77 @@ impl<'a> ProcessRef<'a> {
     ///
     /// # Returns
     ///
-    /// The image file name string slice.
+    /// The image file name.
     #[inline]
-    pub fn image_file_name(&self) -> &str {
-        &self.inner.image_file_name
+    pub fn image_file_name(&self) -> String {
+        self.inner.image_file_name.read().clone()
     }
 
     /// Returns the full image path if available.
     ///
     /// # Returns
     ///
-    /// `Some(&str)` containing the full path, or `None`.
+    /// `Some(String)` containing the full path, or `None`.
     #[inline]
-    pub fn image_path(&self) -> Option<&str> {
-        self.inner.image_path.as_deref()
+    pub fn image_path(&self) -> Option<String> {
+        self.inner.image_path.read().clone()
     }
 
     /// Returns the base name of the process image.
     ///
     /// # Returns
     ///
-    /// Extracted file name string slice.
-    pub fn image_name(&self) -> &str {
-        if let Some(path) = self.inner.image_path.as_deref() {
-            path.rsplit(&['/', '\\'][..]).next().unwrap_or(path)
-        } else if !self.inner.image_file_name.is_empty() {
-            &self.inner.image_file_name
-        } else {
-            "unknown"
+    /// Extracted file name.
+    pub fn image_name(&self) -> String {
+        let path_guard = self.inner.image_path.read();
+        if let Some(path) = path_guard.as_deref() {
+            return path.rsplit(&['/', '\\'][..]).next().unwrap_or(path).to_string();
         }
+        let name_guard = self.inner.image_file_name.read();
+        if !name_guard.is_empty() {
+            return name_guard.clone();
+        }
+        "unknown".to_string()
     }
 
     /// Returns the process command line invocation string if available.
     ///
     /// # Returns
     ///
-    /// `Some(&str)` containing the command line, or `None`.
+    /// `Some(String)` containing the command line, or `None`.
     #[inline]
-    pub fn command_line(&self) -> Option<&str> {
-        self.inner.command_line.as_deref()
+    pub fn command_line(&self) -> Option<String> {
+        self.inner.command_line()
+    }
+
+    /// Returns the package full name for UWP / AppX applications if available.
+    #[inline]
+    pub fn package_full_name(&self) -> Option<String> {
+        self.inner.package_full_name()
+    }
+
+    /// Returns the application ID string if available.
+    #[inline]
+    pub fn application_id(&self) -> Option<String> {
+        self.inner.application_id()
+    }
+
+    /// Checks if the process token is elevated (Administrator or SYSTEM).
+    #[inline]
+    pub fn is_elevated(&self) -> bool {
+        self.inner.token.read().is_elevated
+    }
+
+    /// Returns the token integrity level for this process.
+    #[inline]
+    pub fn integrity(&self) -> crate::context::models::token::IntegrityLevel {
+        self.inner.token.read().integrity
+    }
+
+    /// Checks if a specific privilege is enabled on the process token.
+    #[inline]
+    pub fn has_privilege(&self, priv_name: &str) -> bool {
+        self.inner.token.read().has_privilege(priv_name)
     }
 
     /// Returns the process creation timestamp (FILETIME 100ns ticks).
@@ -243,7 +275,7 @@ impl<'a> ProcessRef<'a> {
             .loaded_modules
             .read()
             .iter()
-            .any(|m| m.image_name.to_lowercase().contains(&lower))
+            .any(|m| m.image_name().to_lowercase().contains(&lower))
     }
 
     /// Resolves a virtual memory address to its owning loaded module within this process.
@@ -269,6 +301,36 @@ impl<'a> ProcessRef<'a> {
         self.inner.handles.read().values().cloned().collect()
     }
 
+    /// Returns all open kernel handles held by this process that target a specific process.
+    ///
+    /// # Arguments
+    ///
+    /// * `target_key` - Synthetic process key of the target process.
+    pub fn handles_to_process(&self, target_key: ProcessKey) -> Vec<HandleObject> {
+        self.inner
+            .handles
+            .read()
+            .values()
+            .filter(|h| h.target_process() == Some(target_key))
+            .cloned()
+            .collect()
+    }
+
+    /// Returns all open kernel handles held by this process that target a specific file.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_key` - Synthetic file key of the target file.
+    pub fn handles_to_file(&self, file_key: FileKey) -> Vec<HandleObject> {
+        self.inner
+            .handles
+            .read()
+            .values()
+            .filter(|h| h.target_file() == Some(file_key))
+            .cloned()
+            .collect()
+    }
+
     /// Returns a snapshot of referenced file keys accessed by this process.
     ///
     /// # Returns
@@ -278,15 +340,20 @@ impl<'a> ProcessRef<'a> {
         self.inner.touched_files.read().iter().copied().collect()
     }
 
-    /// Returns a snapshot of all [`FileContext`] entities touched by this process.
+    /// Returns a snapshot of all [`FileRef`] query handles touched by this process.
     ///
     /// # Returns
     ///
-    /// A vector of [`Arc<FileContext>`] references.
-    pub fn touched_files(&self) -> Vec<Arc<FileContext>> {
+    /// A vector of [`FileRef`] query handles.
+    pub fn touched_files(&self) -> Vec<FileRef<'a>> {
         let keys = self.inner.touched_files.read();
         keys.iter()
-            .filter_map(|key| self.ctx.files.get_by_key(*key))
+            .filter_map(|key| {
+                self.ctx
+                    .files
+                    .get_by_key(*key)
+                    .map(|inner| FileRef::new(self.ctx, inner))
+            })
             .collect()
     }
 
@@ -294,8 +361,8 @@ impl<'a> ProcessRef<'a> {
     ///
     /// # Returns
     ///
-    /// A vector of [`Arc<FileContext>`] references with write activity.
-    pub fn recent_file_writes(&self) -> Vec<Arc<FileContext>> {
+    /// A vector of [`FileRef`] references with write activity.
+    pub fn recent_file_writes(&self) -> Vec<FileRef<'a>> {
         self.touched_files()
             .into_iter()
             .filter(|f| f.has_writes())
@@ -306,9 +373,9 @@ impl<'a> ProcessRef<'a> {
     ///
     /// # Returns
     ///
-    /// A vector of [`Arc<FileContext>`] references.
+    /// A vector of [`FileRef`] references.
     #[inline]
-    pub fn modified_files(&self) -> Vec<Arc<FileContext>> {
+    pub fn modified_files(&self) -> Vec<FileRef<'a>> {
         self.recent_file_writes()
     }
 

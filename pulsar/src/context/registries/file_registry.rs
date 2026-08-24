@@ -62,20 +62,26 @@ impl FileRegistry {
     pub fn get_or_create(&self, raw_path: &str, timestamp: i64) -> (Arc<FileContext>, bool) {
         let normalized = normalize_file_path(raw_path);
 
-        if let Some(key_ref) = self.path_to_key.get(&normalized)
-            && let Some(file_ref) = self.files.get(key_ref.value())
-        {
-            file_ref.touch(timestamp);
-            return (Arc::clone(file_ref.value()), false);
+        match self.path_to_key.entry(normalized.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                let key = *occupied.get();
+                if let Some(file_ref) = self.files.get(&key) {
+                    file_ref.touch(timestamp);
+                    (Arc::clone(file_ref.value()), false)
+                } else {
+                    let file_ctx = Arc::new(FileContext::new(key, normalized, timestamp));
+                    self.files.insert(key, Arc::clone(&file_ctx));
+                    (file_ctx, true)
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                let key = FileKey::new();
+                let file_ctx = Arc::new(FileContext::new(key, normalized, timestamp));
+                self.files.insert(key, Arc::clone(&file_ctx));
+                vacant.insert(key);
+                (file_ctx, true)
+            }
         }
-
-        let key = FileKey::new();
-        let file_ctx = Arc::new(FileContext::new(key, normalized.clone(), timestamp));
-
-        self.files.insert(key, Arc::clone(&file_ctx));
-        self.path_to_key.insert(normalized, key);
-
-        (file_ctx, true)
     }
 
     /// Associates an active kernel `FileObject` pointer with a synthetic `FileKey`.

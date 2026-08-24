@@ -97,6 +97,14 @@ impl NetworkRegistry {
         self.process_connections(proc_key)
     }
 
+    /// Returns a snapshot of all active connections currently tracked in the registry.
+    pub fn all_connections(&self) -> Vec<Arc<NetworkConnection>> {
+        self.connections
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect()
+    }
+
     /// Total count of tracked connections.
     ///
     /// # Returns

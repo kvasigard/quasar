@@ -46,7 +46,7 @@ pub struct InjectionDetails {
     /// Target base address in remote memory.
     pub target_base_address: Option<u64>,
     /// Number of bytes allocated or written.
-    pub allocated_size: Option<usize>,
+    pub allocated_size: Option<u64>,
     /// How the payload was triggered.
     pub execution_trigger: Option<ExecutionTrigger>,
     /// Number of sequential attack stages correlated.
@@ -81,7 +81,7 @@ pub struct MemoryTamperingDetails {
     /// Target virtual base address.
     pub target_base_address: u64,
     /// Size of the modified memory region.
-    pub region_size: usize,
+    pub region_size: u64,
     /// Memory protection before modification.
     pub old_protection: u32,
     /// New memory protection (e.g. PAGE_EXECUTE_READWRITE).

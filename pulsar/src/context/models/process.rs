@@ -44,8 +44,6 @@ pub struct ProcessContext {
     pub exit_time: AtomicI64,
     /// Final NTSTATUS / Win32 exit code (STILL_ACTIVE while running).
     pub exit_status: AtomicU32,
-    /// Fast lock-free execution status flag.
-    pub is_alive: AtomicBool,
 
     // --- Retention & Forensics Control ---
     /// When `true`, this process is exempt from garbage collection (e.g. involved in an alert).
@@ -61,15 +59,15 @@ pub struct ProcessContext {
 
     // --- Executable & Invocation Details ---
     /// Base image file name (e.g. "cmd.exe").
-    pub image_file_name: String,
+    pub image_file_name: RwLock<String>,
     /// Full normalized filesystem image path.
-    pub image_path: Option<String>,
+    pub image_path: RwLock<Option<String>>,
     /// Full command line invocation string.
-    pub command_line: Option<String>,
+    pub command_line: RwLock<Option<String>>,
     /// Package full name for UWP / AppX applications.
-    pub package_full_name: Option<String>,
+    pub package_full_name: RwLock<Option<String>>,
     /// Application ID string.
-    pub application_id: Option<String>,
+    pub application_id: RwLock<Option<String>>,
 
     // --- In-Place Mutable Sub-Tables (Fine-grained Interior Mutability) ---
     /// Security token context.
@@ -117,16 +115,15 @@ impl ProcessContext {
             create_time,
             exit_time: AtomicI64::new(0),
             exit_status: AtomicU32::new(STILL_ACTIVE as u32),
-            is_alive: AtomicBool::new(true),
             is_pinned: AtomicBool::new(false),
             is_tombstone: AtomicBool::new(false),
             unique_process_key: 0,
             page_directory_base: 0,
-            image_file_name: String::new(),
-            image_path: None,
-            command_line: None,
-            package_full_name: None,
-            application_id: None,
+            image_file_name: RwLock::new(String::new()),
+            image_path: RwLock::new(None),
+            command_line: RwLock::new(None),
+            package_full_name: RwLock::new(None),
+            application_id: RwLock::new(None),
             token: RwLock::new(TokenContext::default()),
             loaded_modules: RwLock::new(Vec::new()),
             handles: RwLock::new(HashMap::new()),
@@ -171,7 +168,7 @@ impl ProcessContext {
     /// `true` if the process is alive, `false` if terminated.
     #[inline]
     pub fn is_alive(&self) -> bool {
-        self.is_alive.load(Ordering::Relaxed)
+        self.exit_time.load(Ordering::Relaxed) == 0
     }
 
     /// Checks if this process is currently pinned for forensic investigation.
@@ -218,7 +215,58 @@ impl ProcessContext {
 
     // --- In-Place Mutation Primitives ---
 
+    /// Explicitly updates the process image file name.
+    #[inline]
+    pub fn set_image_name(&self, name: impl Into<String>) {
+        *self.image_file_name.write() = name.into();
+    }
+
+    /// Explicitly updates the full process image path.
+    #[inline]
+    pub fn set_image_path(&self, path: impl Into<String>) {
+        *self.image_path.write() = Some(path.into());
+    }
+
+    /// Returns the command line invocation string if recorded.
+    #[inline]
+    pub fn command_line(&self) -> Option<String> {
+        self.command_line.read().clone()
+    }
+
+    /// Explicitly updates the process command line invocation string.
+    #[inline]
+    pub fn set_command_line(&self, cmd: impl Into<String>) {
+        *self.command_line.write() = Some(cmd.into());
+    }
+
+    /// Returns the package full name for UWP / AppX applications if recorded.
+    #[inline]
+    pub fn package_full_name(&self) -> Option<String> {
+        self.package_full_name.read().clone()
+    }
+
+    /// Explicitly updates the package full name for UWP / AppX applications.
+    #[inline]
+    pub fn set_package_full_name(&self, pkg: impl Into<String>) {
+        *self.package_full_name.write() = Some(pkg.into());
+    }
+
+    /// Returns the application ID string if recorded.
+    #[inline]
+    pub fn application_id(&self) -> Option<String> {
+        self.application_id.read().clone()
+    }
+
+    /// Explicitly updates the application ID string.
+    #[inline]
+    pub fn set_application_id(&self, app_id: impl Into<String>) {
+        *self.application_id.write() = Some(app_id.into());
+    }
+
     /// Records a newly mapped DLL or binary image into this process context in-place.
+    ///
+    /// If the loaded module is an executable (`.exe`) and the process currently has an empty
+    /// image name, automatically populates the process's image name and path.
     ///
     /// Maintains the internal [`Vec<LoadedModule>`] in ascending order by base address.
     /// If a module already exists at `module.base_address`, its metadata is overwritten;
@@ -228,6 +276,22 @@ impl ProcessContext {
     ///
     /// * `module` - The loaded module metadata to record.
     pub fn record_module_load(&self, module: LoadedModule) {
+        let image_name = module.image_name();
+        if image_name.to_ascii_lowercase().ends_with(".exe") {
+            let mut name_guard = self.image_file_name.write();
+            if name_guard.is_empty() {
+                let short_name = image_name
+                    .rsplit(&['/', '\\'][..])
+                    .next()
+                    .unwrap_or(image_name);
+                *name_guard = short_name.to_string();
+            }
+            let mut path_guard = self.image_path.write();
+            if path_guard.is_none() {
+                *path_guard = Some(image_name.to_string());
+            }
+        }
+
         let mut modules = self.loaded_modules.write();
         match modules.binary_search_by_key(&module.base_address, |m| m.base_address) {
             Ok(idx) => modules[idx] = module,
@@ -323,7 +387,6 @@ impl ProcessContext {
     /// * `exit_status` - The Win32 / NTSTATUS exit code.
     /// * `timestamp` - Termination timestamp in FILETIME format.
     pub fn mark_terminated(&self, exit_status: u32, timestamp: i64) {
-        self.is_alive.store(false, Ordering::Release);
         self.exit_status.store(exit_status, Ordering::Release);
         self.exit_time.store(timestamp, Ordering::Release);
     }

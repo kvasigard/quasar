@@ -25,7 +25,9 @@ To determine if a system call is legitimate or an evasive direct syscall, the si
 
 First, it locates the user-mode caller. On 64-bit Windows, user space is strictly confined to memory addresses below `0x00007FFFFFFFFFFF`. The sink filters through the return addresses on the stack to find the very first instruction pointer that falls within user space. This instruction pointer represents the exact code location that issued the `syscall` instruction.
 
-Second, it passes this instruction pointer to the `SymbolResolver` in `helpers/symbol_resolver.rs`. The symbol resolver dynamically parses the Portable Executable (PE) Export Directories of all DLLs loaded into that process.
+Second, it evaluates the instruction pointer using Quasar's in-memory `ProcessContext` interval map (`find_module_by_address`) and `FileRegistry`'s cached `PeInfo` export tables (parsed by `helpers/pe/`):
+* **Zero `dbghelp.dll` Lock Contention**: Rather than calling single-threaded Win32 debugging APIs under global mutexes, the sink performs sub-50ns in-memory interval queries.
+* **Pure-Rust PE Export Verification**: If the instruction pointer resolves to a system DLL (such as `ntdll.dll` or `win32u.dll`), the sink queries `file_ctx.pe_info()` to verify that the return address corresponds to a recognized exported syscall stub (e.g. `NtAllocateVirtualMemory`, `NtProtectVirtualMemory`).
 
 If the instruction pointer falls in an unbacked memory region (such as dynamic heap memory or shellcode buffers not mapped from any file on disk), an anomaly alert is raised immediately because legitimate code does not execute system calls from unbacked memory.
 

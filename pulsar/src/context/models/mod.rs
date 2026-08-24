@@ -9,13 +9,16 @@ pub mod process;
 pub mod thread;
 pub mod token;
 
-pub use file::{FileAccessRecord, FileContext, FileOperationKind};
+pub use file::{
+    FileAccessRecord, FileContext, FileFormatInfo, FileOperationKind, PeExport, PeExportDirectory,
+    PeInfo, PeSection,
+};
 pub use handle::{HandleObject, HandleTarget};
 pub use interaction::{
     ConfidenceLevel, ExecutionTrigger, HandleDupDetails, InjectionDetails, InjectionTechnique,
     InteractionKind, InteractionRecord, MemoryTamperingDetails, TokenImpersonationDetails,
 };
-pub use module::LoadedModule;
+pub use module::{LoadedModule, ModuleInfo};
 pub use network::{NetworkConnection, SocketProtocol};
 pub use process::ProcessContext;
 pub use thread::{ThreadContext, ThreadExecutionState};

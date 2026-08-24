@@ -55,12 +55,24 @@ pub fn handle_process_start(record: &EventRecord) -> Result<ProcessStartEvent, H
     // Multi-source deduplication: check if active process already exists for this PID
     if let Some(existing) = CONTEXT.get_process(pid) {
         // Same process lifecycle already indexed -> merge missing metadata in-place
-        if existing.command_line.is_none() && command_line.is_some() {
-            // Logically merge enriched information
+        if existing.command_line().is_none()
+            && let Some(ref cmd) = command_line
+        {
+            existing.set_command_line(cmd.clone());
             log::trace!(
                 target: "system_context",
                 "Merged enriched command-line for already active PID {pid}"
             );
+        }
+        if existing.package_full_name().is_none()
+            && let Some(ref pkg) = package_full_name
+        {
+            existing.set_package_full_name(pkg.clone());
+        }
+        if existing.application_id().is_none()
+            && let Some(ref app_id) = application_id
+        {
+            existing.set_application_id(app_id.clone());
         }
 
         return Ok(ProcessStartEvent {
@@ -81,10 +93,16 @@ pub fn handle_process_start(record: &EventRecord) -> Result<ProcessStartEvent, H
     context.page_directory_base = page_directory_base;
     context.session_id = session_id;
     context.unique_process_key = unique_process_key;
-    context.image_file_name = image_file_name.clone();
-    context.command_line = command_line.clone();
-    context.package_full_name = package_full_name;
-    context.application_id = application_id;
+    context.set_image_name(image_file_name.clone());
+    if let Some(cmd) = command_line.clone() {
+        context.set_command_line(cmd);
+    }
+    if let Some(pkg) = package_full_name {
+        context.set_package_full_name(pkg);
+    }
+    if let Some(app_id) = application_id {
+        context.set_application_id(app_id);
+    }
 
     let inserted = CONTEXT.insert_process(context);
     if !image_file_name.is_empty() {

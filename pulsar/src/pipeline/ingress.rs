@@ -93,7 +93,7 @@ impl IngressParser {
     /// # Returns
     ///
     /// `Some(Event)` if the record produced a complete domain event, or `None` if incomplete/buffered.
-    #[tracing::instrument(name = "ingress_process_record", skip(self, record), level = "debug", fields(pid = record.process_id, opcode = record.opcode))]
+    #[tracing::instrument(name = "ingress_process_record", skip(self, record), level = "trace", fields(pid = record.process_id, opcode = record.opcode))]
     pub fn process_raw_record(&self, record: EventRecord) -> Option<Event> {
         let prefix = record.provider_id.data1;
         let opcode = record.opcode;
@@ -134,9 +134,9 @@ impl IngressParser {
                 match handle_image_load(&record) {
                     Ok(event) => Some(Event::ImageLoad(event)),
                     Err(e) => {
-                        log::warn!(
+                        log::debug!(
                             target: "ingress",
-                            "Failed to parse image load event for PID {}: {e}",
+                            "Image load event for pre-existing or unmapped PID {}: {e}",
                             record.process_id
                         );
                         None
@@ -159,10 +159,12 @@ impl IngressParser {
                 }
             }
 
-            // Syscall Enter trigger event
+            // Syscall Enter trigger event (PerfInfo payload contains 64-bit SyscallAddress kernel function pointer)
             (PERFINFO_GUID_PREFIX, OPCODE_SYSCALL_ENTER) => {
-                let syscall_num = if record.user_data.len() >= 4 {
-                    Some(u32::from_ne_bytes(record.user_data[0..4].try_into().unwrap()))
+                let syscall_address = if record.user_data.len() >= 8 {
+                    Some(u64::from_ne_bytes(record.user_data[0..8].try_into().unwrap()))
+                } else if record.user_data.len() >= 4 {
+                    Some(u32::from_ne_bytes(record.user_data[0..4].try_into().unwrap()) as u64)
                 } else {
                     None
                 };
@@ -172,7 +174,7 @@ impl IngressParser {
                     record.process_id,
                     record.thread_id,
                     record.timestamp,
-                    syscall_num,
+                    syscall_address,
                 );
 
                 matched.map(Event::CorrelatedSyscall)

@@ -128,6 +128,29 @@ Each `FileContext` maintains:
 ### 4. Process Context touched_files Linkage
 Whenever a process creates, opens, or writes to a file, the resulting `FileKey` is recorded into the originating process's `ProcessContext::touched_files` set. Detection sinks can query `proc.touched_files()`, `proc.recent_file_writes()`, and `proc.modified_files()` through the `ProcessRef` fluent query DSL.
 
+## Extensible File Format Architecture & Pure-Rust PE Header Extraction
+
+To detect weaponized payloads, inspect syscall entrypoints, and verify dynamic link libraries, `FileContext` holds format-specific structural metadata via the polymorphic `FileFormatInfo` container:
+
+```rust
+pub enum FileFormatInfo {
+    Unknown,
+    Pe(Arc<PeInfo>),
+    // Extensible for future weaponized document formats:
+    // Office(Arc<OfficeDocInfo>),
+    // Pdf(Arc<PdfDocInfo>),
+}
+```
+
+### 1. Pure-Rust Memory-Safe PE Parser
+Implemented in `pulsar/src/helpers/pe/`, the `PeParser` operates entirely in safe Rust with zero external debug library (`dbghelp.dll`) or C FFI dependencies:
+* **Headers Parsed**: Validates DOS `IMAGE_DOS_HEADER` (`MZ`), calculates `e_lfanew`, verifies NT signature (`PE\0\0`), extracts COFF File Header, and decodes 32-bit (PE32) / 64-bit (PE32+) Optional Headers.
+* **Section Interval Mapping**: Translates Relative Virtual Addresses (RVAs) to physical raw file offsets through defensive section boundary checks.
+* **Export Directory Extraction**: Parses `IMAGE_DIRECTORY_ENTRY_EXPORT` (opcode RVAs, name pointer arrays, ordinal arrays, and forwarder strings). Indexes symbols into fast $O(1)$ lookup maps (`by_name` and `by_ordinal`).
+
+### 2. Centralized Caching & Single-Parse Sharing
+When a process loads a DLL or accesses a binary, the background enrichment thread parses the file once on disk and attaches `FileFormatInfo::Pe(Arc<PeInfo>)` to the `FileContext`. All processes referencing that `FileKey` across the entire operating system share the exact same in-memory `Arc<PeInfo>` instance without duplicate disk reads or heap allocations.
+
 ## Context System Expansion Notes
 
 When you want to expand the System Context with new capabilities, keep the following guidelines in mind to preserve performance and thread safety:

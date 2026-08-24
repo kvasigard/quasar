@@ -9,8 +9,8 @@ pub struct CorrelatedSyscallEvent {
     pub tid: u32,
     /// Timestamp when the syscall was triggered.
     pub timestamp: i64,
-    /// System call number / service index if available from PerfInfo.
-    pub syscall_number: Option<u32>,
+    /// 64-bit kernel dispatch function address (SyscallAddress) from PerfInfo.
+    pub syscall_address: Option<u64>,
     /// Correlated call stack instruction pointers (frames) from Stack_Walk telemetry.
     pub frames: Vec<u64>,
 }
@@ -24,6 +24,6 @@ pub struct SyscallEvent {
     pub tid: u32,
     /// Event timestamp in FILETIME ticks.
     pub timestamp: i64,
-    /// System call service index number.
-    pub syscall_number: Option<u32>,
+    /// 64-bit kernel dispatch function address (SyscallAddress) from PerfInfo.
+    pub syscall_address: Option<u64>,
 }

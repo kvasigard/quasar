@@ -41,10 +41,13 @@ pub fn handle_image_load(record: &EventRecord) -> Result<ImageLoadEvent, Handler
     let image_size = u64::from_ne_bytes(data[8..16].try_into().unwrap());
     let pid = u32::from_ne_bytes(data[16..20].try_into().unwrap());
     let checksum = u32::from_ne_bytes(data[20..24].try_into().unwrap());
-    let default_base = u64::from_ne_bytes(data[24..32].try_into().unwrap());
+    let default_base = if data.len() >= 40 {
+        u64::from_ne_bytes(data[32..40].try_into().unwrap())
+    } else {
+        u64::from_ne_bytes(data[24..32].try_into().unwrap())
+    };
 
-    let (image_name, _) = extract_utf16_string(data, 32);
-    let resolved_name = image_name.unwrap_or_default();
+    let resolved_name = extract_image_path(data);
 
     let file_key = if !resolved_name.is_empty() {
         Some(
@@ -56,26 +59,26 @@ pub fn handle_image_load(record: &EventRecord) -> Result<ImageLoadEvent, Handler
         None
     };
 
-    let module = LoadedModule::new(
-        image_base,
-        image_size,
-        resolved_name,
+    let info = CONTEXT.get_or_create_module_info(
         file_key,
-        record.timestamp,
+        &resolved_name,
+        image_size,
         checksum,
         default_base,
-        false,
     );
 
-    let process_key = if let Some(ctx) = CONTEXT.get_process(pid) {
-        ctx.record_module_load(module.clone());
-        ctx.key
-    } else {
-        return Err(HandlerError::ProcessNotFound(pid));
-    };
+    let is_unbacked = file_key.is_none();
+    let module = LoadedModule::with_info(image_base, record.timestamp, is_unbacked, info);
+
+    if module.is_system() {
+        CONTEXT.record_system_module(module.clone());
+    }
+
+    let proc_ctx = CONTEXT.get_or_create_process(pid, record.timestamp);
+    proc_ctx.record_module_load(module.clone());
 
     Ok(ImageLoadEvent {
-        process_key,
+        process_key: proc_ctx.key,
         pid,
         module,
         timestamp: record.timestamp,
@@ -123,4 +126,37 @@ pub fn handle_image_unload(record: &EventRecord) -> Result<ImageUnloadEvent, Han
         base_address: image_base,
         timestamp: record.timestamp,
     })
+}
+
+/// Robustly extracts the UTF-16 image file path from an ETW ImageLoad record.
+///
+/// In 64-bit Windows ETW NT Kernel Logger sessions, the MOF `Image_Load` header is 56 bytes,
+/// and `FileName` starts at offset 56. In 32-bit or legacy sessions, it may start at 44, 48, 64, or 32.
+/// This helper tries standard offsets first and falls back to a structural prefix scan.
+fn extract_image_path(data: &[u8]) -> String {
+    for &offset in &[56, 64, 48, 44, 32, 20] {
+        if offset < data.len()
+            && let (Some(path), _) = extract_utf16_string(data, offset)
+        {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() && (trimmed.contains('\\') || trimmed.contains('.')) {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    // Defensive scan: look for common drive or device UTF-16 prefixes (e.g. '\', 'C', 'c')
+    for offset in (20..data.len().saturating_sub(4)).step_by(2) {
+        if (data[offset] == b'\\' || data[offset].is_ascii_alphabetic())
+            && data[offset + 1] == 0
+            && let (Some(path), _) = extract_utf16_string(data, offset)
+        {
+            let trimmed = path.trim();
+            if trimmed.contains('\\') && trimmed.len() >= 3 {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    String::new()
 }

@@ -60,7 +60,7 @@ struct PendingTrigger {
     pid: u32,
     tid: u32,
     timestamp: i64,
-    syscall_number: Option<u32>,
+    syscall_address: Option<u64>,
 }
 
 /// State machine designed to correlate trigger events with their ETW `Stack_Walk` events.
@@ -86,24 +86,34 @@ impl StackCorrelator {
     }
 
     /// Ingests a syscall enter trigger event.
-    #[tracing::instrument(name = "correlate_syscall_trigger", skip(self), level = "debug")]
+    #[tracing::instrument(name = "correlate_syscall_trigger", skip(self), level = "trace")]
     pub fn process_syscall_trigger(
         &mut self,
         pid: u32,
         tid: u32,
         timestamp: i64,
-        syscall_number: Option<u32>,
+        syscall_address: Option<u64>,
     ) -> Option<CorrelatedSyscallEvent> {
         let ts_key = timestamp as u64;
 
         // Check if stack payload already arrived earlier
         if let Some(stack) = self.pending_stacks.remove(&ts_key) {
             self.maintenance();
+            let resolved_pid = if pid != u32::MAX && pid != 0 {
+                pid
+            } else {
+                stack.stack_process
+            };
+            let resolved_tid = if tid != u32::MAX && tid != 0 {
+                tid
+            } else {
+                stack.stack_thread
+            };
             return Some(CorrelatedSyscallEvent {
-                pid,
-                tid,
+                pid: resolved_pid,
+                tid: resolved_tid,
                 timestamp,
-                syscall_number,
+                syscall_address,
                 frames: stack.frames,
             });
         }
@@ -115,7 +125,7 @@ impl StackCorrelator {
                 pid,
                 tid,
                 timestamp,
-                syscall_number,
+                syscall_address,
             },
         );
 
@@ -124,18 +134,28 @@ impl StackCorrelator {
     }
 
     /// Ingests a `Stack_Walk` payload event.
-    #[tracing::instrument(name = "correlate_stack_walk", skip(self, payload), level = "debug")]
+    #[tracing::instrument(name = "correlate_stack_walk", skip(self, payload), level = "trace")]
     pub fn process_stack_walk(&mut self, payload: StackWalkPayload) -> Option<CorrelatedSyscallEvent> {
         let key = payload.event_timestamp;
 
         // Check if trigger event is already waiting for this stack
         if let Some(trigger) = self.pending_events.remove(&key) {
             self.maintenance();
+            let resolved_pid = if payload.stack_process != 0 && payload.stack_process != u32::MAX {
+                payload.stack_process
+            } else {
+                trigger.pid
+            };
+            let resolved_tid = if payload.stack_thread != 0 && payload.stack_thread != u32::MAX {
+                payload.stack_thread
+            } else {
+                trigger.tid
+            };
             return Some(CorrelatedSyscallEvent {
-                pid: trigger.pid,
-                tid: trigger.tid,
+                pid: resolved_pid,
+                tid: resolved_tid,
                 timestamp: trigger.timestamp,
-                syscall_number: trigger.syscall_number,
+                syscall_address: trigger.syscall_address,
                 frames: payload.frames,
             });
         }
@@ -219,7 +239,7 @@ mod tests {
         let res2 = correlator.process_stack_walk(payload).expect("Must correlate event");
         assert_eq!(res2.pid, 1234);
         assert_eq!(res2.tid, 5678);
-        assert_eq!(res2.syscall_number, Some(0x28));
+        assert_eq!(res2.syscall_address, Some(0x28));
         assert_eq!(res2.frames, vec![0x7FFF_1234_5678]);
     }
 
@@ -245,7 +265,7 @@ mod tests {
             .expect("Must correlate event");
         assert_eq!(res2.pid, 9999);
         assert_eq!(res2.tid, 8888);
-        assert_eq!(res2.syscall_number, Some(0x50));
+        assert_eq!(res2.syscall_address, Some(0x50));
         assert_eq!(res2.frames, vec![0x7FFF_AAAA_BBBB]);
     }
 

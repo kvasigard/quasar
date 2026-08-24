@@ -144,8 +144,6 @@ impl EventDispatcher {
                         if let Some(domain_event) = ingress_parser.process_raw_record(raw_record) {
                             // Stage 2: Concurrent Detection Dispatch to Analytical Sinks
                             let event_ptr = Arc::new(domain_event);
-
-                            let _span = tracing::trace_span!("dispatch_event").entered();
                             for sub in subs.iter() {
                                 if sub.is_interested(&event_ptr) {
                                     sub.on_event(&event_ptr);

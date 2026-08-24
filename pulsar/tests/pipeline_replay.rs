@@ -7,9 +7,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use pulsar::context::system_context;
-use pulsar::helpers::symbol_resolver::SymbolResolver;
 use pulsar::pipeline::dispatcher::{EventDispatcher, Subscriber};
 use pulsar::pipeline::event::Event;
 use pulsar::sensors::etw::EventRecord;
@@ -44,8 +42,7 @@ fn test_end_to_end_synthetic_pipeline_replay() {
         received_count: Arc::clone(&recorded_events),
     }));
 
-    let shared_resolver = Arc::new(Mutex::new(SymbolResolver::new()));
-    dispatcher.add_subscriber(Box::new(DirectSyscallSink::new(shared_resolver)));
+    dispatcher.add_subscriber(Box::new(DirectSyscallSink::new()));
 
     let dispatcher_handle = dispatcher.start();
 
@@ -231,19 +228,19 @@ fn test_end_to_end_synthetic_pipeline_replay() {
     let proc = ctx.process(7777).expect("Process 7777 must be indexed in SystemContext");
     assert_eq!(proc.image_file_name(), "svchost.exe");
     assert_eq!(
-        proc.command_line(),
+        proc.command_line().as_deref(),
         Some("svchost.exe -k netsvcs")
     );
 
     // Verify FileRegistry and ProcessContext touched files
     let touched = proc.touched_files();
     assert_eq!(touched.len(), 1);
-    assert_eq!(touched[0].path, r"c:\windows\system32\drivers\etc\hosts");
+    assert_eq!(touched[0].path(), r"c:\windows\system32\drivers\etc\hosts");
     assert!(touched[0].has_writes());
 
     let modified = proc.modified_files();
     assert_eq!(modified.len(), 1);
-    assert_eq!(modified[0].path, r"c:\windows\system32\drivers\etc\hosts");
+    assert_eq!(modified[0].path(), r"c:\windows\system32\drivers\etc\hosts");
 
     let file_in_registry = ctx.file(r"c:\windows\system32\drivers\etc\hosts");
     assert!(file_in_registry.is_some());

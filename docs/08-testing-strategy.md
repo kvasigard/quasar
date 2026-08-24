@@ -33,7 +33,7 @@ This architectural separation allows us to construct **Synthetic Kernel Telemetr
 
 Located directly in `pulsar/src/helpers/`, these unit tests verify defensive programming around untrusted binary buffers:
 * In `helpers/strings.rs`, tests verify extraction of null-terminated UTF-16 strings, empty slices, odd byte lengths, and truncated ANSI strings.
-* In `helpers/symbol_resolver.rs`, tests verify DbgHelp session initialization, address lookups, and graceful handling of invalid process IDs.
+* In `helpers/pe/tests.rs`, tests verify pure-Rust DOS/NT header parsing, 64-bit and 32-bit optional headers, live system DLL export extraction, and defensive rejection of corrupted buffers.
 * In `helpers/stack_correlator.rs`, tests verify event pairing regardless of whether the system call trigger or the kernel stack walk arrives first, as well as ring-buffer capacity eviction when orphan events accumulate.
 
 ### 2. Context Engine State Machine Tests

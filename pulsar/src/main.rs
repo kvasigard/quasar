@@ -1,12 +1,9 @@
-use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use clap::Parser;
 use crossbeam_channel::Sender;
-use parking_lot::Mutex;
 use pulsar::cli::Cli;
 use pulsar::error::AppError;
-use pulsar::helpers::symbol_resolver::SymbolResolver;
 use pulsar::pipeline::{DispatcherHandle, EventDispatcher};
 use pulsar::sensors::etw::director::SessionDirector;
 use pulsar::sensors::etw::{EtwSession, EventRecord, KernelSession, KernelSessionBuilder};
@@ -123,14 +120,11 @@ fn setup_event_pipeline(
     // Lock-free MPMC queue for high throughput across worker threads
     let (tx, rx) = crossbeam_channel::bounded::<EventRecord>(1_000_000);
 
-    let shared_resolver = Arc::new(Mutex::new(SymbolResolver::new()));
     let mut dispatcher = EventDispatcher::new(rx);
 
     if enable_syscalls {
         log::info!("Feature enabled: Direct Syscall Detection Sink.");
-        dispatcher.add_subscriber(Box::new(DirectSyscallSink::new(Arc::clone(
-            &shared_resolver,
-        ))));
+        dispatcher.add_subscriber(Box::new(DirectSyscallSink::new()));
     } else {
         log::debug!("Feature disabled: Direct Syscall Detection Sink.");
     }
