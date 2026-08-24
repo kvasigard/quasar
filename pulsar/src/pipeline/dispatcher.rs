@@ -131,7 +131,7 @@ impl EventDispatcher {
             let ingress_parser = Arc::clone(&ingress);
 
             let handle = thread::Builder::new()
-                .name(format!("pulsar-dispatcher-{}", worker_id))
+                .name(format!("pulsar-disp-{}", worker_id))
                 .spawn(move || {
                     log::debug!(
                         target: "dispatcher",

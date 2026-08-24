@@ -396,6 +396,49 @@ impl<'a> ProcessRef<'a> {
     pub fn inbound_injections(&self) -> Vec<Arc<InteractionRecord>> {
         self.ctx.interactions.injections_into(self.inner.key)
     }
+
+    /// Resolves the [`FileRef`] query handle for the main executable image of this process.
+    pub fn main_image_file(&self) -> Option<FileRef<'a>> {
+        let name = self.image_name();
+        if name.contains('\\') || name.contains('/') {
+            return self.ctx.file(&name);
+        }
+        self.touched_files()
+            .into_iter()
+            .find(|f| f.file_name().eq_ignore_ascii_case(&name))
+    }
+
+    /// Returns `true` if the main executable image of this process is verified and signed.
+    pub fn is_image_signed(&self) -> bool {
+        self.main_image_file()
+            .map(|f| f.is_signed())
+            .unwrap_or(false)
+    }
+
+    /// Returns `true` if the main executable image of this process is signed by Microsoft.
+    pub fn is_image_microsoft(&self) -> bool {
+        self.main_image_file()
+            .map(|f| f.is_microsoft())
+            .unwrap_or(false)
+    }
+
+    /// Returns all loaded non-system modules whose underlying binary file is confirmed to be unsigned.
+    pub fn unsigned_loaded_modules(&self) -> Vec<LoadedModule> {
+        self.loaded_modules()
+            .into_iter()
+            .filter(|m| {
+                if m.is_system() {
+                    return false;
+                }
+                if let Some(key) = m.file_key()
+                    && let Some(file) = self.ctx.file_by_key(key)
+                {
+                    return file.is_unsigned();
+                }
+                false
+            })
+            .collect()
+    }
 }
 
 /// Lazy iterator traversing process ancestry upwards `[Parent, Grandparent, ...]`.

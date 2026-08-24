@@ -1,12 +1,39 @@
 //! Concurrent normalized filesystem file registry.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use dashmap::DashMap;
+use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
 
 use crate::context::identity::FileKey;
 use crate::context::models::file::FileContext;
 
-/// Normalizes Windows file paths (strips NT prefixes like `\??\`, `\\?\`, and normalizes `\Device\HarddiskVolumeX\`).
+/// Cached map of NT device paths to standard DOS drive letters (e.g. `\device\harddiskvolume3` -> `c:`).
+fn dos_device_map() -> &'static Vec<(String, String)> {
+    static MAP: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut map = Vec::new();
+        let mut buffer = [0u16; 512];
+        for drive_letter in b'A'..=b'Z' {
+            let drive_str = format!("{}:", drive_letter as char);
+            let wide_drive: Vec<u16> = drive_str.encode_utf16().chain(std::iter::once(0)).collect();
+            let len = unsafe {
+                QueryDosDeviceW(wide_drive.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32)
+            };
+            if len > 0 {
+                let nt_device = String::from_utf16_lossy(&buffer[..len as usize])
+                    .trim_matches('\0')
+                    .to_lowercase();
+                map.push((nt_device, drive_str.to_lowercase()));
+            }
+        }
+        map
+    })
+}
+
+/// Normalizes Windows file paths:
+/// 1. Strips NT namespace prefixes (`\??\`, `\\?\`).
+/// 2. Converts NT kernel device paths (`\Device\HarddiskVolumeX\...`) to standard Win32 drive paths (`C:\...`).
+/// 3. Normalizes forward slashes to standard Windows backslashes and lowercases for uniform indexing.
 ///
 /// # Arguments
 ///
@@ -14,14 +41,27 @@ use crate::context::models::file::FileContext;
 ///
 /// # Returns
 ///
-/// A normalized lowercase Windows path string with standard backslashes.
+/// A normalized lowercase Windows path string with standard backslashes accessible via Win32 APIs.
 pub fn normalize_file_path(path: &str) -> String {
-    let cleaned = path
+    let mut cleaned = path
         .strip_prefix(r"\??\")
         .or_else(|| path.strip_prefix(r"\\?\"))
-        .unwrap_or(path);
+        .unwrap_or(path)
+        .replace('/', "\\");
 
-    cleaned.replace('/', "\\").to_lowercase()
+    let lower = cleaned.to_lowercase();
+    if lower.starts_with(r"\device\harddiskvolume") {
+        for (nt_device, drive_letter) in dos_device_map() {
+            if lower.starts_with(nt_device) {
+                cleaned = format!("{}{}", drive_letter, &cleaned[nt_device.len()..]);
+                return cleaned.to_lowercase();
+            }
+        }
+        // Fallback for unmapped volumes: use Win32 global root device prefix
+        cleaned = format!(r"\\?\GLOBALROOT{}", cleaned);
+    }
+
+    cleaned.to_lowercase()
 }
 
 /// Concurrent registry mapping normalized file paths and active kernel FileObjects to `FileContext` entities.
@@ -97,110 +137,76 @@ impl FileRegistry {
     }
 
     /// Resolves the synthetic `FileKey` associated with an active kernel `FileObject`.
-    ///
-    /// # Arguments
-    ///
-    /// * `file_object` - Kernel `FileObject` pointer.
-    ///
-    /// # Returns
-    ///
-    /// `Some(FileKey)` if mapped, otherwise `None`.
-    #[inline]
-    pub fn get_key_by_file_object(&self, file_object: u64) -> Option<FileKey> {
-        self.file_objects.get(&file_object).map(|entry| *entry.value())
+    pub fn resolve_file_object(&self, file_object: u64) -> Option<FileKey> {
+        self.file_objects.get(&file_object).map(|r| *r.value())
     }
 
-    /// Resolves the [`FileContext`] associated with an active kernel `FileObject`.
-    ///
-    /// # Arguments
-    ///
-    /// * `file_object` - Kernel `FileObject` pointer.
-    ///
-    /// # Returns
-    ///
-    /// `Some(Arc<FileContext>)` if mapped and tracked, otherwise `None`.
-    #[inline]
+    /// Resolves the synthetic `FileKey` associated with an active kernel `FileObject` (alias).
+    pub fn get_key_by_file_object(&self, file_object: u64) -> Option<FileKey> {
+        self.resolve_file_object(file_object)
+    }
+
+    /// Resolves the `FileContext` associated with an active kernel `FileObject`.
     pub fn get_by_file_object(&self, file_object: u64) -> Option<Arc<FileContext>> {
         let key = self.get_key_by_file_object(file_object)?;
         self.get_by_key(key)
     }
 
-    /// Unmaps a kernel `FileObject` pointer upon file close or cleanup.
-    ///
-    /// # Arguments
-    ///
-    /// * `file_object` - Kernel `FileObject` pointer to unmap.
-    ///
-    /// # Returns
-    ///
-    /// The previously mapped `Some(FileKey)` if found.
-    pub fn unmap_file_object(&self, file_object: u64) -> Option<FileKey> {
-        self.file_objects.remove(&file_object).map(|(_, k)| k)
-    }
-
-    /// Returns the number of active mapped kernel FileObjects.
-    #[inline]
+    /// Returns the number of currently active mapped kernel FileObjects.
     pub fn active_file_object_count(&self) -> usize {
         self.file_objects.len()
     }
 
-    /// Looks up a file context by its synthetic FileKey.
+    /// Removes a `FileObject` mapping upon cleanup or closure.
+    pub fn unmap_file_object(&self, file_object: u64) -> Option<FileKey> {
+        self.file_objects.remove(&file_object).map(|(_, k)| k)
+    }
+
+    /// Looks up a tracked file entity by its normalized path string.
     ///
     /// # Arguments
     ///
-    /// * `key` - The synthetic [`FileKey`].
+    /// * `path` - The path to search.
     ///
     /// # Returns
     ///
     /// `Some(Arc<FileContext>)` if tracked, otherwise `None`.
-    #[inline]
+    pub fn get_by_path(&self, path: &str) -> Option<Arc<FileContext>> {
+        let normalized = normalize_file_path(path);
+        let key = *self.path_to_key.get(&normalized)?;
+        self.files.get(&key).map(|r| Arc::clone(r.value()))
+    }
+
+    /// Looks up a tracked file entity by its synthetic `FileKey`.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The `FileKey` to look up.
+    ///
+    /// # Returns
+    ///
+    /// `Some(Arc<FileContext>)` if tracked, otherwise `None`.
     pub fn get_by_key(&self, key: FileKey) -> Option<Arc<FileContext>> {
-        self.files.get(&key).map(|entry| Arc::clone(entry.value()))
+        self.files.get(&key).map(|r| Arc::clone(r.value()))
     }
 
-    /// Looks up a file context by path if already tracked.
-    ///
-    /// # Arguments
-    ///
-    /// * `raw_path` - The path to search.
+    /// Returns a list of all currently tracked files.
     ///
     /// # Returns
     ///
-    /// `Some(Arc<FileContext>)` if tracked, otherwise `None`.
-    pub fn get_by_path(&self, raw_path: &str) -> Option<Arc<FileContext>> {
-        let normalized = normalize_file_path(raw_path);
-        let key_ref = self.path_to_key.get(&normalized)?;
-        self.get_by_key(*key_ref.value())
+    /// A vector of shared [`Arc<FileContext>`] references.
+    pub fn all_files(&self) -> Vec<Arc<FileContext>> {
+        self.files.iter().map(|r| Arc::clone(r.value())).collect()
     }
 
-    /// Returns the total count of tracked files.
-    ///
-    /// # Returns
-    ///
-    /// Number of distinct files tracked in memory.
-    #[inline]
+    /// Returns the total number of tracked unique file entities.
     pub fn len(&self) -> usize {
         self.files.len()
     }
 
-    /// Checks if the file registry is empty.
-    ///
-    /// # Returns
-    ///
-    /// `true` if zero files are currently tracked.
-    #[inline]
+    /// Returns `true` if no files are tracked.
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
-    }
-
-    /// Total count alias for backwards compatibility.
-    ///
-    /// # Returns
-    ///
-    /// Number of distinct files tracked in memory.
-    #[inline]
-    pub fn total_count(&self) -> usize {
-        self.len()
     }
 }
 

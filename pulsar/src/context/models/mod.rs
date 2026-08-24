@@ -10,8 +10,8 @@ pub mod thread;
 pub mod token;
 
 pub use file::{
-    FileAccessRecord, FileContext, FileFormatInfo, FileOperationKind, PeExport, PeExportDirectory,
-    PeInfo, PeSection,
+    DigitalSignature, FileAccessRecord, FileContext, FileFormatInfo, FileOperationKind, PeExport,
+    PeExportDirectory, PeInfo, PeSection, SignatureStatus, SignatureType,
 };
 pub use handle::{HandleObject, HandleTarget};
 pub use interaction::{

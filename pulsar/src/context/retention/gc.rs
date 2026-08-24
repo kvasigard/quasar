@@ -174,7 +174,7 @@ impl RetentionManager {
         let interval = Duration::from_millis(self.config.gc_interval_ms);
 
         thread::Builder::new()
-            .name("pulsar-context-gc".to_string())
+            .name("pulsar-ctx-gc".into())
             .spawn(move || {
                 log::info!(target: "system_gc", "Background Context GC worker thread started");
 

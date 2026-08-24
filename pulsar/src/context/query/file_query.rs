@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use crate::context::SystemContext;
 use crate::context::identity::FileKey;
-use crate::context::models::file::{FileAccessRecord, FileContext, FileFormatInfo, PeExport, PeInfo};
+use crate::context::models::file::{
+    DigitalSignature, FileAccessRecord, FileContext, FileFormatInfo, PeExport, PeInfo,
+    SignatureStatus,
+};
 use crate::context::query::process_query::ProcessRef;
 
 /// Ergonomic, fluent query wrapper around an `Arc<FileContext>` snapshot.
@@ -104,10 +107,52 @@ impl<'a> FileRef<'a> {
         })
     }
 
+    /// Returns a copy of the cached digital signature verification record.
+    #[inline]
+    pub fn signature(&self) -> DigitalSignature {
+        self.inner.signature()
+    }
+
+    /// Returns the current digital signature verification verdict.
+    #[inline]
+    pub fn signature_status(&self) -> SignatureStatus {
+        self.inner.signature_status()
+    }
+
+    /// Returns `true` if this file has a valid, untrusted, or expired signature.
+    #[inline]
+    pub fn is_signed(&self) -> bool {
+        self.inner.is_signed()
+    }
+
+    /// Returns `true` if this file is signed and chains to a trusted root CA.
+    #[inline]
+    pub fn is_trusted(&self) -> bool {
+        self.inner.is_trusted()
+    }
+
+    /// Returns `true` if this file is verified and signed by Microsoft.
+    #[inline]
+    pub fn is_microsoft(&self) -> bool {
+        self.inner.is_microsoft()
+    }
+
+    /// Returns `true` if this file is confirmed to be unsigned.
+    #[inline]
+    pub fn is_unsigned(&self) -> bool {
+        self.inner.is_unsigned()
+    }
+
     /// Returns the digital signature signer name if verified.
     #[inline]
     pub fn signer_name(&self) -> Option<String> {
-        self.inner.signer_name.read().clone()
+        self.inner.signer_name()
+    }
+
+    /// Returns the certificate issuer name if verified.
+    #[inline]
+    pub fn issuer_name(&self) -> Option<String> {
+        self.inner.signature().issuer_name
     }
 
     /// Returns timestamp when this file was first discovered.

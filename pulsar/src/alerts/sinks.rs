@@ -1,6 +1,6 @@
-﻿//! Alert sink interfaces, console formatters, and telemetry forwarders.
+//! Alert sink interfaces, console formatters, and telemetry forwarders.
 
-use crate::alerts::model::AlertRecord;
+use crate::alerts::model::{AlertRecord, AlertSeverity};
 
 /// Interface for dispatching generated alerts to notification channels, logging, or telemetry forwarders.
 pub trait AlertSink: Send + Sync {
@@ -25,17 +25,30 @@ impl ConsoleAlertSink {
 
 impl AlertSink for ConsoleAlertSink {
     fn on_alert(&self, alert: &AlertRecord) {
-        log::warn!(
-            target: "alerts",
-            "[{}] [{}] {} (ID: {}, Proc: {}, MITRE: {:?}): {}",
-            alert.severity,
-            alert.category,
-            alert.title,
-            alert.id,
-            alert.triggering_process,
-            alert.mitre_technique.as_deref().unwrap_or("N/A"),
-            alert.description
-        );
+        let mitre = alert.mitre_technique.as_deref().unwrap_or("N/A");
+        if alert.severity == AlertSeverity::Informational {
+            log::info!(
+                target: "alerts",
+                "[ALERT] [{}] [{}] {} | Proc: {} | MITRE: {} | {}",
+                alert.severity,
+                alert.category,
+                alert.title,
+                alert.triggering_process,
+                mitre,
+                alert.description
+            );
+        } else {
+            log::warn!(
+                target: "alerts",
+                "[ALERT] [{}] [{}] {} | Proc: {} | MITRE: {} | {}",
+                alert.severity,
+                alert.category,
+                alert.title,
+                alert.triggering_process,
+                mitre,
+                alert.description
+            );
+        }
     }
 }
 

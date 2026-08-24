@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use crate::context::identity::FileKey;
 
 pub mod pe;
+pub mod signature;
+
 pub use pe::{PeExport, PeExportDirectory, PeInfo, PeSection, file_flags, machine, magic, section_flags};
+pub use signature::{DigitalSignature, SignatureStatus, SignatureType};
 
 /// Maximum number of file access records retained per file context.
 const MAX_ACCESS_HISTORY_ENTRIES: usize = 32;
@@ -62,8 +65,8 @@ pub struct FileContext {
     pub format_info: parking_lot::RwLock<FileFormatInfo>,
     /// Optional SHA-256 hash of the file contents (if calculated).
     pub sha256: parking_lot::RwLock<Option<[u8; 32]>>,
-    /// Digital signature verification status / signer name.
-    pub signer_name: parking_lot::RwLock<Option<String>>,
+    /// Digital signature verification verdict and certificate details.
+    pub signature: parking_lot::RwLock<DigitalSignature>,
     /// Timestamp when this file was first observed by the EDR.
     pub first_seen: i64,
     /// Timestamp of the most recent interaction.
@@ -92,7 +95,7 @@ impl FileContext {
             path,
             format_info: parking_lot::RwLock::new(FileFormatInfo::Unknown),
             sha256: parking_lot::RwLock::new(None),
-            signer_name: parking_lot::RwLock::new(None),
+            signature: parking_lot::RwLock::new(DigitalSignature::unchecked()),
             first_seen: timestamp,
             last_accessed: AtomicI64::new(timestamp),
             is_modified: AtomicBool::new(false),
@@ -118,16 +121,58 @@ impl FileContext {
         *self.sha256.read()
     }
 
-    /// Sets the digital signature signer name for this file entity.
+    /// Sets the digital signature record for this file entity.
+    #[inline]
+    pub fn set_signature(&self, signature: DigitalSignature) {
+        *self.signature.write() = signature;
+    }
+
+    /// Returns a copy of the cached digital signature record.
+    #[inline]
+    pub fn signature(&self) -> DigitalSignature {
+        self.signature.read().clone()
+    }
+
+    /// Returns the current digital signature verification status.
+    #[inline]
+    pub fn signature_status(&self) -> SignatureStatus {
+        self.signature.read().status
+    }
+
+    /// Returns `true` if this file is signed (valid, untrusted root, or expired).
+    #[inline]
+    pub fn is_signed(&self) -> bool {
+        self.signature.read().is_signed()
+    }
+
+    /// Returns `true` if this file has a cryptographically valid signature chaining to a trusted Root CA.
+    #[inline]
+    pub fn is_trusted(&self) -> bool {
+        self.signature.read().is_trusted()
+    }
+
+    /// Returns `true` if this file is signed by Microsoft and trusted.
+    #[inline]
+    pub fn is_microsoft(&self) -> bool {
+        self.signature.read().is_microsoft()
+    }
+
+    /// Returns `true` if this binary is confirmed to be unsigned.
+    #[inline]
+    pub fn is_unsigned(&self) -> bool {
+        self.signature.read().is_unsigned()
+    }
+
+    /// Sets the digital signature signer name for this file entity (convenience helper).
     #[inline]
     pub fn set_signer_name(&self, name: impl Into<String>) {
-        *self.signer_name.write() = Some(name.into());
+        self.signature.write().signer_name = Some(name.into());
     }
 
     /// Returns the digital signature signer name if available.
     #[inline]
     pub fn signer_name(&self) -> Option<String> {
-        self.signer_name.read().clone()
+        self.signature.read().signer_name.clone()
     }
 
     /// Returns the parsed PE metadata if this file is a Portable Executable.

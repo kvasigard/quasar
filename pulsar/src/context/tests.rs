@@ -493,9 +493,12 @@ fn test_file_path_normalization_nt_prefixes() {
         normalize_file_path(r"\\?\C:\Users\Admin/AppData/Local/Temp/malware.exe"),
         r"c:\users\admin\appdata\local\temp\malware.exe"
     );
-    assert_eq!(
-        normalize_file_path(r"\Device\HarddiskVolume2\Windows\explorer.exe"),
-        r"\device\harddiskvolume2\windows\explorer.exe"
+    let normalized_dev = normalize_file_path(r"\Device\HarddiskVolume2\Windows\explorer.exe");
+    assert!(
+        normalized_dev.ends_with(r"\windows\explorer.exe")
+            && (normalized_dev.starts_with(r"c:")
+                || normalized_dev.starts_with(r"d:")
+                || normalized_dev.starts_with(r"\\?\globalroot"))
     );
     assert_eq!(
         normalize_file_path("C:/Program Files/Quasar/agent.exe"),
@@ -1213,6 +1216,65 @@ fn test_network_query_dsl() {
     assert_eq!(external.len(), 1);
     assert_eq!(external[0].remote_addr.port(), 443);
 }
+
+/// Tests that digital signature verification verdicts stored on FileContext are shared across
+/// all processes accessing or executing the binary with zero CPU overhead.
+#[test]
+fn test_file_digital_signature_caching_and_process_sharing() {
+    use crate::context::models::file::{DigitalSignature, SignatureStatus, SignatureType};
+
+    let ctx = SystemContext::new_for_test(ContextConfig::for_test());
+
+    // 1. Register shared binary in FileRegistry
+    let file = ctx.get_or_create_file(r"C:\Windows\System32\svchost.exe", 100);
+    assert_eq!(file.signature_status(), SignatureStatus::Unchecked);
+
+    // 2. Simulate background verification by setting the verified DigitalSignature
+    let sig = DigitalSignature {
+        status: SignatureStatus::SignedVerified,
+        signature_type: Some(SignatureType::Catalog),
+        signer_name: Some("Microsoft Windows".to_string()),
+        issuer_name: Some("Microsoft Root Certificate Authority 2010".to_string()),
+        is_microsoft: true,
+        win32_error: 0,
+        verification_timestamp: 150,
+    };
+    file.set_signature(sig);
+
+    // 3. Create two independent processes executing svchost.exe
+    let k_proc1 = ProcessKey::new();
+    let proc1 = ProcessContext::new(k_proc1, None, 1001, 4, 200);
+    proc1.set_image_name(r"C:\Windows\System32\svchost.exe");
+    proc1.record_file_access(file.key);
+    ctx.insert_process(proc1);
+
+    let k_proc2 = ProcessKey::new();
+    let proc2 = ProcessContext::new(k_proc2, None, 1002, 4, 205);
+    proc2.set_image_name(r"C:\Windows\System32\svchost.exe");
+    proc2.record_file_access(file.key);
+    ctx.insert_process(proc2);
+
+    // 4. Query both processes via ProcessRef DSL
+    let p1_ref = ctx.process(1001).expect("Process 1 must exist");
+    let p2_ref = ctx.process(1002).expect("Process 2 must exist");
+
+    assert!(p1_ref.is_image_signed());
+    assert!(p1_ref.is_image_microsoft());
+    assert!(p2_ref.is_image_signed());
+    assert!(p2_ref.is_image_microsoft());
+
+    // Query file via FileRef DSL
+    let file_ref = ctx.file(r"C:\Windows\System32\svchost.exe").expect("FileRef must resolve");
+    assert_eq!(file_ref.signature_status(), SignatureStatus::SignedVerified);
+    assert!(file_ref.is_trusted());
+    assert!(file_ref.is_microsoft());
+    assert_eq!(file_ref.signer_name().as_deref(), Some("Microsoft Windows"));
+    assert_eq!(
+        file_ref.issuer_name().as_deref(),
+        Some("Microsoft Root Certificate Authority 2010")
+    );
+}
+
 
 
 

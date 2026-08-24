@@ -86,7 +86,7 @@ impl EnrichmentQueue {
         receiver: Receiver<EnrichmentTask>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::Builder::new()
-            .name("pulsar-context-enrichment".into())
+            .name("pulsar-enrich".into())
             .spawn(move || {
                 log::info!(
                     target: "context_enrichment",
@@ -103,7 +103,7 @@ impl EnrichmentQueue {
                             );
 
                             use crate::context::CONTEXT;
-                            use crate::context::models::file::FileFormatInfo;
+                            use crate::context::models::file::{DigitalSignature, FileFormatInfo};
                             use crate::helpers::pe::{PeError, PeParser};
 
                             if let Some(file_ctx) = CONTEXT.files.get_by_key(file_key) {
@@ -136,6 +136,18 @@ impl EnrichmentQueue {
                                             );
                                         }
                                     }
+
+                                    // Perform Digital Signature Verification off the hot path
+                                    let signature = DigitalSignature::verify_file(&path);
+                                    log::debug!(
+                                        target: "context_enrichment",
+                                        "Verified signature for {}: status={:?}, is_ms={}, signer={:?}",
+                                        path,
+                                        signature.status,
+                                        signature.is_microsoft,
+                                        signature.signer_name
+                                    );
+                                    file_ctx.set_signature(signature);
                                 }
                             }
                         }

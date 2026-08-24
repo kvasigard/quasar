@@ -80,7 +80,7 @@ impl IngressParser {
     /// An initialized [`IngressParser`].
     pub fn new() -> Self {
         Self {
-            stack_correlator: Mutex::new(StackCorrelator::new(10_000)),
+            stack_correlator: Mutex::new(StackCorrelator::default()),
         }
     }
 
