@@ -107,9 +107,10 @@ Without real-time filesystem telemetry, `FileRegistry` would only track binaries
  └──────────────────────┘
 ```
 
-### 1. NT Device Path Normalization
-File I/O events from the kernel arrive with diverse path formats including NT object manager prefixes (`\??\C:\...`, `\\?\C:\...`) and NT device volume paths (`\Device\HarddiskVolumeX\...`).
+### 1. NT Device Path Normalization & QueryDosDeviceW Mapping
+File I/O and image load events from the kernel arrive with diverse path formats including NT object manager prefixes (`\??\C:\...`, `\\?\C:\...`) and NT device volume paths (`\Device\HarddiskVolumeX\...`).
 * `normalize_file_path()` strips leading `\??\` and `\\?\` prefixes.
+* Uses cached `QueryDosDeviceW` mappings to translate kernel volume paths (e.g. `\Device\HarddiskVolume3\Program Files\...`) directly to canonical Win32 drive letters (`C:\Program Files\...`), ensuring disk lookups, PE parsing, and signature verification succeed.
 * Converts forward slashes to standard Windows backslashes (`\`).
 * Lowercases the path string so case differences in Windows APIs resolve to identical canonical `FileKey` identifiers in `FileRegistry`.
 
@@ -127,6 +128,15 @@ Each `FileContext` maintains:
 
 ### 4. Process Context touched_files Linkage
 Whenever a process creates, opens, or writes to a file, the resulting `FileKey` is recorded into the originating process's `ProcessContext::touched_files` set. Detection sinks can query `proc.touched_files()`, `proc.recent_file_writes()`, and `proc.modified_files()` through the `ProcessRef` fluent query DSL.
+
+## Authenticode Digital Signature Verification & Single-Source Caching
+
+Determining whether an executable or DLL is digitally signed by Microsoft or a trusted commercial vendor is essential for identifying unsigned malware and living-off-the-land attacks (LOLBAS). Windows `WinVerifyTrust` performs synchronous certificate chain validation and catalog database lookups, taking 5ms to 50ms per invocation.
+
+To eliminate latency and redundant calls across identical binaries:
+* **Embedded & Catalog Verification**: The `DigitalSignature::verify_file` engine first checks embedded Authenticode signatures via `WINTRUST_ACTION_GENERIC_VERIFY_V2`. If no embedded signature is found, it queries the Windows Security Catalog database (`CryptCATAdminCalcHashFromFileHandle2` and `CryptCATAdminEnumCatalogFromHash`) to verify OS system binaries signed via `.cat` files.
+* **Single-Source Flyweight Caching**: The verification result is stored directly on `FileContext.signature` inside `FileRegistry`. Every unique binary on disk is verified only once across the entire agent lifecycle, and all processes referencing that `FileKey` read the verified signature status instantly in memory.
+* **Query DSL Integration**: `FileRef` exposes `.is_signed()`, `.is_microsoft()`, `.is_trusted()`, and `.signer_name()`. `ProcessRef` exposes `.is_image_signed()`, `.is_image_microsoft()`, and `.unsigned_loaded_modules()`.
 
 ## Extensible File Format Architecture & Pure-Rust PE Header Extraction
 

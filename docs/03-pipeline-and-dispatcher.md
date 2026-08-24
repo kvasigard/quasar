@@ -27,7 +27,12 @@ Telemetry from the kernel arrives as raw byte slices. To guarantee that a malfor
 
 Stage 1 also handles multi-source event deduplication. In a live system, telemetry about a process starting can arrive from multiple sources at roughly the same time, such as an initial ETW process rundown and a kernel driver callback. Instead of creating redundant process nodes in memory, the Ingress Parser checks if an active entry already exists for that process ID. If it does, it merges any enriched metadata (like command line arguments or package details) directly into the existing context in-place.
 
-Another critical responsibility of Stage 1 is call stack correlation. When Windows traces system calls through ETW, it splits the information across two separate events: first, a `SyscallEnter` event fired directly on the CPU core when a thread issues a system call, and second, an asynchronous `Stack_Walk` event delivered a short time later by the kernel stack unwinder containing the array of return addresses. The `StackCorrelator` pairs these asynchronous events in a small, time-ordered ring buffer. By performing this correlation in Stage 1, all downstream detection sinks receive a unified event containing both the syscall details and its complete call stack without having to duplicate buffering logic in every sink.
+Another critical responsibility of Stage 1 is call stack correlation. When Windows traces system calls through ETW, it splits the information across two separate events: first, a `SyscallEnter` event fired directly on the CPU core when a thread issues a system call, and second, an asynchronous `Stack_Walk` event delivered a short time later by the kernel stack unwinder containing the array of return addresses. The `StackCorrelator` pairs these asynchronous events in memory:
+* **Sliding-Window TTL Eviction**: Instead of destructive `.clear()` sweeps that drop legitimate in-flight call stacks under heavy load, `StackCorrelator` uses sliding-window TTL pruning (evicting only orphan events older than 2.0 seconds relative to the latest timestamp).
+* **Zero-Cost Periodic Maintenance**: Maintenance checks run non-blockingly every 1,024 events using fast bitwise checks (`(op_count & 0x3FF) == 0`).
+* **High-Throughput Buffer**: Holds up to 50,000 pending items, ensuring reliable pairing even during multi-threaded bursts across dozens of active CPU cores.
+
+By performing this correlation in Stage 1, all downstream detection sinks receive a unified event containing both the syscall details and its complete call stack without having to duplicate buffering logic in every sink.
 
 ## Asynchronous Metadata Enrichment Offloading
 
@@ -42,6 +47,15 @@ Once Stage 1 produces a strongly-typed domain event and updates the context, the
 To distribute work efficiently across multiple threads without locking, Quasar uses `crossbeam-channel`. Standard library channels (`std::sync::mpsc`) only support a single receiver, which means you cannot have multiple worker threads pulling directly from the same channel without an extra multiplexer thread. Shared mutex queues (`Arc<Mutex<VecDeque<T>>>`) allow multiple workers, but every time a thread wants to pop an event, it blocks all other workers, creating severe lock contention during high-volume bursts.
 
 Crossbeam channels solve this with a lock-free Multi-Producer Multi-Consumer (MPMC) design. Multiple dispatcher worker threads concurrently pop events from the same bounded queue using atomic operations. When there are no events in the queue, the worker threads are suspended in the operating system kernel at zero percent CPU usage, waking up within microseconds the moment a new packet is pushed. When the kernel sensor stops and closes the channel, all worker threads naturally drain any remaining events in the buffer and shut down cleanly.
+
+## Centralized Alert Management & Emission Policies
+
+When analytical sinks detect malicious behavior or telemetry anomalies, alerts are routed through the centralized `AlertManager` singleton rather than being printed ad-hoc to stdout.
+
+To prevent alert fatigue during tight execution loops (e.g. video game main loops calling direct syscalls at 60 FPS, or web browser JavaScript engines continuously executing JIT code), `AlertRecord` supports explicit `AlertEmissionPolicy` configurations:
+* **`EveryEvent`**: Dispatches every individual occurrence (standard for multi-stage injection sequences).
+* **`OncePerProcess`**: Emits the detection **exactly once** per process lifecycle. Subsequent duplicate events for the same process key and alert title are automatically suppressed by `AlertManager`'s concurrent deduplication ledger.
+* **`Throttled { cooldown_ms }`**: Rate-limits emissions to at most once per process within a specified time window.
 
 ## Why We Bound the Dispatcher Thread Pool
 

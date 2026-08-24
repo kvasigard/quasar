@@ -1,4 +1,4 @@
-﻿//! Decoupled Alert and Detection Management Subsystem.
+//! Decoupled Alert and Detection Management Subsystem.
 //!
 //! Exposes the centralized [`AlertManager`] singleton, structured [`AlertRecord`] definitions,
 //! and [`AlertSink`] subscribers for routing detections out of analytical sinks.
@@ -13,7 +13,7 @@ mod tests;
 use std::sync::LazyLock;
 
 pub use manager::AlertManager;
-pub use model::{AlertId, AlertRecord, AlertSeverity};
+pub use model::{AlertEmissionPolicy, AlertId, AlertRecord, AlertSeverity};
 pub use sinks::{AlertSink, ConsoleAlertSink, TelemetryForwarderSink};
 
 /// Global `AlertManager` singleton instance.

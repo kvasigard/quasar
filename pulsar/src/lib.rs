@@ -12,6 +12,6 @@ pub mod profiling;
 pub mod sensors;
 pub mod sinks;
 
-pub use alerts::{alert_manager, AlertManager, AlertRecord, AlertSeverity};
+pub use alerts::{alert_manager, AlertEmissionPolicy, AlertManager, AlertRecord, AlertSeverity};
 pub use error::{AppError, BootstrapError, DriverError, EtwError, HandlerError, Win32Error};
 pub use profiling::{init_profiling, ProfilingGuard};

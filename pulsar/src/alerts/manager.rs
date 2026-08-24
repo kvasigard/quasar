@@ -1,20 +1,24 @@
-﻿//! Centralized Alert Manager and bounded event distribution coordinator.
+//! Centralized Alert Manager and bounded event distribution coordinator.
 
 use std::collections::VecDeque;
+use dashmap::DashMap;
 use parking_lot::RwLock;
 
-use crate::alerts::model::AlertRecord;
+use crate::alerts::model::{AlertEmissionPolicy, AlertRecord};
 use crate::alerts::sinks::{AlertSink, ConsoleAlertSink};
+use crate::context::identity::ProcessKey;
 
 /// Centralized manager for buffering, indexing, and dispatching analytical alerts.
 ///
 /// Implements a bounded FIFO ring buffer to prevent unbounded memory growth during alert storms,
-/// and fans out alerts to registered [`AlertSink`] subscribers.
+/// deduplicates alerts based on per-process emission policies, and fans out alerts to registered [`AlertSink`] subscribers.
 pub struct AlertManager {
     /// Bounded ring buffer of recent alerts.
     alerts: RwLock<VecDeque<AlertRecord>>,
     /// Registered analytical output sinks.
     sinks: RwLock<Vec<Box<dyn AlertSink + Send + Sync>>>,
+    /// Tracks per-process alert history for deduplication and throttling: `(ProcessKey, AlertTitle)` -> `last_emitted_timestamp_ms`.
+    dedup_ledger: DashMap<(ProcessKey, String), i64>,
     /// Maximum number of alerts retained in the in-memory ring buffer.
     max_capacity: usize,
 }
@@ -40,17 +44,57 @@ impl AlertManager {
         Self {
             alerts: RwLock::new(VecDeque::with_capacity(max_capacity.min(1_000))),
             sinks: RwLock::new(vec![default_sink]),
+            dedup_ledger: DashMap::new(),
             max_capacity: max_capacity.max(100),
         }
     }
 
-    /// Emits a new detection alert, storing it in the bounded buffer and notifying all sinks.
+    /// Emits a new detection alert subject to its [`AlertEmissionPolicy`].
     ///
     /// # Arguments
     ///
     /// * `alert` - The generated alert record.
-    pub fn emit(&self, alert: AlertRecord) {
-        // 1. Dispatch to all registered alert sinks
+    ///
+    /// # Returns
+    ///
+    /// `true` if the alert was emitted and dispatched to sinks, or `false` if suppressed by policy.
+    pub fn emit(&self, alert: AlertRecord) -> bool {
+        let now_ms = if alert.timestamp > 0 {
+            // Convert FILETIME (100ns units) to ms, or raw ms
+            if alert.timestamp > 10_000_000_000_000 {
+                alert.timestamp / 10_000
+            } else {
+                alert.timestamp
+            }
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        };
+
+        // 1. Evaluate per-process emission policy
+        let dedup_key = (alert.triggering_process, alert.title.clone());
+        match alert.emission_policy {
+            AlertEmissionPolicy::EveryEvent => {}
+            AlertEmissionPolicy::OncePerProcess => {
+                if self.dedup_ledger.contains_key(&dedup_key) {
+                    return false;
+                }
+                self.dedup_ledger.insert(dedup_key, now_ms);
+            }
+            AlertEmissionPolicy::Throttled { cooldown_ms } => {
+                if let Some(last_time) = self.dedup_ledger.get(&dedup_key) {
+                    let elapsed = (now_ms - *last_time).unsigned_abs();
+                    if elapsed < cooldown_ms {
+                        return false;
+                    }
+                }
+                self.dedup_ledger.insert(dedup_key, now_ms);
+            }
+        }
+
+        // 2. Dispatch to all registered alert sinks
         {
             let sinks = self.sinks.read();
             for sink in sinks.iter() {
@@ -58,7 +102,7 @@ impl AlertManager {
             }
         }
 
-        // 2. Commit to bounded in-memory ring buffer
+        // 3. Commit to bounded in-memory ring buffer
         {
             let mut alerts = self.alerts.write();
             if alerts.len() >= self.max_capacity {
@@ -66,6 +110,8 @@ impl AlertManager {
             }
             alerts.push_back(alert);
         }
+
+        true
     }
 
     /// Registers an additional alert sink subscriber.
@@ -103,8 +149,9 @@ impl AlertManager {
         self.alerts.read().is_empty()
     }
 
-    /// Clears all retained alerts from the ring buffer (primarily useful in tests).
+    /// Clears all retained alerts from the ring buffer and dedup ledger (primarily useful in tests).
     pub fn clear(&self) {
         self.alerts.write().clear();
+        self.dedup_ledger.clear();
     }
 }

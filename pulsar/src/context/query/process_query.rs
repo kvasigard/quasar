@@ -400,12 +400,27 @@ impl<'a> ProcessRef<'a> {
     /// Resolves the [`FileRef`] query handle for the main executable image of this process.
     pub fn main_image_file(&self) -> Option<FileRef<'a>> {
         let name = self.image_name();
-        if name.contains('\\') || name.contains('/') {
-            return self.ctx.file(&name);
+        if (name.contains('\\') || name.contains('/'))
+            && let Some(f) = self.ctx.file(&name)
+        {
+            return Some(f);
         }
+
+        // Check loaded modules for matching image binary
+        let lower_base = self.image_file_name().to_ascii_lowercase();
+        for m in self.loaded_modules() {
+            let m_name = m.image_name().to_ascii_lowercase();
+            if (m_name.ends_with(&lower_base) || m_name.contains(&lower_base))
+                && let Some(key) = m.file_key()
+                && let Some(f) = self.ctx.file_by_key(key)
+            {
+                return Some(f);
+            }
+        }
+
         self.touched_files()
             .into_iter()
-            .find(|f| f.file_name().eq_ignore_ascii_case(&name))
+            .find(|f| f.file_name().eq_ignore_ascii_case(&lower_base))
     }
 
     /// Returns `true` if the main executable image of this process is verified and signed.

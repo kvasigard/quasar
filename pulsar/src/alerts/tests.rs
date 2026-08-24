@@ -93,3 +93,98 @@ fn test_alert_sink_dispatch() {
 
     assert_eq!(call_count.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn test_alert_manager_once_per_process_deduplication() {
+    let manager = AlertManager::new(10);
+    let proc_key = ProcessKey::new();
+
+    let alert1 = AlertRecord::new(
+        AlertSeverity::High,
+        "Defense Evasion",
+        "Direct Syscall Execution",
+        "First occurrence",
+        proc_key,
+        ConfidenceLevel::Confirmed,
+        1000,
+    )
+    .once_per_process();
+
+    let alert2 = AlertRecord::new(
+        AlertSeverity::High,
+        "Defense Evasion",
+        "Direct Syscall Execution",
+        "Second occurrence (should be suppressed)",
+        proc_key,
+        ConfidenceLevel::Confirmed,
+        1005,
+    )
+    .once_per_process();
+
+    assert!(manager.emit(alert1));
+    assert!(!manager.emit(alert2)); // Suppressed by OncePerProcess policy
+
+    // Only 1 alert should be recorded in manager
+    assert_eq!(manager.len(), 1);
+
+    // Another process with the same alert title must succeed
+    let other_proc = ProcessKey::new();
+    let alert3 = AlertRecord::new(
+        AlertSeverity::High,
+        "Defense Evasion",
+        "Direct Syscall Execution",
+        "Occurrence in another process",
+        other_proc,
+        ConfidenceLevel::Confirmed,
+        1010,
+    )
+    .once_per_process();
+
+    assert!(manager.emit(alert3));
+    assert_eq!(manager.len(), 2);
+}
+
+#[test]
+fn test_alert_manager_throttled_cooldown_policy() {
+    let manager = AlertManager::new(10);
+    let proc_key = ProcessKey::new();
+
+    let alert1 = AlertRecord::new(
+        AlertSeverity::Informational,
+        "Research",
+        "JIT Telemetry",
+        "JIT call 1",
+        proc_key,
+        ConfidenceLevel::Low,
+        1_000, // 1000ms
+    )
+    .with_cooldown(5_000); // 5s cooldown
+
+    let alert2 = AlertRecord::new(
+        AlertSeverity::Informational,
+        "Research",
+        "JIT Telemetry",
+        "JIT call 2 (within cooldown)",
+        proc_key,
+        ConfidenceLevel::Low,
+        3_000, // 3000ms (diff 2000 < 5000)
+    )
+    .with_cooldown(5_000);
+
+    let alert3 = AlertRecord::new(
+        AlertSeverity::Informational,
+        "Research",
+        "JIT Telemetry",
+        "JIT call 3 (after cooldown)",
+        proc_key,
+        ConfidenceLevel::Low,
+        7_000, // 7000ms (diff 6000 >= 5000)
+    )
+    .with_cooldown(5_000);
+
+    assert!(manager.emit(alert1));
+    assert!(!manager.emit(alert2)); // Suppressed
+    assert!(manager.emit(alert3));  // Emitted after cooldown expired
+
+    assert_eq!(manager.len(), 2);
+}

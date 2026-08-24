@@ -1,4 +1,4 @@
-﻿//! Analytical alert domain models, severity taxonomy, and evidence structures.
+//! Analytical alert domain models, severity taxonomy, emission policies, and evidence structures.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -83,6 +83,18 @@ impl std::fmt::Display for AlertSeverity {
     }
 }
 
+/// Emission frequency and deduplication policy for analytical detection alerts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AlertEmissionPolicy {
+    /// Emit every occurrence of the alert (default for critical attacks/injections).
+    #[default]
+    EveryEvent,
+    /// Emit only once per unique process lifecycle (e.g. initial direct syscall evasion, JIT discovery).
+    OncePerProcess,
+    /// Emit at most once per process within a specified cooldown window in milliseconds.
+    Throttled { cooldown_ms: u64 },
+}
+
 /// Structured record representing an analytical detection alert.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlertRecord {
@@ -106,6 +118,8 @@ pub struct AlertRecord {
     pub target_process: Option<ProcessKey>,
     /// Confidence assessment of the detection heuristic.
     pub confidence: ConfidenceLevel,
+    /// Emission deduplication and throttling policy.
+    pub emission_policy: AlertEmissionPolicy,
     /// Contextual key-value evidence artifacts (e.g. RVA, module name, call stack).
     pub evidence: HashMap<String, String>,
 }
@@ -146,6 +160,7 @@ impl AlertRecord {
             triggering_process,
             target_process: None,
             confidence,
+            emission_policy: AlertEmissionPolicy::EveryEvent,
             evidence: HashMap::new(),
         }
     }
@@ -159,12 +174,33 @@ impl AlertRecord {
 
     /// Attaches a target process reference.
     #[inline]
-    pub fn with_target(mut self, target: ProcessKey) -> Self {
-        self.target_process = Some(target);
+    pub fn with_target_process(mut self, target_key: ProcessKey) -> Self {
+        self.target_process = Some(target_key);
         self
     }
 
-    /// Appends a key-value evidence entry.
+    /// Configures this alert to fire only once per unique process lifecycle.
+    #[inline]
+    pub fn once_per_process(mut self) -> Self {
+        self.emission_policy = AlertEmissionPolicy::OncePerProcess;
+        self
+    }
+
+    /// Configures this alert to fire with a per-process throttling cooldown window.
+    #[inline]
+    pub fn with_cooldown(mut self, cooldown_ms: u64) -> Self {
+        self.emission_policy = AlertEmissionPolicy::Throttled { cooldown_ms };
+        self
+    }
+
+    /// Explicitly sets the alert emission policy.
+    #[inline]
+    pub fn with_policy(mut self, policy: AlertEmissionPolicy) -> Self {
+        self.emission_policy = policy;
+        self
+    }
+
+    /// Appends a key-value diagnostic evidence entry.
     #[inline]
     pub fn with_evidence(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.evidence.insert(key.into(), value.into());

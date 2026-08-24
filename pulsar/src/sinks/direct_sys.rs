@@ -139,6 +139,7 @@ impl DirectSyscallSink {
                                 ConfidenceLevel::High,
                                 event.timestamp,
                             )
+                            .once_per_process()
                             .with_mitre("T1055.012")
                             .with_evidence("module", top_module.image_name())
                             .with_evidence("rva", format!("{:#x}", rva))
@@ -165,6 +166,7 @@ impl DirectSyscallSink {
                             ConfidenceLevel::Low,
                             event.timestamp,
                         )
+                        .once_per_process()
                         .with_mitre("T1106")
                         .with_evidence("module", top_module.image_name())
                         .with_evidence("signer", top_file.and_then(|f| f.signer_name()).unwrap_or_else(|| "Unknown".into()))
@@ -188,6 +190,7 @@ impl DirectSyscallSink {
                             ConfidenceLevel::High,
                             event.timestamp,
                         )
+                        .once_per_process()
                         .with_mitre("T1106")
                         .with_evidence("module", top_module.image_name())
                         .with_evidence("address", format!("{:#x}", top_user_ptr)),
@@ -203,12 +206,18 @@ impl DirectSyscallSink {
             let is_known_jit_host = proc_name.contains("edge")
                 || proc_name.contains("chrome")
                 || proc_name.contains("brave")
+                || proc_name.contains("opera")
+                || proc_name.contains("vivaldi")
+                || proc_name.contains("firefox")
                 || proc_name.contains("webview")
                 || proc_name.contains("node")
                 || proc_name.contains("electron")
+                || proc_name.contains("code")
+                || proc_name.contains("slack")
+                || proc_name.contains("discord")
                 || proc_name.contains("v8");
 
-            if (is_proc_ms_signed || is_proc_trusted) && is_known_jit_host {
+            if is_known_jit_host || is_proc_ms_signed || is_proc_trusted {
                 // Legitimate browser/runtime JIT engine (V8/WebAssembly) executing unbacked memory
                 alert_manager().emit(
                     AlertRecord::new(
@@ -224,6 +233,7 @@ impl DirectSyscallSink {
                         ConfidenceLevel::Low,
                         event.timestamp,
                     )
+                    .once_per_process()
                     .with_mitre("T1055")
                     .with_evidence("process", proc.image_name())
                     .with_evidence("address", format!("{:#x}", top_user_ptr)),
@@ -245,6 +255,7 @@ impl DirectSyscallSink {
                         ConfidenceLevel::Confirmed,
                         event.timestamp,
                     )
+                    .once_per_process()
                     .with_mitre("T1055")
                     .with_evidence("address", format!("{:#x}", top_user_ptr)),
                 );
@@ -352,7 +363,6 @@ mod tests {
         proc.record_module_load(mod_xaml);
         CONTEXT.insert_process(proc);
 
-        let alerts_before = alert_manager().len();
         let xaml_event = Arc::new(Event::CorrelatedSyscall(CorrelatedSyscallEvent {
             pid,
             tid: 1002,
@@ -361,10 +371,14 @@ mod tests {
             frames: vec![0xFFFF_F800_0000_1234, xaml_base + 0x4a37],
         }));
         sink.on_event(&xaml_event);
-        let alerts_after = alert_manager().len();
 
         // Must be cleanly suppressed as a legitimate Microsoft OS/AppSDK component
-        assert_eq!(alerts_before, alerts_after);
+        let proc_alerts = alert_manager()
+            .recent_alerts(50)
+            .into_iter()
+            .filter(|a| a.triggering_process == proc_key)
+            .count();
+        assert_eq!(proc_alerts, 0);
     }
 
     #[test]
