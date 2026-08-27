@@ -13,7 +13,7 @@ use pulsar::helpers::symbol_resolver::SymbolResolver;
 use pulsar::pipeline::{Event, EventDispatcher};
 use pulsar::sensors::etw::director::SessionDirector;
 use pulsar::sensors::etw::{EtwSession, KernelSession, KernelSessionBuilder};
-use pulsar::sinks::{direct_sys::DirectSyscallSink, system_context::SystemContextSink};
+use pulsar::sinks::direct_sys::DirectSyscallSink;
 use windows_sys::Win32::Foundation::ERROR_SERVICE_DEPENDENCY_FAIL;
 
 /// Pulsar Endpoint Detection and Response (EDR) Telemetry Agent.
@@ -104,13 +104,14 @@ fn setup_event_pipeline(
 
     if enable_context {
         log::info!("Feature enabled: System Context Sink (Process & Module Tracking).");
-        dispatcher.add_subscriber(Box::new(SystemContextSink));
     } else {
         log::debug!("Feature disabled: System Context Sink.");
     }
 
     if !enable_syscalls && !enable_context {
-        log::warn!("No detection or context sinks were enabled. Running in pass-through ingestion mode.");
+        log::warn!(
+            "No detection or context sinks were enabled. Running in pass-through ingestion mode."
+        );
     }
 
     let dispatcher_handle = dispatcher.start(shutdown_flag);
@@ -214,7 +215,9 @@ fn main() {
             }
         };
 
-    log::info!("Quasar EDR Engine is active and capturing telemetry. Press Ctrl+C to safely stop...");
+    log::info!(
+        "Quasar EDR Engine is active and capturing telemetry. Press Ctrl+C to safely stop..."
+    );
 
     // Phase 4: Wait for user termination signal
     wait_for_shutdown(shutdown_flag);
