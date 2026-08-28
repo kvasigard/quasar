@@ -10,3 +10,5 @@ env_logger = { workspace = true }
 clap = { workspace = true }
 ctrlc = "3.5.2"
 shared = { path = "../shared" }
+thiserror = { workspace = true }
+

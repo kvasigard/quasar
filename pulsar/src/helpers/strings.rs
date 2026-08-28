@@ -1,5 +1,62 @@
 //! String decoding utilities for Windows ETW telemetry payloads.
 
+use std::str;
+use thiserror::Error;
+
+/// Error type when parsing strings from raw ETW byte slices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum StringError {
+    #[error("Missing null terminator")]
+    MissingNullTerminator,
+
+    #[error("Invalid UTF-8 encoding")]
+    InvalidEncoding,
+}
+
+/// Parses a zero-copy null-terminated ANSI (or UTF-8) string slice from bytes.
+///
+/// # Arguments
+/// * `bytes` - The raw byte buffer starting from the string.
+///
+/// # Returns
+/// A tuple of `(&str, usize)` containing the borrowed string slice and total bytes consumed (including null terminator).
+pub fn parse_ansi_string(bytes: &[u8]) -> Result<(&str, usize), StringError> {
+    let null_pos = bytes.iter().position(|&b| b == 0).ok_or(StringError::MissingNullTerminator)?;
+    let s = str::from_utf8(&bytes[..null_pos]).map_err(|_| StringError::InvalidEncoding)?;
+    Ok((s, null_pos + 1))
+}
+
+/// Parses a zero-copy null-terminated UTF-16LE slice (`&[u16]`) from bytes.
+///
+/// # Arguments
+/// * `bytes` - The raw byte buffer starting from the UTF-16 string.
+///
+/// # Returns
+/// A tuple of `(&[u16], usize)` containing the borrowed UTF-16 slice and total bytes consumed.
+pub fn parse_utf16_slice(bytes: &[u8]) -> Result<(&[u16], usize), StringError> {
+    let (aligned_bytes, padding) = if (bytes.as_ptr() as usize) % 2 != 0 {
+        if bytes.is_empty() {
+            return Ok((&[], 0));
+        }
+        (&bytes[1..], 1)
+    } else {
+        (bytes, 0)
+    };
+
+    let count = aligned_bytes.len() / 2;
+    if count == 0 {
+        return Ok((&[], padding));
+    }
+
+    let u16_slice = unsafe {
+        std::slice::from_raw_parts(aligned_bytes.as_ptr() as *const u16, count)
+    };
+
+    let len = u16_slice.iter().position(|&c| c == 0).ok_or(StringError::MissingNullTerminator)?;
+    let bytes_consumed = padding + ((len + 1) * 2).min(aligned_bytes.len());
+    Ok((&u16_slice[..len], bytes_consumed))
+}
+
 /// Decodes a null-terminated UTF-16LE string from an ETW byte slice starting at a given offset.
 ///
 /// # Arguments
@@ -45,3 +102,4 @@ pub fn extract_ansi_string(bytes: &[u8]) -> String {
         .trim()
         .to_string()
 }
+

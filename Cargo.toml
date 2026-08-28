@@ -7,6 +7,7 @@ resolver = "3"
 clap = { version = "4.5.31", features = ["derive"] }
 env_logger = "0.11.9"
 log = "0.4.29"
+thiserror = "2.0.12"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Etw",
@@ -18,3 +19,4 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO"
 ] }
+

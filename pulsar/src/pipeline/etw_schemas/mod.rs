@@ -1,1 +1,1 @@
-mod nt_kernel;
+pub mod nt_kernel;
