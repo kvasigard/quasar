@@ -8,11 +8,12 @@ use std::fmt;
 use thiserror::Error;
 
 use crate::model::security::Sid;
+use crate::model::types::{ExitStatus, ProcessId, SessionId, StackTrace, UniqueProcessKey};
 use crate::pipeline::etw_schemas::nt_kernel::process::{
+
     DtoProcessError, Process_V0_TypeGroup1, Process_V1_TypeGroup1, Process_V2_TypeGroup1,
 };
 use crate::sensors::etw::EventRecord;
-use windows_sys::Win32::Foundation::STATUS_CONTROL_C_EXIT;
 
 /// Domain-level error encountered while parsing and validating process events.
 #[derive(Debug, Error)]
@@ -28,66 +29,6 @@ pub enum ProcessModelError {
 
     #[error("Invalid SID: {0}")]
     InvalidSid(String),
-}
-
-/// Strongly-typed Process Identifier (PID).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ProcessId(pub u32);
-
-impl fmt::Display for ProcessId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Strongly-typed Windows Session Identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SessionId(pub u32);
-
-impl fmt::Display for SessionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Kernel pointer address of the `EPROCESS` block uniquely identifying a process instance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct UniqueProcessKey(pub usize);
-
-impl fmt::Display for UniqueProcessKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:#x}", self.0)
-    }
-}
-
-/// Exit status outcome for terminated processes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ExitStatus {
-    Success,
-    /// Process was forcefully terminated (killed, terminated via Ctrl+C / taskkill, or crashed).
-    Terminated,
-    Other(i32),
-}
-
-impl From<i32> for ExitStatus {
-    fn from(code: i32) -> Self {
-        match code {
-            0 => Self::Success,
-            // STATUS_CONTROL_C_EXIT (0xC000013A = -1073741510) indicates forced termination
-            STATUS_CONTROL_C_EXIT | 1 => Self::Terminated,
-            other => Self::Other(other),
-        }
-    }
-}
-
-impl fmt::Display for ExitStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Success => write!(f, "SUCCESS (0)"),
-            Self::Terminated => write!(f, "TERMINATED"),
-            Self::Other(code) => write!(f, "EXIT_CODE ({:#x})", code),
-        }
-    }
 }
 
 /// Identifies the specific lifecycle or telemetry event emitted by the ETW provider.
@@ -156,7 +97,7 @@ pub struct ProcessEvent {
     pub timestamp: i64,
     pub emitter_pid: ProcessId,
     pub emitter_tid: u32,
-    pub stack_trace: Option<Vec<u64>>,
+    pub stack_trace: Option<StackTrace>,
     pub kind: ProcessEventKind,
 
     // Process Hierarchy & Identification
@@ -174,6 +115,107 @@ pub struct ProcessEvent {
     pub image_file_name: String,
     pub command_line: String,
 }
+
+impl ProcessEvent {
+    /// Constructs a `ProcessEvent` from modern Windows 8+ (Version 2) schema payload.
+    fn from_v2(
+        record: &EventRecord,
+        kind: ProcessEventKind,
+        dto: &Process_V2_TypeGroup1,
+    ) -> Result<Self, ProcessModelError> {
+        let user_sid = Sid::try_from(dto.UserSID)
+            .map_err(|e| ProcessModelError::InvalidSid(e.to_string()))?;
+
+        let exit_status = match kind {
+            ProcessEventKind::End | ProcessEventKind::Defunct => {
+                Some(ExitStatus::from(dto.ExitStatus))
+            }
+            _ => None,
+        };
+
+        Ok(Self {
+            timestamp: record.timestamp,
+            emitter_pid: ProcessId(record.process_id),
+            emitter_tid: record.thread_id,
+            stack_trace: record.stack_trace.clone().map(StackTrace::new),
+            kind,
+
+            unique_process_key: UniqueProcessKey(dto.UniqueProcessKey),
+            process_id: ProcessId(dto.ProcessId),
+            parent_id: ProcessId(dto.ParentId),
+            session_id: SessionId(dto.SessionId),
+
+            exit_status,
+            user_sid,
+            image_file_name: dto.ImageFileName.to_string(),
+            command_line: String::from_utf16_lossy(dto.CommandLine),
+        })
+    }
+
+    /// Constructs a `ProcessEvent` from Windows Vista / 7 (Version 1) schema payload.
+    fn from_v1(
+        record: &EventRecord,
+        kind: ProcessEventKind,
+        dto: &Process_V1_TypeGroup1,
+    ) -> Result<Self, ProcessModelError> {
+        let user_sid = Sid::try_from(dto.UserSID)
+            .map_err(|e| ProcessModelError::InvalidSid(e.to_string()))?;
+
+        let exit_status = match kind {
+            ProcessEventKind::End | ProcessEventKind::Defunct => {
+                Some(ExitStatus::from(dto.ExitStatus))
+            }
+            _ => None,
+        };
+
+        Ok(Self {
+            timestamp: record.timestamp,
+            emitter_pid: ProcessId(record.process_id),
+            emitter_tid: record.thread_id,
+            stack_trace: record.stack_trace.clone().map(StackTrace::new),
+            kind,
+
+            unique_process_key: UniqueProcessKey(dto.PageDirectoryBase),
+            process_id: ProcessId(dto.ProcessId),
+            parent_id: ProcessId(dto.ParentId),
+            session_id: SessionId(dto.SessionId),
+
+            exit_status,
+            user_sid,
+            image_file_name: dto.ImageFileName.to_string(),
+            command_line: String::new(), // V1 did not capture command lines
+        })
+    }
+
+    /// Constructs a `ProcessEvent` from legacy Windows XP / 2003 (Version 0) schema payload.
+    fn from_v0(
+        record: &EventRecord,
+        kind: ProcessEventKind,
+        dto: &Process_V0_TypeGroup1,
+    ) -> Result<Self, ProcessModelError> {
+        let user_sid = Sid::try_from(dto.UserSID)
+            .map_err(|e| ProcessModelError::InvalidSid(e.to_string()))?;
+
+        Ok(Self {
+            timestamp: record.timestamp,
+            emitter_pid: ProcessId(record.process_id),
+            emitter_tid: record.thread_id,
+            stack_trace: record.stack_trace.clone().map(StackTrace::new),
+            kind,
+
+            unique_process_key: UniqueProcessKey(0),
+            process_id: ProcessId(dto.ProcessId),
+            parent_id: ProcessId(dto.ParentId),
+            session_id: SessionId(0),
+
+            exit_status: None,
+            user_sid,
+            image_file_name: dto.ImageFileName.to_string(),
+            command_line: String::new(),
+        })
+    }
+}
+
 
 impl TryFrom<&EventRecord> for ProcessEvent {
     type Error = ProcessModelError;
@@ -197,105 +239,5 @@ impl TryFrom<&EventRecord> for ProcessEvent {
             }
             v => Err(ProcessModelError::UnsupportedVersion(v)),
         }
-    }
-}
-
-impl ProcessEvent {
-    /// Constructs a `ProcessEvent` from modern Windows 8+ (Version 2) schema payload.
-    fn from_v2(
-        record: &EventRecord,
-        kind: ProcessEventKind,
-        dto: &Process_V2_TypeGroup1,
-    ) -> Result<Self, ProcessModelError> {
-        let user_sid =
-            Sid::try_from(dto.UserSID).map_err(|e| ProcessModelError::InvalidSid(e.to_string()))?;
-
-        let exit_status = match kind {
-            ProcessEventKind::End | ProcessEventKind::Defunct => {
-                Some(ExitStatus::from(dto.ExitStatus))
-            }
-            _ => None,
-        };
-
-        Ok(Self {
-            timestamp: record.timestamp,
-            emitter_pid: ProcessId(record.process_id),
-            emitter_tid: record.thread_id,
-            stack_trace: record.stack_trace.clone(),
-            kind,
-
-            unique_process_key: UniqueProcessKey(dto.UniqueProcessKey),
-            process_id: ProcessId(dto.ProcessId),
-            parent_id: ProcessId(dto.ParentId),
-            session_id: SessionId(dto.SessionId),
-
-            exit_status,
-            user_sid,
-            image_file_name: dto.ImageFileName.to_string(),
-            command_line: String::from_utf16_lossy(dto.CommandLine),
-        })
-    }
-
-    /// Constructs a `ProcessEvent` from Windows Vista / 7 (Version 1) schema payload.
-    fn from_v1(
-        record: &EventRecord,
-        kind: ProcessEventKind,
-        dto: &Process_V1_TypeGroup1,
-    ) -> Result<Self, ProcessModelError> {
-        let user_sid =
-            Sid::try_from(dto.UserSID).map_err(|e| ProcessModelError::InvalidSid(e.to_string()))?;
-
-        let exit_status = match kind {
-            ProcessEventKind::End | ProcessEventKind::Defunct => {
-                Some(ExitStatus::from(dto.ExitStatus))
-            }
-            _ => None,
-        };
-
-        Ok(Self {
-            timestamp: record.timestamp,
-            emitter_pid: ProcessId(record.process_id),
-            emitter_tid: record.thread_id,
-            stack_trace: record.stack_trace.clone(),
-            kind,
-
-            unique_process_key: UniqueProcessKey(dto.PageDirectoryBase),
-            process_id: ProcessId(dto.ProcessId),
-            parent_id: ProcessId(dto.ParentId),
-            session_id: SessionId(dto.SessionId),
-
-            exit_status,
-            user_sid,
-            image_file_name: dto.ImageFileName.to_string(),
-            command_line: String::new(), // V1 did not capture command lines
-        })
-    }
-
-    /// Constructs a `ProcessEvent` from legacy Windows XP / 2003 (Version 0) schema payload.
-    fn from_v0(
-        record: &EventRecord,
-        kind: ProcessEventKind,
-        dto: &Process_V0_TypeGroup1,
-    ) -> Result<Self, ProcessModelError> {
-        let user_sid =
-            Sid::try_from(dto.UserSID).map_err(|e| ProcessModelError::InvalidSid(e.to_string()))?;
-
-        Ok(Self {
-            timestamp: record.timestamp,
-            emitter_pid: ProcessId(record.process_id),
-            emitter_tid: record.thread_id,
-            stack_trace: record.stack_trace.clone(),
-            kind,
-
-            unique_process_key: UniqueProcessKey(0),
-            process_id: ProcessId(dto.ProcessId),
-            parent_id: ProcessId(dto.ParentId),
-            session_id: SessionId(0),
-
-            exit_status: None,
-            user_sid,
-            image_file_name: dto.ImageFileName.to_string(),
-            command_line: String::new(),
-        })
     }
 }

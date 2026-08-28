@@ -1,7 +1,5 @@
-//! Common ETW session traits and configuration properties.
-
 use crate::error::AppError;
-use crate::pipeline::Event;
+use crate::sensors::etw::EventRecord;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::SyncSender;
 use std::thread::JoinHandle;
@@ -60,7 +58,7 @@ pub trait EtwSession {
     ///
     /// # Arguments
     ///
-    /// * `sender` - Synchronous channel sender pushing decoded `Event` records to the dispatcher.
+    /// * `sender` - Synchronous channel sender pushing raw `EventRecord` items to the dispatcher.
     ///
     /// # Returns
     ///
@@ -71,7 +69,7 @@ pub trait EtwSession {
     /// Returns `AppError::WindowsApi` if `OpenTraceW` fails.
     fn consume(
         &self,
-        sender: SyncSender<Event>,
+        sender: SyncSender<EventRecord>,
     ) -> Result<JoinHandle<Result<(), AppError>>, AppError>;
 }
 
@@ -99,8 +97,8 @@ pub struct EventTraceProperties {
 
 /// Context passed to the ETW C-callback function.
 pub struct TraceContext {
-    /// Sender channel forwarding parsed events to the event dispatcher.
-    pub sender: std::sync::mpsc::SyncSender<Event>,
+    /// Sender channel forwarding parsed event records to the event dispatcher.
+    pub sender: std::sync::mpsc::SyncSender<EventRecord>,
     /// Process ID of the tracer to filter out self-generated telemetry.
     pub current_pid: u32,
     /// Flag ensuring the channel saturation warning is only emitted once.
@@ -112,12 +110,12 @@ impl TraceContext {
     ///
     /// # Arguments
     ///
-    /// * `sender` - The channel sender for pipeline events.
+    /// * `sender` - The channel sender for event records.
     ///
     /// # Returns
     ///
     /// An initialized `TraceContext`.
-    pub fn new(sender: std::sync::mpsc::SyncSender<Event>) -> Self {
+    pub fn new(sender: std::sync::mpsc::SyncSender<EventRecord>) -> Self {
         Self {
             sender,
             current_pid: std::process::id(),
@@ -125,3 +123,4 @@ impl TraceContext {
         }
     }
 }
+

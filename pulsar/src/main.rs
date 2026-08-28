@@ -2,18 +2,16 @@
 
 use std::sync::mpsc;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::JoinHandle;
 
 use clap::Parser;
 use pulsar::error::AppError;
-use pulsar::helpers::symbol_resolver::SymbolResolver;
-use pulsar::pipeline::{Event, EventDispatcher};
+use pulsar::pipeline::EventDispatcher;
 use pulsar::sensors::etw::director::SessionDirector;
-use pulsar::sensors::etw::{EtwSession, KernelSession, KernelSessionBuilder};
-use pulsar::sinks::direct_sys::DirectSyscallSink;
+use pulsar::sensors::etw::{EtwSession, EventRecord, KernelSession, KernelSessionBuilder};
 use windows_sys::Win32::Foundation::ERROR_SERVICE_DEPENDENCY_FAIL;
 
 /// Pulsar Endpoint Detection and Response (EDR) Telemetry Agent.
@@ -81,31 +79,27 @@ fn init_driver_and_ppl(skip_driver: bool) {
     }
 }
 
-/// Initializes the telemetry ingestion channel, shared symbol resolver, and starts the event dispatcher thread.
+/// Initializes the telemetry ingestion channel and starts the event dispatcher thread.
 fn setup_event_pipeline(
     enable_syscalls: bool,
     enable_context: bool,
     shutdown_flag: Arc<AtomicBool>,
-) -> (mpsc::SyncSender<Event>, JoinHandle<()>) {
+) -> (mpsc::SyncSender<EventRecord>, JoinHandle<()>) {
     // Inter-thread ring-buffer queue for high throughput
-    let (tx, rx) = mpsc::sync_channel::<Event>(1_000_000);
+    let (tx, rx) = mpsc::sync_channel::<EventRecord>(1_000_000);
 
-    let shared_resolver = Arc::new(Mutex::new(SymbolResolver::new()));
-    let mut dispatcher = EventDispatcher::new(rx);
+    let dispatcher = EventDispatcher::new(rx);
 
     if enable_syscalls {
-        log::info!("Feature enabled: Direct Syscall Detection Sink.");
-        dispatcher.add_subscriber(Box::new(DirectSyscallSink::new(Arc::clone(
-            &shared_resolver,
-        ))));
+        log::info!("Feature enabled: Syscall Tracing.");
     } else {
-        log::debug!("Feature disabled: Direct Syscall Detection Sink.");
+        log::debug!("Feature disabled: Syscall Tracing.");
     }
 
     if enable_context {
-        log::info!("Feature enabled: System Context Sink (Process & Module Tracking).");
+        log::info!("Feature enabled: Process & System Context Tracing.");
     } else {
-        log::debug!("Feature disabled: System Context Sink.");
+        log::debug!("Feature disabled: Process & System Context Tracing.");
     }
 
     if !enable_syscalls && !enable_context {
@@ -122,7 +116,7 @@ fn setup_event_pipeline(
 fn start_kernel_session(
     enable_syscalls: bool,
     enable_context: bool,
-    tx: mpsc::SyncSender<Event>,
+    tx: mpsc::SyncSender<EventRecord>,
 ) -> Result<(KernelSession, JoinHandle<Result<(), AppError>>), AppError> {
     let mut session_builder = KernelSessionBuilder::new();
     SessionDirector::construct_edr_session(&mut session_builder, enable_syscalls, enable_context);
@@ -141,6 +135,7 @@ fn start_kernel_session(
 
     Ok((kernel_session, consumer_handle))
 }
+
 
 /// Registers the Ctrl+C signal handler and blocks the main thread until interruption is received.
 fn wait_for_shutdown(shutdown_flag: Arc<AtomicBool>) {

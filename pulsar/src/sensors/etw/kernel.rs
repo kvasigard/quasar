@@ -8,7 +8,6 @@ use std::thread::JoinHandle;
 
 use super::event::EventRecord;
 use super::session::{EtwSession, EtwSessionBuilder, EventTraceProperties, TraceContext};
-use crate::pipeline::Event;
 use crate::{AppError, win_last_error};
 
 // Windows System APIs
@@ -23,70 +22,55 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
 use windows_sys::core::GUID;
 
 /// Represents the primary kernel flags used in the `EnableFlags` member of the
-/// `EVENT_TRACE_PROPERTIES` structure for the NT Kernel Logger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `EVENT_TRACE_PROPERTIES` structure.
+///
+/// Setting these flags tells the kernel to enable event tracing for specific
+/// kernel subsystems.
+///
+/// Reference: <https://learn.microsoft.com/en-us/windows/win32/etw/event-trace-properties>
 #[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelFlag {
-    // --- Process and Thread Events ---
-    /// Enables process-related events, such as process creation and termination.
+    // --- Process & Thread Events ---
+    /// Enables process tracing (creation, termination, data collection).
     Process = 0x0000_0001,
-    /// Enables thread-related events, including thread start and end.
+    /// Enables thread tracing (creation, termination, context switch).
     Thread = 0x0000_0002,
-    /// Enables context switch events, which track when a processor switches between threads.
-    Cswitch = 0x0000_0010,
-    /// Enables thread dispatcher events, such as ReadyThread.
-    Dispatcher = 0x0000_0800,
-    /// Enables process performance counter events.
-    ProcessCounters = 0x0000_0008,
-    /// Enables events related to Windows jobs.
-    Job = 0x0008_0000,
-
-    // --- Memory and Page Fault Events ---
-    /// Enables all page fault events, including transition and demand-zero faults.
-    MemoryPageFaults = 0x0000_1000,
-    /// Enables hard page fault events (faults requiring disk access).
-    MemoryHardFaults = 0x0000_2000,
-    /// Enables events for virtual memory allocation and free operations.
-    VirtualAlloc = 0x0000_4000,
-    /// Enables events for mapping and unmapping files (excluding image files).
-    Vamap = 0x0000_8000,
-
-    // --- I/O and Storage Events ---
-    /// Enables physical disk I/O events like read, write, and flush.
-    DiskIo = 0x0000_0100,
-    /// Enables events that mark the beginning of a disk I/O operation.
-    DiskIoInit = 0x0000_0400,
-    /// Enables file I/O events that include the file name.
-    DiskFileIo = 0x0000_0200,
-    /// Enables high-level file system operation end times and results.
-    FileIo = 0x0200_0000,
-    /// Enables initialization events for file operations like create, open, and read/write.
-    FileIoInit = 0x0400_0000,
-    /// Enables split I/O events, indicating requests split into multiple disk I/Os.
-    SplitIo = 0x0020_0000,
-    /// Enables events relating to driver execution and completion of I/O request packets (IRPs).
-    Driver = 0x0080_0000,
-
-    // --- Network, Registry, and ALPC Events ---
-    /// Enables TCP/IP and UDP/IP network events.
-    NetworkTcpip = 0x0001_0000,
-    /// Enables registry operations like create, open, and set value.
-    Registry = 0x0002_0000,
-    /// Enables events for Advanced Local Procedure Calls (ALPC).
-    Alpc = 0x0010_0000,
-
-    // --- Performance and Debugging Events ---
-    /// Enables events for system call entry and exit.
-    SystemCall = 0x0000_0080,
-    /// Enables sampled profile events used for performance analysis.
-    Profile = 0x0100_0000,
-    /// Enables events for deferred procedure calls (DPC).
-    Dpc = 0x0000_0020,
-    /// Enables events for interrupt service routines (ISR).
-    Interrupt = 0x0000_0040,
-    /// Enables image load/unload events for executables and DLLs.
+    /// Enables image load tracing (DLL/Driver loading/unloading).
     ImageLoad = 0x0000_0004,
-    /// Enables DbgPrint and DbgPrintEx calls to be captured as ETW events.
+    /// Enables process counter tracing.
+    ProcessCounter = 0x0000_0008,
+
+    // --- Memory & Disk Events ---
+    /// Enables disk I/O tracing.
+    DiskIO = 0x0000_0100,
+    /// Enables file I/O operations (detailed file access).
+    DiskFileIO = 0x0000_0200,
+    /// Enables memory page faults and hard fault tracing.
+    PageFault = 0x0000_1000,
+    /// Enables hard fault tracing.
+    HardFault = 0x0000_2000,
+
+    // --- Network Events ---
+    /// Enables TCP and UDP IP tracing.
+    NetworkTCPIP = 0x0001_0000,
+
+    // --- Registry & Inter-Process Communication ---
+    /// Enables registry access (open, create, query, set key).
+    Registry = 0x0002_0000,
+    /// Enables Advanced Local Procedure Call (ALPC) tracing.
+    Alpc = 0x0010_0000,
+    /// Enables Object Manager tracking (Handles, Object creation/destruction).
+    Handle = 0x8000_0000,
+
+    // --- System & Hardware Activity ---
+    /// Enables kernel system call tracing (SysEnter / SysExit).
+    SystemCall = 0x0000_0080,
+    /// Enables Interrupt Service Routine (ISR) and Deferred Procedure Call (DPC) tracing.
+    Dispatcher = 0x0000_0800,
+    /// Enables Virtual Allocation / Memory management operations.
+    VirtualAlloc = 0x0000_4000,
+    /// Enables debug print tracing (`DbgPrint`).
     DbgPrint = 0x0004_0000,
 
     // --- Configuration Flags ---
@@ -120,11 +104,9 @@ unsafe extern "system" fn etw_callback(record: *mut EVENT_RECORD) {
             return;
         }
 
-        // Parse and send the event to the Dispatcher.
+        // Parse and send the raw EventRecord to the Dispatcher.
         if let Some(event_record) = EventRecord::from_raw(record) {
-            let event = Event::Etw(event_record);
-
-            if let Err(err) = (*ctx_ptr).sender.try_send(event) {
+            if let Err(err) = (*ctx_ptr).sender.try_send(event_record) {
                 match err {
                     TrySendError::Full(_) => {
                         // Warn only once if the channel is full
@@ -143,6 +125,7 @@ unsafe extern "system" fn etw_callback(record: *mut EVENT_RECORD) {
         }
     }
 }
+
 
 /// Singleton guard ensuring only one NT Kernel Logger is created concurrently.
 /// Windows strictly limits the NT Kernel Logger to a single concurrent session across the entire OS.
@@ -557,8 +540,9 @@ impl EtwSession for KernelSession {
     /// Returns `AppError::Internal` if the session is not started, or `AppError::WindowsApi` if `OpenTraceW` fails.
     fn consume(
         &self,
-        sender: SyncSender<Event>,
+        sender: SyncSender<EventRecord>,
     ) -> Result<JoinHandle<Result<(), AppError>>, AppError> {
+
         if self.handle.is_none() {
             log::warn!(target: "etw_kernel", "Attempted to consume events from an unstarted ETW session.");
             return Err(AppError::Internal(
