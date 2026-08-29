@@ -149,3 +149,53 @@ impl EventRecord {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Diagnostics::Etw::{
+        EVENT_DESCRIPTOR, EVENT_HEADER, EVENT_HEADER_EXT_TYPE_STACK_TRACE64,
+        EVENT_HEADER_EXTENDED_DATA_ITEM, EVENT_RECORD,
+    };
+
+    /// Asserts that null pointers passed to from_raw return None safely without triggering null pointer dereferences.
+    /// Essential safety boundary check for the raw C-ABI ETW callback invoked asynchronously by the OS kernel.
+    #[test]
+    fn test_event_record_from_raw_null_pointer() {
+        let result = unsafe { EventRecord::from_raw(std::ptr::null()) };
+        assert!(result.is_none());
+    }
+
+    /// Verifies parsing of ExtendedData 64-bit stack payloads, confirming the 8-byte MatchId header is skipped.
+    /// Critical to ensure instruction pointer frames extracted from ETW extended buffers represent actual caller frames.
+    #[test]
+    fn test_event_record_from_raw_with_extended_stack64() {
+        let mut stack_payload = Vec::new();
+        stack_payload.extend_from_slice(&0xDEAD_BEEF_CAFE_BABE_u64.to_ne_bytes()); // 8-byte MatchId
+        stack_payload.extend_from_slice(&0x7FFF_1111_2222_u64.to_ne_bytes());      // Frame 1
+        stack_payload.extend_from_slice(&0x7FFF_3333_4444_u64.to_ne_bytes());      // Frame 2
+
+        let mut ext_item: EVENT_HEADER_EXTENDED_DATA_ITEM = unsafe { std::mem::zeroed() };
+        ext_item.ExtType = EVENT_HEADER_EXT_TYPE_STACK_TRACE64 as u16;
+        ext_item.DataSize = stack_payload.len() as u16;
+        ext_item.DataPtr = stack_payload.as_ptr() as u64;
+
+        let mut raw_record: EVENT_RECORD = unsafe { std::mem::zeroed() };
+        raw_record.EventHeader.Size = std::mem::size_of::<EVENT_HEADER>() as u16;
+        raw_record.EventHeader.ThreadId = 1234;
+        raw_record.EventHeader.ProcessId = 5678;
+        raw_record.EventHeader.TimeStamp = 99999;
+        raw_record.EventHeader.ProviderId = GUID { data1: 0x1234, data2: 0, data3: 0, data4: [0; 8] };
+        raw_record.EventHeader.EventDescriptor = EVENT_DESCRIPTOR { Id: 1, Version: 2, Channel: 0, Level: 0, Opcode: 1, Task: 0, Keyword: 0 };
+        raw_record.ExtendedDataCount = 1;
+        raw_record.ExtendedData = &ext_item as *const _ as *mut _;
+
+        let parsed = unsafe { EventRecord::from_raw(&raw_record) }.expect("Record must parse");
+        assert_eq!(parsed.process_id, 5678);
+        assert_eq!(
+            parsed.stack_trace,
+            Some(vec![0x7FFF_1111_2222, 0x7FFF_3333_4444])
+        );
+    }
+}
+

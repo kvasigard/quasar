@@ -322,3 +322,28 @@ fn is_ppl_antimalware() -> bool {
         level == 3
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Validates SCM binary path normalization by stripping NT DOS device prefixes, enclosing quotes, and expanding SystemRoot variables.
+    /// Mandatory to ensure driver upgrade comparison checks accurately match local staged driver binaries against active SCM service registrations.
+    #[test]
+    fn test_clean_driver_path_normalization() {
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+
+        let scm_raw = r#"\??\C:\Windows\System32\drivers\singularity.sys"#;
+        assert_eq!(clean_driver_path(scm_raw), r#"C:\Windows\System32\drivers\singularity.sys"#);
+
+        let quoted_raw = r#""C:\Program Files\Quasar\singularity.sys""#;
+        assert_eq!(clean_driver_path(quoted_raw), r#"C:\Program Files\Quasar\singularity.sys"#);
+
+        let macro_raw = r#"\SystemRoot\System32\drivers\singularity.sys"#;
+        assert_eq!(
+            clean_driver_path(macro_raw),
+            format!(r#"{}\System32\drivers\singularity.sys"#, system_root)
+        );
+    }
+}
+

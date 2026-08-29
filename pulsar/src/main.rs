@@ -12,7 +12,6 @@ use pulsar::error::AppError;
 use pulsar::pipeline::EventDispatcher;
 use pulsar::sensors::etw::director::SessionDirector;
 use pulsar::sensors::etw::{EtwSession, EventRecord, KernelSession, KernelSessionBuilder};
-use windows_sys::Win32::Foundation::ERROR_SERVICE_DEPENDENCY_FAIL;
 
 /// Pulsar Endpoint Detection and Response (EDR) Telemetry Agent.
 #[derive(Parser, Debug)]
@@ -53,30 +52,21 @@ pub struct Cli {
 }
 
 /// Handles the `--uninstall` CLI flag by requesting SCM to stop and delete the driver service.
-fn handle_uninstall() {
+fn handle_uninstall() -> Result<(), AppError> {
     log::info!("Uninstall option detected. Initiating Singularity driver teardown...");
-    match pulsar::drivers::scm::unload_driver() {
-        Ok(_) => {
-            log::info!("Singularity driver successfully stopped and unregistered.");
-            std::process::exit(0);
-        }
-        Err(e) => {
-            log::error!("Failed to unload/uninstall Singularity driver: {}", e);
-            std::process::exit(1);
-        }
-    }
+    pulsar::drivers::scm::unload_driver()?;
+    log::info!("Singularity driver successfully stopped and unregistered.");
+    Ok(())
 }
 
 /// Orchestrates pre-flight driver installation, SCM service start, and PPL-Antimalware elevation.
-fn init_driver_and_ppl(skip_driver: bool) {
+fn init_driver_and_ppl(skip_driver: bool) -> Result<(), AppError> {
     if !skip_driver {
-        if let Err(e) = pulsar::bootstrap::initialize() {
-            log::error!("Bootstrap initialization failed: {}", e);
-            std::process::exit(ERROR_SERVICE_DEPENDENCY_FAIL as i32);
-        }
+        pulsar::bootstrap::initialize()?;
     } else {
         log::warn!("Running in standalone mode: driver initialization and PPL elevation skipped.");
     }
+    Ok(())
 }
 
 /// Initializes the telemetry ingestion channel and starts the event dispatcher thread.
@@ -85,8 +75,9 @@ fn setup_event_pipeline(
     enable_context: bool,
     shutdown_flag: Arc<AtomicBool>,
 ) -> (mpsc::SyncSender<EventRecord>, JoinHandle<()>) {
-    // Inter-thread ring-buffer queue for high throughput
-    let (tx, rx) = mpsc::sync_channel::<EventRecord>(1_000_000);
+    // Bound the channel queue to 50,000 items to prevent unbounded memory allocation under heavy telemetry bursts.
+    // Avoid allocating millions of queue items which can consume hundreds of megabytes if the consumer thread lags.
+    let (tx, rx) = mpsc::sync_channel::<EventRecord>(50_000);
 
     let dispatcher = EventDispatcher::new(rx);
 
@@ -175,21 +166,15 @@ fn teardown_session(
     log::info!("Graceful shutdown complete. All resources freed successfully.");
 }
 
-fn main() {
-    // Initialize logging from environment (supports dynamic RUST_LOG configuration, defaulting to info)
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    let cli = Cli::parse();
-    log::debug!("Parsed CLI configuration: {:?}", cli);
-
+fn run(cli: Cli) -> Result<(), AppError> {
     if cli.uninstall {
-        handle_uninstall();
+        return handle_uninstall();
     }
 
     log::info!("Starting Quasar EDR Engine (Pulsar)...");
 
     // Phase 1: Initialize driver and request PPL elevation
-    init_driver_and_ppl(cli.skip_driver);
+    init_driver_and_ppl(cli.skip_driver)?;
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
 
@@ -202,13 +187,7 @@ fn main() {
 
     // Phase 3: Build and start NT Kernel Logger ETW session
     let (kernel_session, consumer_handle) =
-        match start_kernel_session(enable_syscalls, enable_context, tx) {
-            Ok(handles) => handles,
-            Err(e) => {
-                log::error!("Failed to initialize and start ETW session: {}", e);
-                return;
-            }
-        };
+        start_kernel_session(enable_syscalls, enable_context, tx)?;
 
     log::info!(
         "Quasar EDR Engine is active and capturing telemetry. Press Ctrl+C to safely stop..."
@@ -219,4 +198,22 @@ fn main() {
 
     // Phase 5: Teardown session and join worker threads
     teardown_session(kernel_session, consumer_handle, dispatcher_handle);
+
+    Ok(())
 }
+
+fn main() -> std::process::ExitCode {
+    // Initialize logging from environment (supports dynamic RUST_LOG configuration, defaulting to info)
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let cli = Cli::parse();
+    log::debug!("Parsed CLI configuration: {:?}", cli);
+
+    if let Err(e) = run(cli) {
+        log::error!("Application error encountered: {}", e);
+        return std::process::ExitCode::FAILURE;
+    }
+
+    std::process::ExitCode::SUCCESS
+}
+

@@ -99,3 +99,54 @@ impl<'a> TryFrom<&'a [u8]> for StackWalk_TypeGroup1<'a> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies extraction of correlation timestamp, thread context, and multi-frame call stack unwinding from raw ETW payloads.
+    /// Mandatory to ensure the call stack correlator receives exact 64-bit frame addresses without truncation or byte transposition.
+    #[test]
+    fn test_stack_walk_dto_parsing_and_frame_iteration() {
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&123_456_789u64.to_ne_bytes()); // EventTimeStamp
+        buffer.extend_from_slice(&4321u32.to_ne_bytes());        // StackProcess
+        buffer.extend_from_slice(&8765u32.to_ne_bytes());        // StackThread
+
+        let frames: [usize; 3] = [0x7FFF_0001, 0x7FFF_0002, 0x7FFF_0003];
+        for f in &frames {
+            buffer.extend_from_slice(&f.to_ne_bytes());
+        }
+
+        let dto = StackWalk_TypeGroup1::try_from(buffer.as_slice()).expect("Valid StackWalk must parse");
+        assert_eq!(dto.EventTimeStamp, 123_456_789);
+        assert_eq!(dto.StackProcess, 4321);
+        assert_eq!(dto.StackThread, 8765);
+        assert_eq!(dto.FrameCount, 3);
+        assert_eq!(
+            dto.to_frames(),
+            vec![0x7FFF_0001u64, 0x7FFF_0002u64, 0x7FFF_0003u64]
+        );
+    }
+
+    /// Asserts rejection of truncated headers and non-pointer-aligned trailing byte arrays.
+    /// Protects against memory corruption when kernel stack buffer flushes are interrupted mid-write.
+    #[test]
+    fn test_stack_walk_dto_unaligned_or_truncated_header() {
+        // Less than 16-byte fixed header
+        let truncated = vec![0u8; 15];
+        assert!(matches!(
+            StackWalk_TypeGroup1::try_from(truncated.as_slice()),
+            Err(DtoStackWalkError::HeaderTooShort(16, 15))
+        ));
+
+        // 16-byte header + 3 unaligned bytes
+        let mut unaligned = vec![0u8; 16];
+        unaligned.extend_from_slice(&[1, 2, 3]);
+        assert!(matches!(
+            StackWalk_TypeGroup1::try_from(unaligned.as_slice()),
+            Err(DtoStackWalkError::UnalignedFrames(3))
+        ));
+    }
+}
+

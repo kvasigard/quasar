@@ -370,3 +370,88 @@ impl TryFrom<&[u8]> for Process_V2_TypeGroup2 {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies binary SID header parsing and ensures buffers shorter than the sub-authority declaration are rejected.
+    /// Necessary because ETW passes raw binary token data where malformed lengths could trigger out-of-bounds slice indexing.
+    #[test]
+    fn test_parse_sid_boundaries_and_truncation() {
+        // S-1-5-18 (Revision 1, 1 Sub-Authority, Authority 5, RID 18): 8 + 4 = 12 bytes
+        let valid_sid = [1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+        let (sid_slice, len) = parse_sid(&valid_sid, "UserSID").expect("Valid SID must parse");
+        assert_eq!(sid_slice, &valid_sid);
+        assert_eq!(len, 12);
+
+        // Header claims 2 sub-authorities (requires 16 bytes), but only 12 bytes provided
+        let truncated_sid = [1u8, 2, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+        assert_eq!(
+            parse_sid(&truncated_sid, "UserSID"),
+            Err(DtoProcessError::InvalidSid("UserSID"))
+        );
+    }
+
+    /// Verifies zero-copy deserialization of modern Windows 10/11 Process V2 telemetry with dynamic-length SID, ANSI name, and UTF-16 command line.
+    /// Essential to confirm pointer arithmetic correctly shifts across sequential variable-length fields in real kernel telemetry.
+    #[test]
+    fn test_process_v2_dto_deserialization() {
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&(0xFFFF800011223344usize).to_ne_bytes()); // UniqueProcessKey
+        buffer.extend_from_slice(&1000u32.to_ne_bytes());                    // ProcessId
+        buffer.extend_from_slice(&500u32.to_ne_bytes());                     // ParentId
+        buffer.extend_from_slice(&1u32.to_ne_bytes());                       // SessionId
+        buffer.extend_from_slice(&0i32.to_ne_bytes());                       // ExitStatus
+        buffer.extend_from_slice(&(0x100000usize).to_ne_bytes());            // DirectoryTableBase
+        buffer.extend_from_slice(&[1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]);  // UserSID (12 bytes)
+        buffer.extend_from_slice(b"svchost.exe\0");                          // ImageFileName (12 bytes)
+
+        let cmdline: Vec<u8> = "svchost.exe -k netsvcs\0"
+            .encode_utf16()
+            .flat_map(|u| u.to_ne_bytes())
+            .collect();
+        buffer.extend_from_slice(&cmdline);
+
+        let dto = Process_V2_TypeGroup1::try_from(buffer.as_slice())
+            .expect("Valid Process_V2 payload should deserialize");
+
+        assert_eq!(dto.ProcessId, 1000);
+        assert_eq!(dto.ParentId, 500);
+        assert_eq!(dto.SessionId, 1);
+        assert_eq!(dto.ExitStatus, 0);
+        assert_eq!(dto.ImageFileName, "svchost.exe");
+        assert_eq!(
+            String::from_utf16_lossy(dto.CommandLine),
+            "svchost.exe -k netsvcs"
+        );
+    }
+
+    /// Asserts that payloads terminating before the fixed header boundary are rejected with BufferTooShort.
+    /// Prevents slice-indexing panics on truncated or corrupted ETW trace frames delivered during high system load.
+    #[test]
+    fn test_process_v2_dto_truncated_fixed_header() {
+        let truncated = vec![0u8; PTR_SIZE + 8]; // Smaller than required fixed header size
+        assert_eq!(
+            Process_V2_TypeGroup1::try_from(truncated.as_slice()),
+            Err(DtoProcessError::BufferTooShort("FixedHeader"))
+        );
+    }
+
+    /// Validates legacy Windows 7/Vista V1 and XP V0 schema parsing to ensure backward-compatible ingestion.
+    /// Mandatory to guarantee that legacy event formats or replay traces from older platforms do not cause agent crashes.
+    #[test]
+    fn test_process_v1_and_v0_schemas() {
+        let mut v0_buf = Vec::new();
+        v0_buf.extend_from_slice(&2000u32.to_ne_bytes()); // PID
+        v0_buf.extend_from_slice(&1000u32.to_ne_bytes()); // ParentID
+        v0_buf.extend_from_slice(&[1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]); // SID
+        v0_buf.extend_from_slice(b"cmd.exe\0");
+
+        let v0_dto = Process_V0_TypeGroup1::try_from(v0_buf.as_slice()).expect("V0 should parse");
+        assert_eq!(v0_dto.ProcessId, 2000);
+        assert_eq!(v0_dto.ParentId, 1000);
+        assert_eq!(v0_dto.ImageFileName, "cmd.exe");
+    }
+}
+

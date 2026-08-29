@@ -110,8 +110,17 @@ impl Singularity {
             return Err(win_last_error!());
         }
 
-        // SAFETY: If DeviceIoControl returns non-zero, the kernel driver has successfully
-        // populated the output buffer. It is now safe to assume the memory is initialized.
+        let expected_size = size_of::<C::Response>();
+        // Verify the driver returned the full expected response buffer before assuming initialization.
+        // Reading from uninitialized memory when bytes_returned is smaller than expected_size causes undefined behavior.
+        if expected_size > 0 && (bytes_returned as usize) < expected_size {
+            return Err(AppError::internal(format!(
+                "IOCTL {:#X} response truncated: expected {} bytes, received {} bytes",
+                C::CODE, expected_size, bytes_returned
+            )));
+        }
+
+        // SAFETY: The kernel driver succeeded and populated at least expected_size bytes.
         let initialized_response = unsafe { response.assume_init() };
 
         Ok(initialized_response)

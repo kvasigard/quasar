@@ -241,3 +241,53 @@ impl TryFrom<&EventRecord> for ProcessEvent {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::core::GUID;
+
+    /// Verifies complete transformation from raw EventRecord into strongly-typed ProcessEvent for Start and End lifecycles.
+    /// Ensures ExitStatus is appropriately populated for termination events and omitted for process spawn events.
+    #[test]
+    fn test_process_event_from_v2_record() {
+        let mut user_data = Vec::new();
+        user_data.extend_from_slice(&(0xAAAA_BBBBusize).to_ne_bytes()); // UniqueProcessKey
+        user_data.extend_from_slice(&4321u32.to_ne_bytes());             // PID
+        user_data.extend_from_slice(&1234u32.to_ne_bytes());             // Parent PID
+        user_data.extend_from_slice(&1u32.to_ne_bytes());                // Session ID
+        user_data.extend_from_slice(&0i32.to_ne_bytes());                // ExitStatus
+        user_data.extend_from_slice(&(0x200000usize).to_ne_bytes());     // DirectoryTableBase
+        user_data.extend_from_slice(&[1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]); // SID S-1-5-18
+        user_data.extend_from_slice(b"consent.exe\0");
+        let cmd: Vec<u8> = "consent.exe 123\0".encode_utf16().flat_map(|u| u.to_ne_bytes()).collect();
+        user_data.extend_from_slice(&cmd);
+
+        let mut record = EventRecord {
+            provider_id: GUID { data1: 0x22fb2cd6, data2: 0x0e7b, data3: 0x4226, data4: [0xa0, 0x66, 0x61, 0x80, 0xf7, 0x71, 0x24, 0x65] },
+            event_id: 0,
+            version: 2,
+            opcode: 1, // Start
+            level: 0,
+            process_id: 4321,
+            thread_id: 100,
+            timestamp: 555_000,
+            user_data,
+            stack_trace: None,
+        };
+
+        let start_event = ProcessEvent::try_from(&record).expect("Start record should convert");
+        assert_eq!(start_event.kind, ProcessEventKind::Start);
+        assert_eq!(start_event.process_id, ProcessId(4321));
+        assert_eq!(start_event.exit_status, None);
+        assert_eq!(start_event.image_file_name, "consent.exe");
+
+        // Change opcode to End (2)
+        record.opcode = 2;
+        let end_event = ProcessEvent::try_from(&record).expect("End record should convert");
+        assert_eq!(end_event.kind, ProcessEventKind::End);
+        assert_eq!(end_event.exit_status, Some(ExitStatus::Success));
+    }
+}
+
+

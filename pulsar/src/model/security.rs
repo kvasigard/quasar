@@ -45,3 +45,37 @@ impl fmt::Display for Sid {
         write!(f, "{}", self.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies binary SID decoding with 48-bit big-endian authority and multiple 32-bit sub-authorities into SDDL format.
+    /// Crucial for user context attribution (e.g., SYSTEM vs Administrator) in behavioral detection rules.
+    #[test]
+    fn test_sid_binary_to_sddl_string() {
+        // S-1-5-21-100-200-300-500 (Revision: 1, SubAuthCount: 5, Authority: 5)
+        let mut bytes = vec![1u8, 5, 0, 0, 0, 0, 0, 5];
+        bytes.extend_from_slice(&21u32.to_ne_bytes());
+        bytes.extend_from_slice(&100u32.to_ne_bytes());
+        bytes.extend_from_slice(&200u32.to_ne_bytes());
+        bytes.extend_from_slice(&300u32.to_ne_bytes());
+        bytes.extend_from_slice(&500u32.to_ne_bytes());
+
+        let sid = Sid::try_from(bytes.as_slice()).expect("Valid domain SID must parse");
+        assert_eq!(sid.0, "S-1-5-21-100-200-300-500");
+    }
+
+    /// Asserts that SID byte arrays missing header or sub-authority payload fail safely with specific errors.
+    /// Prevents panic unwinds in ETW consumer threads when inspecting tokens from corrupted or terminating processes.
+    #[test]
+    fn test_sid_truncation_errors() {
+        // Less than 8 bytes header
+        assert_eq!(Sid::try_from(&[1u8, 1, 0][..]), Err("SID buffer too short for header"));
+
+        // Header claims 2 sub-authorities (16 bytes expected), but only 12 bytes given
+        let truncated = [1u8, 2, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+        assert_eq!(Sid::try_from(&truncated[..]), Err("SID buffer truncated"));
+    }
+}
+

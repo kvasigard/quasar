@@ -56,3 +56,26 @@ impl<'a> TryFrom<&'a [u8]> for SysCallEnter_TypeGroup1 {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies zero-copy extraction of the kernel syscall entry address and validates rejection of undersized buffers.
+    /// Critical for direct syscall detection engines to avoid processing corrupt instruction addresses that trigger false alerts.
+    #[test]
+    fn test_syscall_enter_dto_deserialization_and_bounds() {
+        let target_addr: usize = 0x7FFF_8899_AABB_CCDD;
+        let bytes = target_addr.to_ne_bytes();
+
+        let dto = SysCallEnter_TypeGroup1::try_from(&bytes[..]).expect("Should deserialize pointer");
+        assert_eq!(dto.SysCallAddress, target_addr);
+
+        let truncated = &bytes[..size_of::<usize>() - 1];
+        assert!(matches!(
+            SysCallEnter_TypeGroup1::try_from(truncated),
+            Err(DtoSyscallError::BufferTooShort(_, _))
+        ));
+    }
+}
+
+

@@ -127,43 +127,37 @@ unsafe extern "system" fn etw_callback(record: *mut EVENT_RECORD) {
 }
 
 
-/// Singleton guard ensuring only one NT Kernel Logger is created concurrently.
-/// Windows strictly limits the NT Kernel Logger to a single concurrent session across the entire OS.
-pub struct NtKernelGuard;
+/// Singleton RAII guard ensuring only one NT Kernel Logger session is active concurrently across the OS.
+/// Releasing the guard on drop automatically frees the global atomic lock, preventing poisoning on panic.
+pub struct NtKernelGuard(());
 
 static IS_TAKEN: AtomicBool = AtomicBool::new(false);
 
 impl NtKernelGuard {
     /// Attempts to acquire the global lock for the NT Kernel Logger.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` on successful atomic acquisition, or `Err(AppError)` if already active.
-    ///
-    /// # Errors
-    ///
-    /// Returns `AppError::Internal` if another session has locked the NT Kernel Logger.
-    pub fn acquire() -> Result<(), AppError> {
+    pub fn acquire() -> Result<Self, AppError> {
         if IS_TAKEN
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
             log::debug!(target: "etw_kernel", "Successfully acquired NT Kernel Logger lock.");
-            Ok(())
+            Ok(Self(()))
         } else {
             log::warn!(target: "etw_kernel", "Failed to acquire NT Kernel Logger lock: Already in use.");
-            Err(AppError::Internal(
-                "The NT Kernel Logger is already running or acquired by another builder.".into(),
+            Err(AppError::internal(
+                "The NT Kernel Logger is already running or acquired by another builder.",
             ))
         }
     }
+}
 
-    /// Releases the global lock, allowing a new kernel session to be built.
-    pub fn release() {
+impl Drop for NtKernelGuard {
+    fn drop(&mut self) {
         IS_TAKEN.store(false, Ordering::SeqCst);
-        log::debug!(target: "etw_kernel", "Released NT Kernel Logger lock.");
+        log::debug!(target: "etw_kernel", "Released NT Kernel Logger lock via RAII guard.");
     }
 }
+
 
 // --- Builder ---
 
@@ -247,13 +241,14 @@ impl KernelSessionBuilder {
     ///
     /// Returns `AppError::Internal` if the global NT Kernel Logger lock cannot be acquired.
     pub fn build(&self) -> Result<KernelSession, AppError> {
-        NtKernelGuard::acquire()?;
+        let guard = NtKernelGuard::acquire()?;
 
         Ok(KernelSession {
             properties: self.properties.clone(),
             flags: self.flags.clone(),
             stack_tracing_events: self.stack_tracing_events.clone(),
             handle: None,
+            _guard: Some(guard),
         })
     }
 }
@@ -303,6 +298,7 @@ pub struct KernelSession {
     flags: Vec<KernelFlag>,
     stack_tracing_events: Vec<(GUID, u8)>,
     handle: Option<CONTROLTRACE_HANDLE>,
+    _guard: Option<NtKernelGuard>,
 }
 
 impl KernelSession {
@@ -460,7 +456,7 @@ impl EtwSession for KernelSession {
                     "Failed to start trace session. Windows Error Code: {}",
                     status
                 );
-                return Err(win_last_error!());
+                return Err(AppError::from_win32_code(status));
             }
         }
 
@@ -477,10 +473,11 @@ impl EtwSession for KernelSession {
     ///
     /// Returns `AppError::WindowsApi` if `ControlTraceW` fails.
     fn stop(&mut self) -> Result<(), AppError> {
-        let handle = match self.handle {
+        let handle = match self.handle.take() {
             Some(h) => h,
             None => {
                 log::trace!(target: "etw_kernel", "Stop called on an uninitialized session. Ignoring.");
+                self._guard = None;
                 return Ok(());
             }
         };
@@ -514,12 +511,11 @@ impl EtwSession for KernelSession {
                     "Failed to stop trace session. Windows Error Code: {}",
                     status
                 );
-                return Err(win_last_error!());
+                return Err(AppError::from_win32_code(status));
             }
         }
 
-        self.handle = None;
-        NtKernelGuard::release();
+        self._guard = None;
         log::debug!(target: "etw_kernel", "ETW session stopped successfully.");
 
         Ok(())
@@ -582,7 +578,7 @@ impl EtwSession for KernelSession {
                 CloseTrace(trace_handle);
 
                 if status != ERROR_SUCCESS {
-                    return Err(win_last_error!());
+                    return Err(AppError::from_win32_code(status));
                 }
             }
 

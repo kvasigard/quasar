@@ -66,38 +66,14 @@ impl AppError {
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
     }
-}
-
-impl fmt::Display for AppError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WindowsApi { code, message } => {
-                write!(f, "Windows API Error {}: {}", code, message)
-            }
-            Self::Bootstrap(msg) => write!(f, "Bootstrap Error: {}", msg),
-            Self::Internal(msg) => write!(f, "Internal Error: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for AppError {}
-
-/// Macro that retrieves the last Windows error code and message.
-///
-/// Calls `GetLastError()` and `FormatMessageW()` to build an `AppError::WindowsApi`.
-#[macro_export]
-macro_rules! win_last_error {
-    () => {{
-        use windows_sys::Win32::Foundation::GetLastError;
+    /// Formats a Win32 status or error code into an AppError using FormatMessageW.
+    /// Many Windows APIs return error codes directly rather than setting thread-local GetLastError.
+    pub fn from_win32_code(code: u32) -> Self {
         use windows_sys::Win32::System::Diagnostics::Debug::{
             FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,
         };
 
-        #[allow(unused_unsafe)]
-        let code = unsafe { GetLastError() };
-
         let mut buffer: [u16; 512] = [0; 512];
-        #[allow(unused_unsafe)]
         let len = unsafe {
             FormatMessageW(
                 FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -118,6 +94,32 @@ macro_rules! win_last_error {
             format!("Unknown Windows error {}", code)
         };
 
-        $crate::error::AppError::from_win32(code, message)
+        Self::from_win32(code, message)
+    }
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WindowsApi { code, message } => {
+                write!(f, "Windows API Error {}: {}", code, message)
+            }
+            Self::Bootstrap(msg) => write!(f, "Bootstrap Error: {}", msg),
+            Self::Internal(msg) => write!(f, "Internal Error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for AppError {}
+
+/// Macro that retrieves the last Windows error code and message.
+///
+/// Calls `GetLastError()` and decodes the message into an `AppError::WindowsApi`.
+#[macro_export]
+macro_rules! win_last_error {
+    () => {{
+        #[allow(unused_unsafe)]
+        let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        $crate::error::AppError::from_win32_code(code)
     }};
 }

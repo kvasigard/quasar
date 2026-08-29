@@ -20,3 +20,5 @@ pub fn format_guid(guid: &GUID) -> String {
         guid.data4[7],
     )
 }
+
+

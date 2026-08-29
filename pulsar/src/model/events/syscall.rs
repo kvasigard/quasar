@@ -79,3 +79,41 @@ impl TryFrom<&EventRecord> for SyscallEvent {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::core::GUID;
+
+    /// Verifies extraction of target kernel function addresses from Opcode 51 records and validates rejection of non-SysCallEnter opcodes.
+    /// Mandatory for direct syscall anomaly detectors to guarantee only valid transition entry events are ingested.
+    #[test]
+    fn test_syscall_event_construction_and_opcode_filter() {
+        let syscall_target: usize = 0x7FFF_1234_5678;
+        let mut record = EventRecord {
+            provider_id: GUID { data1: 0xce1dbfb4, data2: 0x137e, data3: 0x4da6, data4: [0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc] },
+            event_id: 0,
+            version: 2,
+            opcode: 51, // SysCallEnter
+            level: 0,
+            process_id: 8888,
+            thread_id: 9999,
+            timestamp: 12345,
+            user_data: syscall_target.to_ne_bytes().to_vec(),
+            stack_trace: Some(vec![0x7FFF_AAAA, 0x7FFF_BBBB]),
+        };
+
+        let event = SyscallEvent::try_from(&record).expect("Opcode 51 must produce SyscallEvent");
+        assert_eq!(event.syscall_address, syscall_target);
+        assert_eq!(event.process_id, ProcessId(8888));
+        assert_eq!(event.stack_trace.unwrap().frames(), &[0x7FFF_AAAA, 0x7FFF_BBBB]);
+
+        // Wrong opcode (e.g. SysCallExit 52)
+        record.opcode = 52;
+        assert!(matches!(
+            SyscallEvent::try_from(&record),
+            Err(SyscallEventError::UnknownOpcode(52))
+        ));
+    }
+}
+
+

@@ -1,9 +1,39 @@
 use wdk::{nt_success, println};
-use wdk_sys::{ntddk::PsLookupProcessByProcessId, NTSTATUS, PEPROCESS};
+use wdk_sys::{
+    ntddk::{PsLookupProcessByProcessId, RtlGetVersion},
+    NTSTATUS, PEPROCESS, RTL_OSVERSIONINFOW, STATUS_NOT_SUPPORTED,
+};
 
-/// WARNING: This changes between Windows versions.
-/// Windows 11 24H2 (26100.1) EPROCESS->Protection offset is 0x5FA
-const EPROCESS_PROTECTION_OFFSET: usize = 0x5FA;
+/// Resolves the EPROCESS Protection byte offset dynamically by checking the Windows kernel build number.
+/// Hardcoding a single offset corrupts adjacent kernel memory and triggers BSODs on differing Windows builds.
+fn get_eprocess_protection_offset() -> Result<usize, NTSTATUS> {
+    let mut version_info: RTL_OSVERSIONINFOW = unsafe { core::mem::zeroed() };
+    version_info.dwOSVersionInfoSize = core::mem::size_of::<RTL_OSVERSIONINFOW>() as u32;
+
+    let status = unsafe { RtlGetVersion(&mut version_info) };
+    if !nt_success(status) {
+        return Err(status);
+    }
+
+    let build = version_info.dwBuildNumber;
+    println!("[Singularity::dkom] Detected Windows Build Number: {}", build);
+
+    match build {
+        // Windows 11 24H2 (Build 26100+)
+        b if b >= 26100 => Ok(0x5FA),
+        // Windows 11 21H2 - 23H2 (Build 22000, 22621, 22631)
+        22000..=22631 => Ok(0x87A),
+        // Windows 10 2004 - 22H2 (Build 19041 - 19045)
+        19041..=19045 => Ok(0x87A),
+        _ => {
+            println!(
+                "[Singularity::dkom] Unsupported Windows build for DKOM: {}",
+                build
+            );
+            Err(STATUS_NOT_SUPPORTED)
+        }
+    }
+}
 
 /// Changes the protection level byte of the specified process.
 ///
@@ -20,14 +50,8 @@ const EPROCESS_PROTECTION_OFFSET: usize = 0x5FA;
 ///
 /// Returns an `NTSTATUS` error code if the process lookup fails, which typically occurs
 /// if the PID is invalid or the target process has already terminated.
-///
-/// # Safety
-///
-/// While the function signature itself is safe to call from standard Rust code, the internal
-/// logic relies on hardcoded internal Windows offsets (`EPROCESS_PROTECTION_OFFSET`).
-/// Executing this on an unsupported Windows version where the offset has changed will
-/// corrupt adjacent kernel memory, resulting in an immediate Bug Check (BSOD).
 pub fn change_process_ppl(pid: u32, level: u8) -> Result<(), NTSTATUS> {
+    let offset = get_eprocess_protection_offset()?;
     let mut process: PEPROCESS = core::ptr::null_mut();
 
     // SAFETY: Casting the u32 PID to a HANDLE is the expected FFI pattern for NTOSKRNL.
@@ -48,16 +72,17 @@ pub fn change_process_ppl(pid: u32, level: u8) -> Result<(), NTSTATUS> {
     // managed and accessed by the kernel concurrently.
     unsafe {
         let process_base = process_guard.0 as *mut u8;
-        let protection_addr = process_base.add(EPROCESS_PROTECTION_OFFSET);
+        let protection_addr = process_base.add(offset);
 
         let old_value = core::ptr::read_volatile(protection_addr);
         core::ptr::write_volatile(protection_addr, level);
 
         println!(
             "[Singularity::dkom] Success. PID: {} | Offset: {:#X} | Old: {:#02X} -> New: {:#02X}",
-            pid, EPROCESS_PROTECTION_OFFSET, old_value, level
+            pid, offset, old_value, level
         );
     }
 
     Ok(())
 }
+

@@ -51,3 +51,30 @@ impl IoctlMessage for ChangeProcessPplLevel {
     const CODE: u32 = IOCTL_CHANGE_PPL_LEVEL;
     type Response = ();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// Verifies the CTL_CODE macro matches the Microsoft WDK specification ((Device << 16) | (Access << 14) | (Function << 2) | Method).
+    /// Prevents invalid IOCTL calculations that would cause the I/O Manager to reject dispatch requests or misroute control packets.
+    #[test]
+    fn test_ctl_code_macro_calculation() {
+        let code = ctl_code!(0x8000u32, 0x801u32, 0u32, 0u32);
+        assert_eq!(code, 0x80002004u32);
+        assert_eq!(IOCTL_CHANGE_PPL_LEVEL, 0x80002004u32);
+    }
+
+    /// Verifies the C-ABI memory layout, size, alignment, and field offsets of the ChangeProcessPplLevel structure.
+    /// Mandatory to prevent binary structure drift between user-mode and kernel-mode drivers which would cause kernel memory corruption.
+    #[test]
+    fn test_change_process_ppl_layout() {
+        assert_eq!(size_of::<ChangeProcessPplLevel>(), 8);
+        assert_eq!(align_of::<ChangeProcessPplLevel>(), 4);
+        assert_eq!(offset_of!(ChangeProcessPplLevel, process_id), 0);
+        assert_eq!(offset_of!(ChangeProcessPplLevel, level), 4);
+    }
+}
+
+
