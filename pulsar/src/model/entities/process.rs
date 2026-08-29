@@ -1,7 +1,7 @@
 //! Domain entities representing long-lived process state.
 
-use std::sync::atomic::AtomicBool;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
 
 use crate::model::security::Sid;
 use crate::model::types::{ExitStatus, ProcessId, SessionId, UniqueProcessKey};
@@ -10,15 +10,25 @@ use crate::model::types::{ExitStatus, ProcessId, SessionId, UniqueProcessKey};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcessKey {
     pub pid: ProcessId,
-    pub create_time: i64,
+    pub creation_timestamp: i64,
+}
+
+impl ProcessKey {
+    pub fn new(pid: ProcessId, creation_timestamp: i64) -> Self {
+        // TODO: Validate that the PID is valid and the timestamp is not in the future
+        Self {
+            pid,
+            creation_timestamp,
+        }
+    }
 }
 
 /// Long-lived state representation of a running or terminated process.
 #[derive(Debug)]
 pub struct ProcessNode {
     // Immutable identity established at start
-    pub key: ProcessKey,
-    pub parent_key: Option<ProcessKey>,
+    pub process_id: ProcessId,
+    pub creation_timestamp: i64,
     pub parent_pid: ProcessId,
     pub unique_process_key: UniqueProcessKey,
     pub session_id: SessionId,
