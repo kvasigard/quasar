@@ -1,3 +1,3 @@
 pub mod process;
 
-pub use process::{ProcessKey, ProcessNode};
+pub use process::{ParentProcess, ProcessKey, ProcessNode};
