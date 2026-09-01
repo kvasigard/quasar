@@ -127,7 +127,6 @@ fn start_kernel_session(
     Ok((kernel_session, consumer_handle))
 }
 
-
 /// Registers the Ctrl+C signal handler and blocks the main thread until interruption is received.
 fn wait_for_shutdown(shutdown_flag: Arc<AtomicBool>) {
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -203,7 +202,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
 }
 
 fn main() -> std::process::ExitCode {
-    // Initialize logging from environment (supports dynamic RUST_LOG configuration, defaulting to info)
+    // Initialize logging from environment (supports dynamic RUST_LOG env variable configuration, defaulting to info)
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
@@ -216,4 +215,3 @@ fn main() -> std::process::ExitCode {
 
     std::process::ExitCode::SUCCESS
 }
-
