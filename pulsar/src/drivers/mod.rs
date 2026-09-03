@@ -11,5 +11,8 @@
 //! It must *not* be used to read telemetry or handle event streams—those responsibilities
 //! belong to the `sensors` and `comm` modules.
 
+pub mod error;
 pub mod kmdf;
 pub mod scm;
+
+pub use error::DriverError;

@@ -1,6 +1,7 @@
 //! ETW (Event Tracing for Windows) sensor implementation and provider infrastructure.
 
 pub mod director;
+pub mod error;
 
 mod consumer;
 mod event;
@@ -11,6 +12,7 @@ mod session;
 mod user;
 
 pub use consumer::TraceContext;
+pub use error::EtwError;
 pub use event::EventRecord;
 pub use kernel::{KernelFlag, KernelSession, KernelSessionBuilder};
 pub use properties::TracePropertiesBuffer;

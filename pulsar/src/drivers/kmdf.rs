@@ -3,10 +3,9 @@
 use std::ffi::c_void;
 use std::ptr;
 
-use crate::error::AppError;
-use crate::win_last_error;
+use super::error::DriverError;
 use shared::ioctl::IoctlMessage;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
@@ -32,12 +31,12 @@ impl Singularity {
     ///
     /// # Returns
     ///
-    /// An initialized `Singularity` client handle on success, or an `AppError` on Win32 failure.
+    /// An initialized `Singularity` client handle on success, or an [`DriverError`] on failure.
     ///
     /// # Errors
     ///
-    /// Returns `AppError::WindowsApi` if the device file cannot be opened (e.g. driver not loaded).
-    pub fn connect() -> Result<Self, AppError> {
+    /// Returns [`DriverError::DeviceConnectFailed`] if the device file cannot be opened (e.g. driver not loaded).
+    pub fn connect() -> Result<Self, DriverError> {
         let device_path = windows_sys::w!("\\\\.\\SingularityDevice");
 
         // SAFETY: Device path is built to guarantee proper null-termination via the `w!` macro.
@@ -55,7 +54,12 @@ impl Singularity {
         };
 
         if handle == INVALID_HANDLE_VALUE {
-            return Err(win_last_error!());
+            let err = unsafe { GetLastError() };
+            return Err(DriverError::DeviceConnectFailed {
+                device: "\\\\.\\SingularityDevice",
+                code: err,
+                message: crate::error::format_win32_error_message(err),
+            });
         }
 
         log::debug!(target: "kmdf", "Successfully acquired handle to Singularity KMDF driver.");
@@ -75,8 +79,8 @@ impl Singularity {
     ///
     /// # Errors
     ///
-    /// Returns `AppError::WindowsApi` if `DeviceIoControl` fails.
-    pub fn send<C: IoctlMessage>(&self, command: &C) -> Result<C::Response, AppError> {
+    /// Returns [`DriverError::WindowsApi`] if `DeviceIoControl` fails, or [`DriverError::IoctlResponseTruncated`].
+    pub fn send<C: IoctlMessage>(&self, command: &C) -> Result<C::Response, DriverError> {
         // Prepare an uninitialized memory block for the exact type of the expected response.
         let mut response = std::mem::MaybeUninit::<C::Response>::uninit();
         let mut bytes_returned = 0;
@@ -107,17 +111,19 @@ impl Singularity {
         };
 
         if success == 0 {
-            return Err(win_last_error!());
+            let err = unsafe { GetLastError() };
+            return Err(DriverError::from_win32_code(err));
         }
 
         let expected_size = size_of::<C::Response>();
         // Verify the driver returned the full expected response buffer before assuming initialization.
         // Reading from uninitialized memory when bytes_returned is smaller than expected_size causes undefined behavior.
         if expected_size > 0 && (bytes_returned as usize) < expected_size {
-            return Err(AppError::internal(format!(
-                "IOCTL {:#X} response truncated: expected {} bytes, received {} bytes",
-                C::CODE, expected_size, bytes_returned
-            )));
+            return Err(DriverError::IoctlResponseTruncated {
+                code: C::CODE,
+                expected: expected_size,
+                received: bytes_returned as usize,
+            });
         }
 
         // SAFETY: The kernel driver succeeded and populated at least expected_size bytes.

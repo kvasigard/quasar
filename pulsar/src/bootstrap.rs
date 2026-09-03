@@ -5,17 +5,18 @@
 //! privileges, locating and loading the underlying kernel driver via INF-based
 //! installation, and establishing the required Process Protection Level (PPL).
 
-use crate::drivers::kmdf;
-use crate::drivers::scm;
-use crate::error::AppError;
-use crate::win_last_error;
 use std::env;
 use std::mem;
+use thiserror::Error;
+
+use crate::drivers::error::DriverError;
+use crate::drivers::kmdf;
+use crate::drivers::scm;
 
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     DIINSTALLDRIVER_FLAGS, DiInstallDriverW,
 };
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, HWND};
 use windows_sys::Win32::Security::{
     GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
 };
@@ -23,6 +24,53 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessInformation, OpenProcessToken,
     PROCESS_PROTECTION_LEVEL_INFORMATION, ProcessProtectionLevelInfo,
 };
+
+/// Errors encountered during the pre-flight bootstrap and initialization sequence.
+#[derive(Debug, Error)]
+pub enum BootstrapError {
+    /// The process is running without Administrator privileges.
+    #[error("Process must be executed with elevated Administrator privileges")]
+    NotElevated,
+
+    /// Could not locate the driver package files (`singularity.inf` / `singularity.sys`).
+    #[error("Could not locate driver package pairing '{inf}' and '{sys}' in executable directory or 'singularity_package\\'")]
+    PackageNotFound {
+        inf: String,
+        sys: String,
+    },
+
+    /// Current executable directory path resolution failed.
+    #[error("Failed to resolve current executable directory: {0}")]
+    ExecutablePath(String),
+
+    /// Kernel driver installation, SCM registration, or loading failed.
+    #[error("Kernel driver bootstrap failed: {0}")]
+    Driver(#[from] DriverError),
+
+    /// Driver connection or IOCTL request for PPL elevation failed.
+    #[error("Failed to acquire PPL privileges from driver: {0}")]
+    PplElevation(#[source] DriverError),
+
+    /// Process Protection Level verification failed (process is not running as PPL-Antimalware).
+    #[error("Failed to verify PPL-Antimalware protection level (expected level 3)")]
+    PplVerificationFailed,
+
+    /// A Win32 setup API call (e.g. `DiInstallDriverW`) failed.
+    #[error("Windows Setup API Error {code}: {message}")]
+    WindowsApi {
+        code: u32,
+        message: String,
+    },
+}
+
+impl BootstrapError {
+    /// Formats a Win32 error code into a structured [`BootstrapError::WindowsApi`] using `FormatMessageW`.
+    #[inline]
+    pub fn from_win32_code(code: u32) -> Self {
+        let message = crate::error::format_win32_error_message(code);
+        Self::WindowsApi { code, message }
+    }
+}
 
 /// Executes the pre-flight checks and driver initialization sequence.
 ///
@@ -38,19 +86,19 @@ use windows_sys::Win32::System::Threading::{
 ///
 /// # Returns
 ///
-/// `Ok(())` on successful bootstrap completion, or `Err(AppError)` on failure.
+/// `Ok(())` on successful bootstrap completion, or `Err(BootstrapError)` on failure.
 ///
 /// # Errors
 ///
-/// Returns an `AppError` if non-elevated, if package files cannot be located,
+/// Returns a [`BootstrapError`] if non-elevated, if package files cannot be located,
 /// if driver loading fails, or if PPL elevation cannot be confirmed.
-pub fn initialize() -> Result<(), AppError> {
+pub fn initialize() -> Result<(), BootstrapError> {
     log::debug!(target: "bootstrap", "Starting bootstrap sequence...");
 
     // Check if the program is running as administrator
     log::debug!(target: "bootstrap", "Verifying Administrator privileges...");
     if !is_running_as_admin() {
-        return Err(AppError::internal("Process must be run as Administrator."));
+        return Err(BootstrapError::NotElevated);
     }
 
     // Resolve the dynamic paths to both package configuration and binary files
@@ -95,20 +143,12 @@ pub fn initialize() -> Result<(), AppError> {
 
         // Start the driver service using SCM module
         log::debug!(target: "bootstrap", "Loading Singularity kernel driver via SCM orchestration...");
-        if let Err(e) = scm::load_driver(&sys_path) {
-            return Err(AppError::internal(format!(
-                "Error while starting the driver service: {e}"
-            )));
-        }
+        scm::load_driver(&sys_path)?;
     } else {
         // If already registered and up-to-date, check if running. Start if stopped.
         if !scm::is_service_running()? {
             log::debug!(target: "bootstrap", "Starting Singularity driver service (registered but stopped)...");
-            if let Err(e) = scm::load_driver(&sys_path) {
-                return Err(AppError::internal(format!(
-                    "Error while starting the driver service: {e}"
-                )));
-            }
+            scm::load_driver(&sys_path)?;
         } else {
             log::debug!(target: "bootstrap", "Singularity driver service is already running.");
         }
@@ -117,14 +157,7 @@ pub fn initialize() -> Result<(), AppError> {
     log::debug!(target: "bootstrap", "Connecting to the Singularity driver...");
     // kmdf_client goes out of scope here when this function returns, and its RAII
     // Drop implementation will call CloseHandle(), detaching from the driver.
-    let kmdf_client = match kmdf::Singularity::connect() {
-        Ok(client) => client,
-        Err(e) => {
-            return Err(AppError::internal(format!(
-                "Failed to connect to Singularity KMDF driver: {e}"
-            )));
-        }
-    };
+    let kmdf_client = kmdf::Singularity::connect().map_err(BootstrapError::PplElevation)?;
 
     log::debug!(target: "bootstrap", "Requesting PPL-Antimalware elevation from the driver...");
     let ppl_request = shared::ioctl::ChangeProcessPplLevel {
@@ -132,18 +165,14 @@ pub fn initialize() -> Result<(), AppError> {
         level: 0x31, // PPL-Antimalware (Signer: 0x3 | Type: 0x1)
     };
 
-    if let Err(e) = kmdf_client.send(&ppl_request) {
-        return Err(AppError::internal(format!(
-            "Failed to acquire PPL privileges: {e}"
-        )));
-    }
+    kmdf_client
+        .send(&ppl_request)
+        .map_err(BootstrapError::PplElevation)?;
 
     // Verify applied Process Protection Level (PPL)
     log::debug!(target: "bootstrap", "Verifying applied Process Protection Level...");
     if !is_ppl_antimalware() {
-        return Err(AppError::internal(
-            "Failed to verify PPL-Antimalware token status.",
-        ));
+        return Err(BootstrapError::PplVerificationFailed);
     }
 
     log::info!(target: "bootstrap", "Bootstrap successful. Running with PPL-Antimalware protection.");
@@ -186,12 +215,12 @@ fn clean_driver_path(path: &str) -> String {
 ///
 /// # Returns
 ///
-/// `Ok(())` on success, or `Err(AppError)` if installation fails.
+/// `Ok(())` on success, or `Err(BootstrapError)` if installation fails.
 ///
 /// # Errors
 ///
-/// Returns `AppError::WindowsApi` if `DiInstallDriverW` returns zero.
-fn install_inf_driver(inf_path: &str) -> Result<(), AppError> {
+/// Returns [`BootstrapError::WindowsApi`] if `DiInstallDriverW` returns zero.
+fn install_inf_driver(inf_path: &str) -> Result<(), BootstrapError> {
     let mut wide_inf: Vec<u16> = inf_path.encode_utf16().collect();
     wide_inf.push(0);
 
@@ -206,7 +235,8 @@ fn install_inf_driver(inf_path: &str) -> Result<(), AppError> {
         unsafe { DiInstallDriverW(0 as HWND, wide_inf.as_ptr(), flags, &mut need_reboot) };
 
     if success == 0 {
-        return Err(win_last_error!());
+        let err = unsafe { GetLastError() };
+        return Err(BootstrapError::from_win32_code(err));
     }
 
     if need_reboot != 0 {
@@ -222,18 +252,18 @@ fn install_inf_driver(inf_path: &str) -> Result<(), AppError> {
 ///
 /// # Returns
 ///
-/// `Ok((inf_path, sys_path))` if both files are found, or `Err(AppError)` otherwise.
+/// `Ok((inf_path, sys_path))` if both files are found, or `Err(BootstrapError)` otherwise.
 ///
 /// # Errors
 ///
-/// Returns `AppError::Internal` if package pairing cannot be found on disk.
-fn resolve_package_paths() -> Result<(String, String), AppError> {
+/// Returns [`BootstrapError::ExecutablePath`] or [`BootstrapError::PackageNotFound`].
+fn resolve_package_paths() -> Result<(String, String), BootstrapError> {
     let exe_path = env::current_exe()
-        .map_err(|e| AppError::internal(format!("Failed to get executable path: {}", e)))?;
+        .map_err(|e| BootstrapError::ExecutablePath(format!("Failed to get executable path: {}", e)))?;
 
     let exe_dir = exe_path
         .parent()
-        .ok_or_else(|| AppError::internal("Executable path has no parent directory"))?;
+        .ok_or_else(|| BootstrapError::ExecutablePath("Executable path has no parent directory".into()))?;
 
     let inf_name = "singularity.inf";
     let sys_name = "singularity.sys";
@@ -259,10 +289,10 @@ fn resolve_package_paths() -> Result<(String, String), AppError> {
         ));
     }
 
-    Err(AppError::internal(format!(
-        "Could not find a valid deployment pairing of '{}' and '{}' in the executable directory or 'singularity_package\\' subdirectory.",
-        inf_name, sys_name
-    )))
+    Err(BootstrapError::PackageNotFound {
+        inf: inf_name.to_string(),
+        sys: sys_name.to_string(),
+    })
 }
 
 /// Checks if the current process token has the Administrator elevation flag set.
@@ -327,6 +357,21 @@ fn is_ppl_antimalware() -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_bootstrap_error_formatting() {
+        let err = BootstrapError::NotElevated;
+        assert_eq!(
+            err.to_string(),
+            "Process must be executed with elevated Administrator privileges"
+        );
+
+        let err_pkg = BootstrapError::PackageNotFound {
+            inf: "singularity.inf".to_string(),
+            sys: "singularity.sys".to_string(),
+        };
+        assert!(err_pkg.to_string().contains("singularity.inf"));
+    }
+
     /// Validates SCM binary path normalization by stripping NT DOS device prefixes, enclosing quotes, and expanding SystemRoot variables.
     /// Mandatory to ensure driver upgrade comparison checks accurately match local staged driver binaries against active SCM service registrations.
     #[test]
@@ -346,4 +391,3 @@ mod tests {
         );
     }
 }
-

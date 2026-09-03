@@ -4,11 +4,11 @@ use std::sync::mpsc::SyncSender;
 use std::thread::JoinHandle;
 
 use super::consumer::spawn_trace_consumer;
+use super::error::EtwError;
 use super::event::EventRecord;
 use super::properties::TracePropertiesBuffer;
 use super::provider::Provider;
 use super::session::{EtwSession, EtwSessionBuilder, EventTraceProperties};
-use crate::error::AppError;
 
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS};
 use windows_sys::Win32::System::Diagnostics::Etw::{
@@ -53,7 +53,7 @@ impl UserSessionBuilder {
     /// # Returns
     ///
     /// An initialized [`UserSession`] ready to `start()`.
-    pub fn build(&self) -> Result<UserSession, AppError> {
+    pub fn build(&self) -> Result<UserSession, EtwError> {
         Ok(UserSession {
             session_name: self.session_name.clone(),
             properties: self.properties.clone(),
@@ -157,13 +157,15 @@ impl EtwSession for UserSession {
     ///
     /// # Returns
     ///
-    /// `Ok(())` on success, or `Err(AppError)` if starting fails.
-    fn start(&mut self) -> Result<(), AppError> {
+    /// `Ok(())` on success, or `Err(EtwError)` if starting fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EtwError::SessionAlreadyRunning`] or [`EtwError::WindowsApi`] on error.
+    fn start(&mut self) -> Result<(), EtwError> {
         if self.handle.is_some() {
             log::warn!(target: "etw_user", "Attempted to start an already running UserSession.");
-            return Err(AppError::internal(
-                "Non-null handle found when trying to initialize UserSession",
-            ));
+            return Err(EtwError::SessionAlreadyRunning(self.session_name.clone()));
         }
 
         log::info!(target: "etw_user", "Starting user ETW session: {}", self.session_name);
@@ -210,7 +212,7 @@ impl EtwSession for UserSession {
                 "Failed to start user trace session '{}'. Windows Error Code: {}",
                 self.session_name, status
             );
-            Err(AppError::from_win32_code(status))
+            Err(EtwError::from_win32_code(status))
         }
     }
 
@@ -218,8 +220,12 @@ impl EtwSession for UserSession {
     ///
     /// # Returns
     ///
-    /// `Ok(())` on success, or `Err(AppError)` on failure.
-    fn stop(&mut self) -> Result<(), AppError> {
+    /// `Ok(())` on success, or `Err(EtwError)` on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EtwError::WindowsApi`] if `ControlTraceW` fails.
+    fn stop(&mut self) -> Result<(), EtwError> {
         let handle = match self.handle.take() {
             Some(h) => h,
             None => {
@@ -255,7 +261,7 @@ impl EtwSession for UserSession {
                 "Failed to stop user trace session '{}'. Windows Error Code: {}",
                 self.session_name, status
             );
-            return Err(AppError::from_win32_code(status));
+            return Err(EtwError::from_win32_code(status));
         }
 
         log::debug!(target: "etw_user", "User ETW session '{}' stopped successfully.", self.session_name);
@@ -271,15 +277,17 @@ impl EtwSession for UserSession {
     /// # Returns
     ///
     /// A `JoinHandle` for the consumer thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EtwError::SessionNotStarted`] if the session is not started, or [`EtwError::WindowsApi`] if `OpenTraceW` fails.
     fn consume(
         &self,
         sender: SyncSender<EventRecord>,
-    ) -> Result<JoinHandle<Result<(), AppError>>, AppError> {
+    ) -> Result<JoinHandle<Result<(), EtwError>>, EtwError> {
         if self.handle.is_none() {
             log::warn!(target: "etw_user", "Attempted to consume events from an unstarted UserSession.");
-            return Err(AppError::Internal(
-                "Cannot consume from an unstarted session.".into(),
-            ));
+            return Err(EtwError::SessionNotStarted(self.session_name.clone()));
         }
 
         spawn_trace_consumer(self.session_name.clone(), sender)

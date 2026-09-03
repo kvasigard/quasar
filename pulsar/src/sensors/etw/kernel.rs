@@ -6,10 +6,10 @@ use std::sync::mpsc::SyncSender;
 use std::thread::JoinHandle;
 
 use super::consumer::spawn_trace_consumer;
+use super::error::EtwError;
 use super::event::EventRecord;
 use super::properties::TracePropertiesBuffer;
 use super::session::{EtwSession, EtwSessionBuilder, EventTraceProperties};
-use crate::AppError;
 
 // Windows System APIs
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS};
@@ -84,7 +84,7 @@ static IS_TAKEN: AtomicBool = AtomicBool::new(false);
 
 impl NtKernelGuard {
     /// Attempts to acquire the global lock for the NT Kernel Logger.
-    pub fn acquire() -> Result<Self, AppError> {
+    pub fn acquire() -> Result<Self, EtwError> {
         if IS_TAKEN
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
@@ -93,9 +93,7 @@ impl NtKernelGuard {
             Ok(Self(()))
         } else {
             log::warn!(target: "etw_kernel", "Failed to acquire NT Kernel Logger lock: Already in use.");
-            Err(AppError::internal(
-                "The NT Kernel Logger is already running or acquired by another builder.",
-            ))
+            Err(EtwError::KernelLoggerAlreadyActive)
         }
     }
 }
@@ -187,8 +185,8 @@ impl KernelSessionBuilder {
     ///
     /// # Errors
     ///
-    /// Returns `AppError::Internal` if the global NT Kernel Logger lock cannot be acquired.
-    pub fn build(&self) -> Result<KernelSession, AppError> {
+    /// Returns [`EtwError::KernelLoggerAlreadyActive`] if the global NT Kernel Logger lock cannot be acquired.
+    pub fn build(&self) -> Result<KernelSession, EtwError> {
         let guard = NtKernelGuard::acquire()?;
 
         Ok(KernelSession {
@@ -305,16 +303,16 @@ impl EtwSession for KernelSession {
     ///
     /// # Returns
     ///
-    /// `Ok(())` on success, or `Err(AppError)` if starting fails.
+    /// `Ok(())` on success, or `Err(EtwError)` if starting fails.
     ///
     /// # Errors
     ///
-    /// Returns `AppError::Internal` or `AppError::WindowsApi` on error.
-    fn start(&mut self) -> Result<(), AppError> {
+    /// Returns [`EtwError::SessionAlreadyRunning`] or [`EtwError::WindowsApi`] on error.
+    fn start(&mut self) -> Result<(), EtwError> {
         if self.handle.is_some() {
             log::warn!(target: "etw_kernel", "Attempted to start an already running NT Kernel Logger instance.");
-            return Err(AppError::internal(
-                "Non-null handle found when trying to initialize NT Kernel Logger",
+            return Err(EtwError::SessionAlreadyRunning(
+                Self::SESSION_NAME.to_string(),
             ));
         }
 
@@ -366,7 +364,7 @@ impl EtwSession for KernelSession {
                 "Failed to start trace session. Windows Error Code: {}",
                 status
             );
-            Err(AppError::from_win32_code(status))
+            Err(EtwError::from_win32_code(status))
         }
     }
 
@@ -374,12 +372,12 @@ impl EtwSession for KernelSession {
     ///
     /// # Returns
     ///
-    /// `Ok(())` on success, or `Err(AppError)` on failure.
+    /// `Ok(())` on success, or `Err(EtwError)` on failure.
     ///
     /// # Errors
     ///
-    /// Returns `AppError::WindowsApi` if `ControlTraceW` fails.
-    fn stop(&mut self) -> Result<(), AppError> {
+    /// Returns [`EtwError::WindowsApi`] if `ControlTraceW` fails.
+    fn stop(&mut self) -> Result<(), EtwError> {
         let handle = match self.handle.take() {
             Some(h) => h,
             None => {
@@ -416,7 +414,7 @@ impl EtwSession for KernelSession {
                 "Failed to stop trace session. Windows Error Code: {}",
                 status
             );
-            return Err(AppError::from_win32_code(status));
+            return Err(EtwError::from_win32_code(status));
         }
 
         log::debug!(target: "etw_kernel", "ETW session stopped successfully.");
@@ -435,15 +433,15 @@ impl EtwSession for KernelSession {
     ///
     /// # Errors
     ///
-    /// Returns `AppError::Internal` if the session is not started, or `AppError::WindowsApi` if `OpenTraceW` fails.
+    /// Returns [`EtwError::SessionNotStarted`] if the session is not started, or [`EtwError::WindowsApi`] if `OpenTraceW` fails.
     fn consume(
         &self,
         sender: SyncSender<EventRecord>,
-    ) -> Result<JoinHandle<Result<(), AppError>>, AppError> {
+    ) -> Result<JoinHandle<Result<(), EtwError>>, EtwError> {
         if self.handle.is_none() {
             log::warn!(target: "etw_kernel", "Attempted to consume events from an unstarted ETW session.");
-            return Err(AppError::Internal(
-                "Cannot consume from an unstarted session.".into(),
+            return Err(EtwError::SessionNotStarted(
+                Self::SESSION_NAME.to_string(),
             ));
         }
 

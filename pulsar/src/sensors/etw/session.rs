@@ -1,9 +1,10 @@
 //! Common traits and configurations defining the ETW session contract.
 
-use crate::error::AppError;
-use crate::sensors::etw::EventRecord;
 use std::sync::mpsc::SyncSender;
 use std::thread::JoinHandle;
+
+use super::error::EtwError;
+use crate::sensors::etw::EventRecord;
 
 /// A common trait defining how to build ETW session properties.
 ///
@@ -37,23 +38,23 @@ pub trait EtwSession {
     ///
     /// # Returns
     ///
-    /// `Ok(())` on success, or `Err(AppError)` if session creation fails.
+    /// `Ok(())` on success, or `Err(EtwError)` if session creation fails.
     ///
     /// # Errors
     ///
-    /// Returns `AppError::WindowsApi` if `StartTraceW` or `ControlTraceW` fails.
-    fn start(&mut self) -> Result<(), AppError>;
+    /// Returns [`EtwError::WindowsApi`] if `StartTraceW` or `ControlTraceW` fails.
+    fn start(&mut self) -> Result<(), EtwError>;
 
     /// Stops and closes the ETW trace session.
     ///
     /// # Returns
     ///
-    /// `Ok(())` on success, or `Err(AppError)` on failure.
+    /// `Ok(())` on success, or `Err(EtwError)` on failure.
     ///
     /// # Errors
     ///
-    /// Returns `AppError::WindowsApi` if `ControlTraceW` fails.
-    fn stop(&mut self) -> Result<(), AppError>;
+    /// Returns [`EtwError::WindowsApi`] if `ControlTraceW` fails.
+    fn stop(&mut self) -> Result<(), EtwError>;
 
     /// Spawns a background thread consuming event records via `ProcessTrace`.
     ///
@@ -67,11 +68,11 @@ pub trait EtwSession {
     ///
     /// # Errors
     ///
-    /// Returns `AppError::WindowsApi` if `OpenTraceW` fails.
+    /// Returns [`EtwError::WindowsApi`] if `OpenTraceW` fails, or [`EtwError::SessionNotStarted`].
     fn consume(
         &self,
         sender: SyncSender<EventRecord>,
-    ) -> Result<JoinHandle<Result<(), AppError>>, AppError>;
+    ) -> Result<JoinHandle<Result<(), EtwError>>, EtwError>;
 }
 
 /// Properties controlling the buffering and logging behavior of the ETW session.

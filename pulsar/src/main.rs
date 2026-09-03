@@ -11,7 +11,9 @@ use clap::Parser;
 use pulsar::error::AppError;
 use pulsar::pipeline::EventDispatcher;
 use pulsar::sensors::etw::director::SessionDirector;
-use pulsar::sensors::etw::{EtwSession, EventRecord, KernelSession, KernelSessionBuilder};
+use pulsar::sensors::etw::{
+    EtwError, EtwSession, EventRecord, KernelSession, KernelSessionBuilder,
+};
 
 /// Pulsar Endpoint Detection and Response (EDR) Telemetry Agent.
 #[derive(Parser, Debug)]
@@ -108,7 +110,7 @@ fn start_kernel_session(
     enable_syscalls: bool,
     enable_context: bool,
     tx: mpsc::SyncSender<EventRecord>,
-) -> Result<(KernelSession, JoinHandle<Result<(), AppError>>), AppError> {
+) -> Result<(KernelSession, JoinHandle<Result<(), EtwError>>), AppError> {
     let mut session_builder = KernelSessionBuilder::new();
     SessionDirector::construct_edr_session(&mut session_builder, enable_syscalls, enable_context);
 
@@ -120,7 +122,7 @@ fn start_kernel_session(
         Ok(handle) => handle,
         Err(e) => {
             let _ = kernel_session.stop();
-            return Err(e);
+            return Err(e.into());
         }
     };
 
@@ -145,7 +147,7 @@ fn wait_for_shutdown(shutdown_flag: Arc<AtomicBool>) {
 /// Gracefully stops the ETW kernel trace session and joins background worker threads.
 fn teardown_session(
     mut kernel_session: KernelSession,
-    consumer_handle: JoinHandle<Result<(), AppError>>,
+    consumer_handle: JoinHandle<Result<(), EtwError>>,
     dispatcher_handle: JoinHandle<()>,
 ) {
     log::info!("Initiating graceful shutdown sequence...");
@@ -202,14 +204,21 @@ fn run(cli: Cli) -> Result<(), AppError> {
 }
 
 fn main() -> std::process::ExitCode {
-    // Initialize logging from environment (supports dynamic RUST_LOG env variable configuration, defaulting to info)
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
     log::debug!("Parsed CLI configuration: {:?}", cli);
 
     if let Err(e) = run(cli) {
-        log::error!("Application error encountered: {}", e);
+        log::error!("Application error encountered: {e}");
+
+        // Print causal source chain if available
+        let mut source = std::error::Error::source(&e);
+        while let Some(cause) = source {
+            log::error!("  Caused by: {cause}");
+            source = cause.source();
+        }
+
         return std::process::ExitCode::FAILURE;
     }
 

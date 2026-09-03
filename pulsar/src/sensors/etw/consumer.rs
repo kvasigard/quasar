@@ -5,11 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::thread::JoinHandle;
 
+use super::error::EtwError;
 use super::event::EventRecord;
-use crate::error::AppError;
-use crate::win_last_error;
 
-use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GetLastError};
 use windows_sys::Win32::System::Diagnostics::Etw::{
     CloseTrace, EVENT_RECORD, EVENT_TRACE_LOGFILEW, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
     PROCESS_TRACE_MODE_RAW_TIMESTAMP, PROCESS_TRACE_MODE_REAL_TIME, ProcessTrace,
@@ -105,11 +104,11 @@ unsafe extern "system" fn etw_callback(record: *mut EVENT_RECORD) {
 ///
 /// # Errors
 ///
-/// Returns `AppError::WindowsApi` if `OpenTraceW` fails.
+/// Returns [`EtwError::WindowsApi`] if `OpenTraceW` fails.
 pub fn spawn_trace_consumer(
     session_name: String,
     sender: SyncSender<EventRecord>,
-) -> Result<JoinHandle<Result<(), AppError>>, AppError> {
+) -> Result<JoinHandle<Result<(), EtwError>>, EtwError> {
     log::info!(target: "etw_consumer", "Spawning background event consumption thread for '{}'...", session_name);
 
     let handle = std::thread::spawn(move || {
@@ -128,7 +127,8 @@ pub fn spawn_trace_consumer(
             let trace_handle = OpenTraceW(&mut logfile);
 
             if trace_handle.Value == 0xFFFF_FFFF_FFFF_FFFF || trace_handle.Value == 0 {
-                return Err(win_last_error!());
+                let err_code = GetLastError();
+                return Err(EtwError::from_win32_code(err_code));
             }
 
             log::debug!(target: "etw_consumer", "Blocking ProcessTrace loop started for session '{}'.", session_name);
@@ -138,7 +138,7 @@ pub fn spawn_trace_consumer(
             CloseTrace(trace_handle);
 
             if status != ERROR_SUCCESS {
-                return Err(AppError::from_win32_code(status));
+                return Err(EtwError::from_win32_code(status));
             }
         }
 
