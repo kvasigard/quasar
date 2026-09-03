@@ -1,6 +1,7 @@
+//! Common traits and configurations defining the ETW session contract.
+
 use crate::error::AppError;
 use crate::sensors::etw::EventRecord;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::SyncSender;
 use std::thread::JoinHandle;
 
@@ -94,33 +95,3 @@ pub struct EventTraceProperties {
     /// The name of the log file to write to, if writing to disk.
     pub log_file_name: Option<String>,
 }
-
-/// Context passed to the ETW C-callback function.
-pub struct TraceContext {
-    /// Sender channel forwarding parsed event records to the event dispatcher.
-    pub sender: std::sync::mpsc::SyncSender<EventRecord>,
-    /// Process ID of the tracer to filter out self-generated telemetry.
-    pub current_pid: u32,
-    /// Flag ensuring the channel saturation warning is only emitted once.
-    pub channel_full_warned: AtomicBool,
-}
-
-impl TraceContext {
-    /// Creates a new `TraceContext`, caching the current process ID.
-    ///
-    /// # Arguments
-    ///
-    /// * `sender` - The channel sender for event records.
-    ///
-    /// # Returns
-    ///
-    /// An initialized `TraceContext`.
-    pub fn new(sender: std::sync::mpsc::SyncSender<EventRecord>) -> Self {
-        Self {
-            sender,
-            current_pid: std::process::id(),
-            channel_full_warned: AtomicBool::new(false),
-        }
-    }
-}
-

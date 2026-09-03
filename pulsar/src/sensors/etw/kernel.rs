@@ -3,21 +3,19 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::mpsc::TrySendError;
 use std::thread::JoinHandle;
 
+use super::consumer::spawn_trace_consumer;
 use super::event::EventRecord;
-use super::session::{EtwSession, EtwSessionBuilder, EventTraceProperties, TraceContext};
-use crate::{AppError, win_last_error};
+use super::properties::TracePropertiesBuffer;
+use super::session::{EtwSession, EtwSessionBuilder, EventTraceProperties};
+use crate::AppError;
 
 // Windows System APIs
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS};
 use windows_sys::Win32::System::Diagnostics::Etw::{
-    CLASSIC_EVENT_ID, CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_RECORD,
-    EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-    EVENT_TRACE_REAL_TIME_MODE, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
-    PROCESS_TRACE_MODE_RAW_TIMESTAMP, PROCESS_TRACE_MODE_REAL_TIME, ProcessTrace, StartTraceW,
-    SystemTraceControlGuid, TraceSetInformation, WNODE_FLAG_TRACED_GUID,
+    CLASSIC_EVENT_ID, CONTROLTRACE_HANDLE, ControlTraceW, EVENT_TRACE_CONTROL_STOP, StartTraceW,
+    SystemTraceControlGuid, TraceSetInformation,
 };
 use windows_sys::core::GUID;
 
@@ -78,55 +76,6 @@ pub enum KernelFlag {
     NoSysConfig = 0x1000_0000,
 }
 
-/// The static C-ABI callback invoked synchronously by Windows via `ProcessTrace`.
-///
-/// # Safety
-///
-/// `record` must be a valid pointer to an `EVENT_RECORD` provided by the ETW runtime.
-unsafe extern "system" fn etw_callback(record: *mut EVENT_RECORD) {
-    if record.is_null() {
-        return;
-    }
-
-    // SAFETY: Already checked for null
-    unsafe {
-        let ctx_ptr = (*record).UserContext as *mut TraceContext;
-        if ctx_ptr.is_null() {
-            return;
-        }
-
-        // Discard System (4), Idle (0), and our own tracer PID to avoid infinite loops
-        // or processing irrelevant background OS noise.
-        let process_id = (*record).EventHeader.ProcessId;
-        let current_pid = (*ctx_ptr).current_pid;
-
-        if process_id == 0 || process_id == 4 || process_id == current_pid {
-            return;
-        }
-
-        // Parse and send the raw EventRecord to the Dispatcher.
-        if let Some(event_record) = EventRecord::from_raw(record) {
-            if let Err(err) = (*ctx_ptr).sender.try_send(event_record) {
-                match err {
-                    TrySendError::Full(_) => {
-                        // Warn only once if the channel is full
-                        if !(*ctx_ptr).channel_full_warned.swap(true, Ordering::Relaxed) {
-                            log::warn!(
-                                target: "etw_kernel",
-                                "The event channel reached its maximum capacity. Some events might be dropped."
-                            );
-                        }
-                    }
-                    TrySendError::Disconnected(_) => {
-                        // Channel dropped, gracefully ignore as shutdown is in progress
-                    }
-                }
-            }
-        }
-    }
-}
-
-
 /// Singleton RAII guard ensuring only one NT Kernel Logger session is active concurrently across the OS.
 /// Releasing the guard on drop automatically frees the global atomic lock, preventing poisoning on panic.
 pub struct NtKernelGuard(());
@@ -157,7 +106,6 @@ impl Drop for NtKernelGuard {
         log::debug!(target: "etw_kernel", "Released NT Kernel Logger lock via RAII guard.");
     }
 }
-
 
 // --- Builder ---
 
@@ -373,94 +321,53 @@ impl EtwSession for KernelSession {
         log::info!(target: "etw_kernel", "Starting ETW session: {}", Self::SESSION_NAME);
 
         let name_wide: Vec<u16> = Self::SESSION_NAME.encode_utf16().chain(Some(0)).collect();
-        let file_wide: Vec<u16> = self
-            .properties
-            .log_file_name
-            .as_ref()
-            .map(|s| s.encode_utf16().chain(Some(0)).collect())
-            .unwrap_or_default();
+        let mut props_buf = TracePropertiesBuffer::new(
+            Self::SESSION_NAME,
+            &self.properties,
+            SystemTraceControlGuid,
+            self.get_enable_flags_mask(),
+        );
 
-        let struct_size = size_of::<EVENT_TRACE_PROPERTIES>();
-        let name_len_bytes = name_wide.len() * size_of::<u16>();
-        let file_len_bytes = file_wide.len() * size_of::<u16>();
+        let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
+        let mut status = unsafe {
+            StartTraceW(&mut handle, name_wide.as_ptr(), props_buf.as_mut_ptr())
+        };
 
-        let total_size = struct_size + name_len_bytes + file_len_bytes;
-        let mut buffer = vec![0u8; total_size];
-        let props_ptr = buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
+        if status == ERROR_ALREADY_EXISTS {
+            log::warn!(target: "etw_kernel", "Kernel trace session already exists. Attempting to stop and recreate it...");
 
-        // SAFETY: Buffer is properly sized and aligned for EVENT_TRACE_PROPERTIES.
-        unsafe {
-            (*props_ptr).Wnode.BufferSize = total_size as u32;
-            (*props_ptr).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-            (*props_ptr).Wnode.ClientContext = 1; // QPC timestamp
-            (*props_ptr).Wnode.Guid = SystemTraceControlGuid;
-
-            let mut log_mode = self.properties.log_file_mode;
-            if log_mode == 0 && file_wide.is_empty() {
-                log::warn!(target: "etw_kernel", "Logging mode or file is not defined. Falling back to Real Time mode.");
-                log_mode = EVENT_TRACE_REAL_TIME_MODE;
-            }
-
-            (*props_ptr).LogFileMode = log_mode;
-            (*props_ptr).BufferSize = self.properties.buffer_size;
-            (*props_ptr).MinimumBuffers = self.properties.minimum_buffers;
-            (*props_ptr).MaximumBuffers = self.properties.maximum_buffers;
-            (*props_ptr).FlushTimer = self.properties.flush_timer;
-            (*props_ptr).EnableFlags = self.get_enable_flags_mask();
-            (*props_ptr).LoggerNameOffset = struct_size as u32;
-
-            if !file_wide.is_empty() {
-                (*props_ptr).LogFileNameOffset = (struct_size + name_len_bytes) as u32;
-            }
-
-            std::ptr::copy_nonoverlapping(
-                name_wide.as_ptr(),
-                buffer.as_mut_ptr().add(struct_size) as *mut u16,
-                name_wide.len(),
+            let mut stop_buf = TracePropertiesBuffer::new(
+                Self::SESSION_NAME,
+                &self.properties,
+                SystemTraceControlGuid,
+                0,
             );
 
-            if !file_wide.is_empty() {
-                std::ptr::copy_nonoverlapping(
-                    file_wide.as_ptr(),
-                    buffer.as_mut_ptr().add(struct_size + name_len_bytes) as *mut u16,
-                    file_wide.len(),
-                );
-            }
-
-            let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
-            let mut status = StartTraceW(&mut handle, name_wide.as_ptr(), props_ptr);
-
-            if status == ERROR_ALREADY_EXISTS {
-                log::warn!(target: "etw_kernel", "Kernel trace session already exists. Attempting to stop and recreate it...");
-
-                let mut stop_buffer = buffer.clone();
-                let stop_props_ptr = stop_buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-
+            unsafe {
                 ControlTraceW(
                     CONTROLTRACE_HANDLE { Value: 0 },
                     name_wide.as_ptr(),
-                    stop_props_ptr,
+                    stop_buf.as_mut_ptr(),
                     EVENT_TRACE_CONTROL_STOP,
                 );
 
-                status = StartTraceW(&mut handle, name_wide.as_ptr(), props_ptr);
-            }
-
-            if status == ERROR_SUCCESS {
-                log::debug!(target: "etw_kernel", "Successfully started ETW trace session.");
-                self.handle = Some(handle);
-                self.enable_stack_trace();
-            } else {
-                log::error!(
-                    target: "etw_kernel",
-                    "Failed to start trace session. Windows Error Code: {}",
-                    status
-                );
-                return Err(AppError::from_win32_code(status));
+                status = StartTraceW(&mut handle, name_wide.as_ptr(), props_buf.as_mut_ptr());
             }
         }
 
-        Ok(())
+        if status == ERROR_SUCCESS {
+            log::debug!(target: "etw_kernel", "Successfully started ETW trace session.");
+            self.handle = Some(handle);
+            self.enable_stack_trace();
+            Ok(())
+        } else {
+            log::error!(
+                target: "etw_kernel",
+                "Failed to start trace session. Windows Error Code: {}",
+                status
+            );
+            Err(AppError::from_win32_code(status))
+        }
     }
 
     /// Stops the ETW trace session and releases the global hardware lock.
@@ -485,39 +392,34 @@ impl EtwSession for KernelSession {
         log::info!(target: "etw_kernel", "Stopping ETW session...");
 
         let name_wide: Vec<u16> = Self::SESSION_NAME.encode_utf16().chain(Some(0)).collect();
-        let struct_size = size_of::<EVENT_TRACE_PROPERTIES>();
-        let name_len_bytes = name_wide.len() * size_of::<u16>();
+        let mut props_buf = TracePropertiesBuffer::new(
+            Self::SESSION_NAME,
+            &self.properties,
+            SystemTraceControlGuid,
+            0,
+        );
 
-        let total_size = struct_size + name_len_bytes;
-        let mut buffer = vec![0u8; total_size];
-        let props_ptr = buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-
-        // SAFETY: Buffer is properly allocated and correctly sized.
-        unsafe {
-            (*props_ptr).Wnode.BufferSize = total_size as u32;
-            (*props_ptr).Wnode.Guid = SystemTraceControlGuid;
-            (*props_ptr).LoggerNameOffset = struct_size as u32;
-
-            let status = ControlTraceW(
+        let status = unsafe {
+            ControlTraceW(
                 handle,
-                std::ptr::null(),
-                props_ptr,
+                name_wide.as_ptr(),
+                props_buf.as_mut_ptr(),
                 EVENT_TRACE_CONTROL_STOP,
-            );
-
-            if status != ERROR_SUCCESS {
-                log::error!(
-                    target: "etw_kernel",
-                    "Failed to stop trace session. Windows Error Code: {}",
-                    status
-                );
-                return Err(AppError::from_win32_code(status));
-            }
-        }
+            )
+        };
 
         self._guard = None;
-        log::debug!(target: "etw_kernel", "ETW session stopped successfully.");
 
+        if status != ERROR_SUCCESS {
+            log::error!(
+                target: "etw_kernel",
+                "Failed to stop trace session. Windows Error Code: {}",
+                status
+            );
+            return Err(AppError::from_win32_code(status));
+        }
+
+        log::debug!(target: "etw_kernel", "ETW session stopped successfully.");
         Ok(())
     }
 
@@ -538,7 +440,6 @@ impl EtwSession for KernelSession {
         &self,
         sender: SyncSender<EventRecord>,
     ) -> Result<JoinHandle<Result<(), AppError>>, AppError> {
-
         if self.handle.is_none() {
             log::warn!(target: "etw_kernel", "Attempted to consume events from an unstarted ETW session.");
             return Err(AppError::Internal(
@@ -546,47 +447,7 @@ impl EtwSession for KernelSession {
             ));
         }
 
-        log::info!(target: "etw_kernel", "Spawning background event consumption thread...");
-
-        let session_name_owned = Self::SESSION_NAME.to_string();
-
-        let handle = std::thread::spawn(move || {
-            let mut name_wide: Vec<u16> =
-                session_name_owned.encode_utf16().chain(Some(0)).collect();
-            let mut context = TraceContext::new(sender);
-            let mut logfile: EVENT_TRACE_LOGFILEW = unsafe { std::mem::zeroed() };
-
-            logfile.LoggerName = name_wide.as_mut_ptr();
-            logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME
-                | PROCESS_TRACE_MODE_EVENT_RECORD
-                | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
-            logfile.Anonymous2.EventRecordCallback = Some(etw_callback);
-            logfile.Context = &mut context as *mut _ as *mut c_void;
-
-            unsafe {
-                let trace_handle = OpenTraceW(&mut logfile);
-
-                if trace_handle.Value == 0xFFFFFFFFFFFFFFFF || trace_handle.Value == 0 {
-                    return Err(win_last_error!());
-                }
-
-                log::debug!(target: "etw_kernel", "Blocking ProcessTrace loop started in background thread.");
-
-                let status =
-                    ProcessTrace(&trace_handle, 1, std::ptr::null_mut(), std::ptr::null_mut());
-
-                CloseTrace(trace_handle);
-
-                if status != ERROR_SUCCESS {
-                    return Err(AppError::from_win32_code(status));
-                }
-            }
-
-            log::info!(target: "etw_kernel", "ETW consumer thread exited gracefully.");
-            Ok(())
-        });
-
-        Ok(handle)
+        spawn_trace_consumer(Self::SESSION_NAME.to_string(), sender)
     }
 }
 

@@ -1,4 +1,4 @@
-//! Session director providing modular recipes for configuring ETW kernel sessions.
+//! Session director providing modular recipes for configuring ETW kernel and user sessions.
 
 use windows_sys::Win32::System::Diagnostics::Etw::{
     EVENT_TRACE_REAL_TIME_MODE, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_RAW_TIMESTAMP,
@@ -6,7 +6,9 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
 use windows_sys::core::GUID;
 
 use super::kernel::{KernelFlag, KernelSessionBuilder};
+use super::provider::Provider;
 use super::session::EtwSessionBuilder;
+use super::user::UserSessionBuilder;
 
 /// Defines the GUID for Performance Information events (`{ce1dbfb4-137e-4da6-87b0-3f59aa102cbc}`).
 ///
@@ -21,7 +23,7 @@ pub const PERFINFO_GUID: GUID = GUID {
 /// Event ID for System Call Entry (`SysClEnter`) used in ETW stack tracing.
 pub const EVENT_ID_SYSCALL_ENTER: u8 = 51;
 
-/// Default buffer size in kilobytes for high-throughput kernel telemetry.
+/// Default buffer size in kilobytes for high-throughput kernel and user telemetry.
 pub const DEFAULT_BUFFER_SIZE_KB: u32 = 1024;
 /// Default minimum number of buffers in the ETW ring-buffer pool.
 pub const DEFAULT_MIN_BUFFERS: u32 = 64;
@@ -30,21 +32,22 @@ pub const DEFAULT_MAX_BUFFERS: u32 = 128;
 /// Default forced buffer flush timer in seconds.
 pub const DEFAULT_FLUSH_TIMER_SECS: u32 = 1;
 
-/// Director helper providing composable, single-responsibility recipes for ETW kernel sessions.
+/// Director helper providing composable, single-responsibility recipes for ETW sessions.
 pub struct SessionDirector;
 
 impl SessionDirector {
-    /// Configures the base real-time logging modes and ring-buffer allocation parameters.
+    /// Configures the base real-time logging modes and ring-buffer allocation parameters
+    /// polymorphically on any builder implementing [`EtwSessionBuilder`].
     ///
     /// # Arguments
     ///
-    /// * `builder` - A mutable reference to the `KernelSessionBuilder`.
+    /// * `builder` - A mutable reference to a type implementing [`EtwSessionBuilder`].
     /// * `buffer_size_kb` - Buffer size in kilobytes.
     /// * `min_buffers` - Minimum number of allocated buffers in the pool.
     /// * `max_buffers` - Maximum number of allocated buffers in the pool.
     /// * `flush_timer_secs` - Interval in seconds for flushing trace buffers.
     pub fn configure_base_session(
-        builder: &mut KernelSessionBuilder,
+        builder: &mut impl EtwSessionBuilder,
         buffer_size_kb: u32,
         min_buffers: u32,
         max_buffers: u32,
@@ -66,7 +69,7 @@ impl SessionDirector {
     ///
     /// # Arguments
     ///
-    /// * `builder` - A mutable reference to the `KernelSessionBuilder`.
+    /// * `builder` - A mutable reference to the [`KernelSessionBuilder`].
     pub fn enable_syscall_monitoring(builder: &mut KernelSessionBuilder) {
         builder
             .enable_flag(KernelFlag::SystemCall)
@@ -77,7 +80,7 @@ impl SessionDirector {
     ///
     /// # Arguments
     ///
-    /// * `builder` - A mutable reference to the `KernelSessionBuilder`.
+    /// * `builder` - A mutable reference to the [`KernelSessionBuilder`].
     pub fn enable_process_monitoring(builder: &mut KernelSessionBuilder) {
         builder.enable_flag(KernelFlag::Process);
     }
@@ -86,7 +89,7 @@ impl SessionDirector {
     ///
     /// # Arguments
     ///
-    /// * `builder` - A mutable reference to the `KernelSessionBuilder`.
+    /// * `builder` - A mutable reference to the [`KernelSessionBuilder`].
     pub fn enable_image_monitoring(builder: &mut KernelSessionBuilder) {
         builder.enable_flag(KernelFlag::ImageLoad);
     }
@@ -96,10 +99,10 @@ impl SessionDirector {
     ///
     /// # Arguments
     ///
-    /// * `builder` - A mutable reference to the `KernelSessionBuilder`.
+    /// * `builder` - A mutable reference to the [`KernelSessionBuilder`].
     /// * `enable_syscalls` - Whether to enable system call monitoring and stack tracing.
     /// * `enable_context` - Whether to enable process and image load lifecycle telemetry.
-    pub fn construct_edr_session(
+    pub fn construct_kernel_edr_session(
         builder: &mut KernelSessionBuilder,
         enable_syscalls: bool,
         enable_context: bool,
@@ -120,5 +123,68 @@ impl SessionDirector {
             Self::enable_process_monitoring(builder);
             Self::enable_image_monitoring(builder);
         }
+    }
+
+    /// Backwards-compatible alias for [`Self::construct_kernel_edr_session`].
+    #[inline]
+    pub fn construct_edr_session(
+        builder: &mut KernelSessionBuilder,
+        enable_syscalls: bool,
+        enable_context: bool,
+    ) {
+        Self::construct_kernel_edr_session(builder, enable_syscalls, enable_context);
+    }
+
+    /// Composes a tailored user-mode trace session with standard ring-buffers and registered providers.
+    ///
+    /// # Arguments
+    ///
+    /// * `builder` - A mutable reference to the [`UserSessionBuilder`].
+    /// * `providers` - An iterator of [`Provider`] descriptors to attach.
+    pub fn construct_user_session(
+        builder: &mut UserSessionBuilder,
+        providers: impl IntoIterator<Item = Provider>,
+    ) {
+        Self::configure_base_session(
+            builder,
+            DEFAULT_BUFFER_SIZE_KB,
+            DEFAULT_MIN_BUFFERS,
+            DEFAULT_MAX_BUFFERS,
+            DEFAULT_FLUSH_TIMER_SECS,
+        );
+
+        for provider in providers {
+            builder.add_provider(provider);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sensors::etw::provider::TraceLevel;
+    use crate::sensors::etw::user::UserSession;
+
+    /// Verifies that SessionDirector properly configures kernel and user builders with standard base ring-buffer settings.
+    #[test]
+    fn test_director_user_and_kernel_recipes() {
+        let mut kernel_builder = KernelSessionBuilder::new();
+        SessionDirector::construct_kernel_edr_session(&mut kernel_builder, true, true);
+
+        let mut user_builder = UserSessionBuilder::new("TestDirectorUserSession");
+        let dummy_guid = GUID {
+            data1: 0x1122_3344,
+            data2: 0,
+            data3: 0,
+            data4: [0; 8],
+        };
+        SessionDirector::construct_user_session(
+            &mut user_builder,
+            vec![Provider::new("TestProv", dummy_guid).with_level(TraceLevel::Information)],
+        );
+
+        let user_session = user_builder.build().expect("Build should succeed");
+        assert_eq!(UserSession::DEFAULT_SESSION_NAME, "Pulsar-User-Session");
+        let _ = user_session;
     }
 }

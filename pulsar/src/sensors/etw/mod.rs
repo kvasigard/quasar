@@ -1,12 +1,19 @@
-//! ETW (Event Tracing for Windows) sensor implementation.
+//! ETW (Event Tracing for Windows) sensor implementation and provider infrastructure.
 
 pub mod director;
 
+mod consumer;
 mod event;
 mod kernel;
+mod properties;
+mod provider;
 mod session;
+mod user;
 
-// Expose the necessary types to the rest of the crate.
+pub use consumer::TraceContext;
 pub use event::EventRecord;
 pub use kernel::{KernelFlag, KernelSession, KernelSessionBuilder};
-pub use session::EtwSession;
+pub use properties::TracePropertiesBuffer;
+pub use provider::{Provider, TraceLevel};
+pub use session::{EtwSession, EtwSessionBuilder, EventTraceProperties};
+pub use user::{UserSession, UserSessionBuilder};
