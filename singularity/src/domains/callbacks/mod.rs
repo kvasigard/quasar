@@ -15,18 +15,21 @@ pub use operations::{
     PreOperationCallbackFn, DEFAULT_ALTITUDE,
 };
 
-use core::sync::atomic::{AtomicPtr, Ordering};
-
-/// Active Object Manager registration handle stored as an atomic pointer.
-static ACTIVE_CALLBACK_HANDLE: AtomicPtr<core::ffi::c_void> =
-    AtomicPtr::new(core::ptr::null_mut());
+/// Global singleton manager for Object Manager callbacks.
+pub static CALLBACK_MANAGER: CallbackManager = CallbackManager::new();
 
 /// Checks whether Object Manager callbacks are currently active.
+#[inline(always)]
 pub fn is_active() -> bool {
-    !ACTIVE_CALLBACK_HANDLE.load(Ordering::Relaxed).is_null()
+    CALLBACK_MANAGER.is_active()
 }
 
 /// Initializes and registers all kernel callbacks during driver startup.
+///
+/// # Return values
+///
+/// * `Ok(())` - Callbacks successfully registered.
+/// * `Err(CallbackError)` - Registration failure.
 pub fn initialize() -> Result<(), CallbackError> {
     if is_active() {
         crate::driver_warn!("[callbacks::initialize] Callbacks are already initialized");
@@ -40,17 +43,11 @@ pub fn initialize() -> Result<(), CallbackError> {
         None,
     )];
 
-    let manager = CallbackManager::register(DEFAULT_ALTITUDE, &callbacks)?;
-    ACTIVE_CALLBACK_HANDLE.store(manager.into_raw(), Ordering::Release);
-    Ok(())
+    CALLBACK_MANAGER.register(DEFAULT_ALTITUDE, &callbacks)
 }
 
 /// Unregisters all kernel callbacks during driver unload or initialization rollback.
+#[inline(always)]
 pub fn cleanup() {
-    let handle = ACTIVE_CALLBACK_HANDLE.swap(core::ptr::null_mut(), Ordering::AcqRel);
-    if !handle.is_null() {
-        // SAFETY: Reconstructing the CallbackManager RAII guard ensures safe, single-point unregistration.
-        let mut manager = unsafe { CallbackManager::from_raw(handle) };
-        manager.unregister();
-    }
+    CALLBACK_MANAGER.unregister();
 }

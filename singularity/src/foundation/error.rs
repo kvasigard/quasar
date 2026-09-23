@@ -5,7 +5,7 @@
 
 use wdk_sys::NTSTATUS;
 
-// Re-export domain errors for unified error handling across the driver
+pub use crate::comm::ring_buffer::RingBufferError;
 pub use crate::device::DeviceError;
 pub use crate::domains::anti_tampering::AntiTamperingError;
 pub use crate::domains::callbacks::CallbackError;
@@ -28,6 +28,9 @@ pub enum DriverError {
 
     /// IOCTL unmarshaling or dispatch error.
     Ioctl(IoctlError),
+
+    /// Shared memory ring buffer transport error.
+    RingBuffer(RingBufferError),
 }
 
 impl DriverError {
@@ -39,6 +42,7 @@ impl DriverError {
             Self::Callbacks(err) => err.to_ntstatus(),
             Self::AntiTampering(err) => err.to_ntstatus(),
             Self::Ioctl(err) => err.to_ntstatus(),
+            Self::RingBuffer(err) => err.to_ntstatus(),
         }
     }
 }
@@ -53,6 +57,7 @@ impl core::fmt::Display for DriverError {
             Self::Callbacks(err) => write!(f, "Callback error: {err}"),
             Self::AntiTampering(err) => write!(f, "Anti-tampering error: {err}"),
             Self::Ioctl(err) => write!(f, "IOCTL error: {err}"),
+            Self::RingBuffer(err) => write!(f, "Ring buffer error: {err}"),
         }
     }
 }
@@ -80,6 +85,12 @@ impl From<AntiTamperingError> for DriverError {
 impl From<IoctlError> for DriverError {
     fn from(err: IoctlError) -> Self {
         Self::Ioctl(err)
+    }
+}
+
+impl From<RingBufferError> for DriverError {
+    fn from(err: RingBufferError) -> Self {
+        Self::RingBuffer(err)
     }
 }
 

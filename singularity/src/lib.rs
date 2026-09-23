@@ -10,11 +10,13 @@ use wdk_alloc::WdkAllocator;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
+pub mod comm;
 pub mod device;
 pub mod domains;
 pub mod foundation;
 pub mod ioctl;
 pub mod wrappers;
+
 // Re-export println for $crate::println! macro expansion in foundation::log
 pub use wdk::println;
 
@@ -66,6 +68,10 @@ unsafe fn initialize_driver(
     // Create the Non-PnP Control Device and Sequential Queue
     unsafe { device::create_control_device(driver_handle)? };
     DRIVER_STATE.mark_device_created();
+
+    // Create the Shared Memory ring
+    comm::ring_buffer::initialize()?;
+    DRIVER_STATE.mark_ring_created();
 
     // Register Object Manager callbacks
     domains::callbacks::initialize()?;

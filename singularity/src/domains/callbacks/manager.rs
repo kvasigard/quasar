@@ -1,33 +1,51 @@
-//! RAII lifecycle manager for Object Manager callback registration.
+//! Singleton lifecycle manager for Object Manager callback registration.
 
 use core::ptr;
+use core::sync::atomic::{AtomicPtr, Ordering};
 use wdk::nt_success;
 use wdk_sys::{
-    _OB_CALLBACK_REGISTRATION, OB_FLT_REGISTRATION_VERSION, OB_OPERATION_REGISTRATION, PVOID,
+    OB_FLT_REGISTRATION_VERSION, OB_OPERATION_REGISTRATION, PASSIVE_LEVEL, PVOID,
+    _OB_CALLBACK_REGISTRATION,
     ntddk::{ObRegisterCallbacks, ObUnRegisterCallbacks},
 };
 
 use super::error::CallbackError;
 use super::operations::Callback;
+use crate::foundation::ensure_max_irql;
 use crate::foundation::string::init_unicode_string;
 
 /// Maximum number of operations supported in a single stack-allocated registration batch.
 const MAX_OPERATIONS: usize = 4;
 
-/// Manages the lifecycle of an active Windows Object Manager registration.
+/// Singleton manager for Windows Object Manager callback registration.
 ///
-/// This structure acts as an RAII guard. When dropped, it automatically unregisters
-/// the kernel handle to prevent calling into unloaded memory during driver unload.
+/// Encapsulates the kernel registration cookie within an atomic pointer, coordinating
+/// thread-safe registration and idempotent unregistration during driver unload or rollback.
 pub struct CallbackManager {
-    handle: PVOID,
+    handle: AtomicPtr<core::ffi::c_void>,
 }
 
 impl CallbackManager {
+    /// Creates a new uninitialized `CallbackManager` instance.
+    pub const fn new() -> Self {
+        Self {
+            handle: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    /// Checks whether Object Manager callbacks are currently active.
+    ///
+    /// # Returns
+    ///
+    /// `true` if callbacks are currently registered with the kernel, `false` otherwise.
+    pub fn is_active(&self) -> bool {
+        !self.handle.load(Ordering::Relaxed).is_null()
+    }
+
     /// Registers callbacks with the Windows Object Manager.
     ///
-    /// This function sets up the required registration structures and submits them
-    /// to `ObRegisterCallbacks`. Callbacks remain active until this manager is dropped
-    /// or explicitly unregistered.
+    /// Configures the callback registration structures and submits them to `ObRegisterCallbacks`
+    /// at `PASSIVE_LEVEL`. On success, stores the opaque kernel handle atomically.
     ///
     /// # Arguments
     ///
@@ -36,9 +54,18 @@ impl CallbackManager {
     ///
     /// # Return values
     ///
-    /// * `Ok(CallbackManager)` - The initialized guard holding the active registration handle.
-    /// * `Err(CallbackError)` - Detailed domain error if registration fails.
-    pub fn register(altitude: *const u16, callbacks: &[Callback]) -> Result<Self, CallbackError> {
+    /// * `Ok(())` - Callbacks registered successfully.
+    /// * `Err(CallbackError::AlreadyInitialized)` - Callbacks are already active.
+    /// * `Err(CallbackError::EmptyCallbacksList)` - Supplied slice contains zero callbacks.
+    /// * `Err(CallbackError::MaxCapacityExceeded)` - Number of callbacks exceeds internal limit.
+    /// * `Err(CallbackError::MissingRoutine)` - Callback defines neither pre- nor post-operation routine.
+    /// * `Err(CallbackError)` - Kernel registration failure or access denial.
+    pub fn register(&self, altitude: *const u16, callbacks: &[Callback]) -> Result<(), CallbackError> {
+        if self.is_active() {
+            crate::driver_warn!("[callbacks::register] Callbacks are already initialized");
+            return Err(CallbackError::AlreadyInitialized);
+        }
+
         if callbacks.is_empty() {
             crate::driver_error!("[callbacks::register] Callback list is empty");
             return Err(CallbackError::EmptyCallbacksList);
@@ -90,8 +117,10 @@ impl CallbackManager {
 
         let mut handle: PVOID = ptr::null_mut();
 
-        // SAFETY: The stack structures and altitude string remain valid for the duration
-        // of ObRegisterCallbacks. Windows copies registration data into executive memory.
+        // SAFETY:
+        // Calling `ObRegisterCallbacks` is safe because the stack-allocated registration arrays
+        // and unicode altitude string remain valid throughout the synchronous call duration, and
+        // the Windows kernel copies all registration data into internal executive memory before returning.
         let status = unsafe { ObRegisterCallbacks(&mut registration, &mut handle) };
         if !nt_success(status) {
             match status {
@@ -129,45 +158,35 @@ impl CallbackManager {
             return Err(CallbackError::NullHandleReturned);
         }
 
+        self.handle.store(handle, Ordering::Release);
         crate::driver_info!("[callbacks::register] Callbacks registered successfully");
-        Ok(Self { handle })
+        Ok(())
     }
 
-    /// Reconstructs a `CallbackManager` guard from a previously registered raw handle.
+    /// Unregisters the callbacks from the Windows Object Manager.
     ///
-    /// # Safety
-    /// `handle` must be a valid Object Manager registration handle obtained via `into_raw()`.
-    pub unsafe fn from_raw(handle: PVOID) -> Self {
-        Self { handle }
-    }
+    /// Atomically swaps the active registration handle with null, ensuring complete idempotency
+    /// against duplicate or concurrent teardown invocations. Verifies that the execution context
+    /// satisfies `IRQL == PASSIVE_LEVEL` as mandated by `ObUnRegisterCallbacks`.
+    pub fn unregister(&self) {
+        if let Err(current_irql) = ensure_max_irql(PASSIVE_LEVEL as u8) {
+            crate::driver_error!(
+                "[callbacks::unregister] Invalid IRQL {current_irql} (ObUnRegisterCallbacks requires PASSIVE_LEVEL)"
+            );
+            return;
+        }
 
-    /// Consumes the manager guard and returns the raw kernel handle without unregistering.
-    pub fn into_raw(mut self) -> PVOID {
-        let handle = self.handle;
-        self.handle = ptr::null_mut();
-        core::mem::forget(self);
-        handle
-    }
-
-    /// Unregisters the callbacks from the kernel.
-    ///
-    /// This method can be invoked to disable callbacks on demand. Subsequent calls or
-    /// dropping the manager will safely perform no operation.
-    pub fn unregister(&mut self) {
-        if !self.handle.is_null() {
-            // SAFETY: ObUnRegisterCallbacks must be called at IRQL == PASSIVE_LEVEL with a valid handle.
-            // Nulling the handle immediately prevents accidental double unregistration.
+        let handle = self.handle.swap(ptr::null_mut(), Ordering::AcqRel);
+        if !handle.is_null() {
+            // SAFETY:
+            // Calling `ObUnRegisterCallbacks` is safe because the handle was verified to be non-null,
+            // was previously returned by a successful `ObRegisterCallbacks` call, and the processor
+            // is confirmed to execute at PASSIVE_LEVEL. Swapping the handle atomically with null prior
+            // to unregistration prevents race conditions and eliminates double-unregistration hazards.
             unsafe {
-                ObUnRegisterCallbacks(self.handle);
+                ObUnRegisterCallbacks(handle);
             }
-            self.handle = ptr::null_mut();
             crate::driver_info!("[callbacks::unregister] Callbacks unregistered successfully");
         }
-    }
-}
-
-impl Drop for CallbackManager {
-    fn drop(&mut self) {
-        self.unregister();
     }
 }

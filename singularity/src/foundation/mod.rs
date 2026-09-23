@@ -14,6 +14,7 @@
 //!   isolated foundational need.
 
 pub mod error;
+pub mod irql;
 pub mod log;
 pub mod raii;
 pub mod state;
@@ -21,6 +22,7 @@ pub mod string;
 
 // Re-export common foundation types for driver-wide convenience
 pub use error::{DeviceError, DriverError};
+pub use irql::{current_irql, ensure_max_irql};
 pub use raii::EprocessGuard;
 pub use state::DRIVER_STATE;
 pub use string::init_unicode_string;
