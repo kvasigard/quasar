@@ -1,6 +1,6 @@
 //! Singleton lifecycle manager for the shared memory ring buffer backing pool allocations.
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use wdk_sys::{
     DISPATCH_LEVEL, PVOID,
     ntddk::{ExAllocatePool2, ExFreePoolWithTag},
@@ -19,6 +19,8 @@ const STATUS_BUFFER_SIZE: u64 = 4 * 1024;
 pub struct RingBufferManager {
     data_buffer: AtomicPtr<core::ffi::c_void>,
     status_page: AtomicPtr<core::ffi::c_void>,
+    write_head: AtomicU64,
+    sequence: AtomicU64,
 }
 
 impl RingBufferManager {
@@ -27,6 +29,8 @@ impl RingBufferManager {
         Self {
             data_buffer: AtomicPtr::new(core::ptr::null_mut()),
             status_page: AtomicPtr::new(core::ptr::null_mut()),
+            write_head: AtomicU64::new(0),
+            sequence: AtomicU64::new(0),
         }
     }
 
@@ -150,6 +154,10 @@ impl RingBufferManager {
         self.status_page.load(Ordering::Acquire)
     }
 
+    pub fn push_event() {
+        todo!()
+    }
+
     /// Allocates a contiguous NonPaged pool buffer of the specified size.
     ///
     /// # Arguments
@@ -167,7 +175,6 @@ impl RingBufferManager {
             crate::driver_error!("[ring_buffer::memory] Invalid buffer size or pool tag parameter");
             return Err(RingBufferError::InvalidParameter);
         }
-
         let flags = wrappers::PoolFlag::NonPaged | wrappers::PoolFlag::Uninitialized;
 
         // SAFETY:

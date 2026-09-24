@@ -1,3 +1,5 @@
+//! Shared memory ring buffer transport primitives and wire formats.
+
 #[repr(C, align(8))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordHeader {
@@ -53,16 +55,6 @@ impl TryFrom<u16> for DriverEventType {
     }
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HandlePreOpEvent {
-    pub source_pid: u32,
-    pub target_pid: u32,
-    pub desired_access: u32,
-    pub operation: u8,
-    pub short_name: [u8; 16],
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,16 +79,5 @@ mod tests {
         assert_eq!(align_of::<ConsumerStatusPage>(), 8);
         assert_eq!(offset_of!(ConsumerStatusPage, user_tail), 0);
         assert_eq!(offset_of!(ConsumerStatusPage, dropped_events), 8);
-    }
-
-    #[test]
-    fn test_handle_pre_op_event_layout() {
-        assert_eq!(size_of::<HandlePreOpEvent>(), 32);
-        assert_eq!(align_of::<HandlePreOpEvent>(), 4);
-        assert_eq!(offset_of!(HandlePreOpEvent, source_pid), 0);
-        assert_eq!(offset_of!(HandlePreOpEvent, target_pid), 4);
-        assert_eq!(offset_of!(HandlePreOpEvent, desired_access), 8);
-        assert_eq!(offset_of!(HandlePreOpEvent, operation), 12);
-        assert_eq!(offset_of!(HandlePreOpEvent, short_name), 13);
     }
 }

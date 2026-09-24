@@ -1,13 +1,14 @@
 //! Callback routines invoked directly by the Windows Object Manager.
 
 use core::sync::atomic::{AtomicU32, Ordering};
+use shared::ring_buffer::HandlePreOpEvent;
 use wdk_sys::{
     _OB_PREOP_CALLBACK_STATUS, ACCESS_MASK, OB_OPERATION_HANDLE_CREATE,
     OB_OPERATION_HANDLE_DUPLICATE, PEPROCESS, PETHREAD, POB_PRE_OPERATION_INFORMATION, PVOID,
     PsProcessType, PsThreadType,
 };
 
-use crate::{driver_info, wrappers};
+use crate::wrappers;
 
 /// Bitwise gate flags for enabling or disabling individual callback hooks dynamically.
 pub const GATE_PROCESS_PROTECTION: u32 = 1 << 0;
@@ -63,18 +64,22 @@ pub unsafe extern "C" fn on_pre_process_operation(
     }
 
     // TODO: Expand this check to a list of processes to be monitored
-    if target_process.short_name().to_bytes_with_nul() == b"lsass.exe\0" {
-        let _desired_access: ACCESS_MASK = match op_info.Operation {
-            OB_OPERATION_HANDLE_CREATE => unsafe {
-                (*op_info.Parameters).CreateHandleInformation.DesiredAccess
-            },
-            OB_OPERATION_HANDLE_DUPLICATE => unsafe {
-                (*op_info.Parameters)
-                    .DuplicateHandleInformation
-                    .DesiredAccess
-            },
-            _ => return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS,
+    if target_process
+        .short_name()
+        .to_bytes()
+        .eq_ignore_ascii_case(b"lsass.exe")
+    {
+        let Some(desired_access) = extract_desired_access(op_info) else {
+            return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS;
         };
+
+        let _event = HandlePreOpEvent::new(
+            current_process.pid() as u32,
+            target_process.pid() as u32,
+            desired_access,
+            op_info.Operation as u8,
+            current_process.short_name().to_bytes(),
+        );
 
         // TODO:
         // The idea is to raise an alert if a process is trying to open a handle to LSASS process and send it to
@@ -83,4 +88,31 @@ pub unsafe extern "C" fn on_pre_process_operation(
     }
 
     _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS
+}
+
+/// Extracts the requested access mask from the pre-operation parameters based on the operation type.
+#[inline(always)]
+fn extract_desired_access(op_info: &wdk_sys::_OB_PRE_OPERATION_INFORMATION) -> Option<ACCESS_MASK> {
+    if op_info.Parameters.is_null() {
+        return None;
+    }
+
+    // SAFETY:
+    // The Windows Object Manager guarantees `op_info.Parameters` is a non-null, valid pointer
+    // for the synchronous duration of the pre-operation callback routine.
+    let access = unsafe {
+        match op_info.Operation {
+            OB_OPERATION_HANDLE_CREATE => {
+                (*op_info.Parameters).CreateHandleInformation.DesiredAccess
+            }
+            OB_OPERATION_HANDLE_DUPLICATE => {
+                (*op_info.Parameters)
+                    .DuplicateHandleInformation
+                    .DesiredAccess
+            }
+            _ => return None,
+        }
+    };
+
+    Some(access)
 }
