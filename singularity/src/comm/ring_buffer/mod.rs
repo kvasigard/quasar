@@ -33,3 +33,18 @@ pub fn initialize() -> Result<(), RingBufferError> {
 pub fn cleanup() {
     RING_BUFFER_MANAGER.cleanup();
 }
+
+/// Enqueues a driver telemetry event into the active shared memory ring buffer.
+///
+/// Operates with zero heap allocations and is safe to call from arbitrary IRQLs up to `DISPATCH_LEVEL`.
+///
+/// # Return values
+///
+/// * `Ok(())` - Event successfully written and committed.
+/// * `Err(RingBufferError::NotInitialized)` - Ring buffer is inactive.
+/// * `Err(RingBufferError::BufferFull)` - Ring buffer capacity exhausted; dropped counter incremented.
+/// * `Err(RingBufferError::InvalidParameter)` - Frame size exceeds buffer capacity.
+#[inline(always)]
+pub fn push_event(event: &impl shared::ring_buffer::DriverEvent) -> Result<(), RingBufferError> {
+    RING_BUFFER_MANAGER.push_event(event)
+}

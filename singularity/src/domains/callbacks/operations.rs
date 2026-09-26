@@ -101,7 +101,7 @@ impl OperationType {
 /// handles inside this routine to prevent infinite callback recursion. If `KernelHandle`
 /// is non-zero, the request originated from the kernel and should generally remain
 /// unrestricted to avoid system instability. Always return `OB_PREOP_SUCCESS`.
-pub type PreOperationCallbackFn = unsafe extern "C" fn(
+pub type PreOperationCallbackFn = unsafe extern "system" fn(
     registration_context: PVOID,
     operation_information: wdk_sys::POB_PRE_OPERATION_INFORMATION,
 ) -> wdk_sys::OB_PREOP_CALLBACK_STATUS;
@@ -114,7 +114,7 @@ pub type PreOperationCallbackFn = unsafe extern "C" fn(
 ///
 /// Always check the `ReturnStatus` field inside the operation information structure before
 /// inspecting granted access rights, as the handle creation may have failed.
-pub type PostOperationCallbackFn = unsafe extern "C" fn(
+pub type PostOperationCallbackFn = unsafe extern "system" fn(
     registration_context: PVOID,
     operation_information: wdk_sys::POB_POST_OPERATION_INFORMATION,
 );

@@ -8,6 +8,7 @@ use wdk_sys::{
     PsProcessType, PsThreadType,
 };
 
+use crate::comm::ring_buffer;
 use crate::wrappers;
 
 /// Bitwise gate flags for enabling or disabling individual callback hooks dynamically.
@@ -18,37 +19,45 @@ pub const GATE_THREAD_PROTECTION: u32 = 1 << 1;
 pub static CALLBACK_GATES: AtomicU32 =
     AtomicU32::new(GATE_PROCESS_PROTECTION | GATE_THREAD_PROTECTION);
 
-/// Pre-operation callback for process handle creation and duplication.
-pub unsafe extern "C" fn on_pre_process_operation(
+/// Pre-operation callback for process and thread handle creation and duplication.
+pub unsafe extern "system" fn on_pre_process_operation(
     _registration_context: PVOID,
     operation_information: POB_PRE_OPERATION_INFORMATION,
 ) -> wdk_sys::OB_PREOP_CALLBACK_STATUS {
-    // Dynamic gate: if feature is disabled, return immediately without altering access
-    if (CALLBACK_GATES.load(Ordering::Relaxed) & GATE_PROCESS_PROTECTION) == 0 {
-        return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS;
-    }
-
     if operation_information.is_null() {
         return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS;
     }
 
-    // SAFETY: operation_information is not null
-    let op_info = unsafe { &mut *operation_information };
+    // SAFETY: operation_information is verified non-null and remains valid
+    // for the synchronous execution of this pre-operation callback.
+    let op_info = unsafe { &*operation_information };
 
-    // Skip kernel-mode callers to prevent OS deadlocks
+    // Evaluate active gates based on the target object type (Process vs Thread)
+    let gate = CALLBACK_GATES.load(Ordering::Relaxed);
+    let is_process = unsafe { op_info.ObjectType == *PsProcessType };
+    let is_thread = unsafe { op_info.ObjectType == *PsThreadType };
+
+    if (is_process && (gate & GATE_PROCESS_PROTECTION) == 0)
+        || (is_thread && (gate & GATE_THREAD_PROTECTION) == 0)
+        || (!is_process && !is_thread)
+    {
+        return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS;
+    }
+
+    // Skip kernel-mode callers to prevent OS deadlocks and avoid high-volume internal handle noise
     let is_kernel_handle = unsafe { op_info.__bindgen_anon_1.__bindgen_anon_1.KernelHandle() != 0 };
     if is_kernel_handle {
         return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS;
     }
 
     let target_process_raw: PEPROCESS = unsafe {
-        match op_info.ObjectType {
-            obj if obj == *PsProcessType => op_info.Object as PEPROCESS,
-            obj if obj == *PsThreadType => {
-                // Target is an ETHREAD, resolve to parent process
-                wdk_sys::ntddk::PsGetThreadProcess(op_info.Object as PETHREAD)
-            }
-            _ => return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS,
+        if is_process {
+            op_info.Object as PEPROCESS
+        } else if is_thread {
+            // Target is an ETHREAD, resolve to parent process
+            wdk_sys::ntddk::PsGetThreadProcess(op_info.Object as PETHREAD)
+        } else {
+            return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS;
         }
     };
 
@@ -63,7 +72,12 @@ pub unsafe extern "C" fn on_pre_process_operation(
         return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS;
     }
 
-    // TODO: Expand this check to a list of processes to be monitored
+    // TODO: Replace short_name() string comparison with dynamic LSASS PID matching.
+    // EPROCESS.ImageFileName (short_name) is truncated to 15 bytes and vulnerable to name spoofing
+    // by arbitrary user-mode executables named lsass.exe. Instead, cache the authentic system
+    // LSASS PID during early driver initialization / PsSetCreateProcessNotifyRoutineEx and verify
+    // target_process.pid() == cached_lsass_pid. In the future, this will also integrate with Rhai
+    // scripting for dynamic rule-based whitelisting and alert filtering.
     if target_process
         .short_name()
         .to_bytes()
@@ -73,7 +87,7 @@ pub unsafe extern "C" fn on_pre_process_operation(
             return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS;
         };
 
-        let _event = HandlePreOpEvent::new(
+        let event = HandlePreOpEvent::new(
             current_process.pid() as u32,
             target_process.pid() as u32,
             desired_access,
@@ -81,16 +95,20 @@ pub unsafe extern "C" fn on_pre_process_operation(
             current_process.short_name().to_bytes(),
         );
 
-        // TODO:
-        // The idea is to raise an alert if a process is trying to open a handle to LSASS process and send it to
-        // the usermode process. How is yet to be defined. In the future we might want to use rhai to perform
-        // filtering on FP and whitelisting. The alert shall be sent only once per process.
+        if let Err(error) = ring_buffer::push_event(&event) {
+            crate::driver_debug!(
+                "[callback::handlers] Failed to enqueue HandlePreOpEvent: {error}"
+            );
+        }
     }
 
     _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS
 }
 
 /// Extracts the requested access mask from the pre-operation parameters based on the operation type.
+///
+/// Uses `OriginalDesiredAccess` rather than `DesiredAccess` so telemetry captures the raw permissions
+/// requested by the calling process even if higher-altitude filters have already modified `DesiredAccess`.
 #[inline(always)]
 fn extract_desired_access(op_info: &wdk_sys::_OB_PRE_OPERATION_INFORMATION) -> Option<ACCESS_MASK> {
     if op_info.Parameters.is_null() {
@@ -103,12 +121,14 @@ fn extract_desired_access(op_info: &wdk_sys::_OB_PRE_OPERATION_INFORMATION) -> O
     let access = unsafe {
         match op_info.Operation {
             OB_OPERATION_HANDLE_CREATE => {
-                (*op_info.Parameters).CreateHandleInformation.DesiredAccess
+                (*op_info.Parameters)
+                    .CreateHandleInformation
+                    .OriginalDesiredAccess
             }
             OB_OPERATION_HANDLE_DUPLICATE => {
                 (*op_info.Parameters)
                     .DuplicateHandleInformation
-                    .DesiredAccess
+                    .OriginalDesiredAccess
             }
             _ => return None,
         }

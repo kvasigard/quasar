@@ -7,6 +7,9 @@ use wdk_sys::{
 };
 
 use crate::{comm::ring_buffer::error::RingBufferError, foundation::ensure_max_irql, wrappers};
+use shared::ring_buffer::{ConsumerStatusPage, DriverEvent};
+
+use super::queue::{RingQueue, calculate_event_size};
 
 /// 4-byte pool tag identifier for ring buffer memory allocations ('QSAR').
 const POOL_TAG: u32 = u32::from_ne_bytes(*b"QSAR");
@@ -21,7 +24,14 @@ pub struct RingBufferManager {
     status_page: AtomicPtr<core::ffi::c_void>,
     write_head: AtomicU64,
     sequence: AtomicU64,
+    active_writers: AtomicU64,
 }
+
+// SAFETY: All pointer accesses, state transitions, and memory reclamation lifecycles
+// are synchronized through atomic operations, release/acquire memory orderings,
+// and active-writer rundown draining.
+unsafe impl Send for RingBufferManager {}
+unsafe impl Sync for RingBufferManager {}
 
 impl RingBufferManager {
     /// Creates a new uninitialized `RingBufferManager` instance.
@@ -31,6 +41,7 @@ impl RingBufferManager {
             status_page: AtomicPtr::new(core::ptr::null_mut()),
             write_head: AtomicU64::new(0),
             sequence: AtomicU64::new(0),
+            active_writers: AtomicU64::new(0),
         }
     }
 
@@ -41,7 +52,7 @@ impl RingBufferManager {
     /// `true` if the backing memory buffers are currently allocated, `false` otherwise.
     #[inline(always)]
     pub fn is_active(&self) -> bool {
-        !self.data_buffer.load(Ordering::Relaxed).is_null()
+        !self.data_buffer.load(Ordering::Acquire).is_null()
     }
 
     /// Allocates NonPaged pool memory regions for the telemetry ring buffer.
@@ -58,28 +69,32 @@ impl RingBufferManager {
     /// * `Err(RingBufferError::InvalidParameter)` - Size or pool tag is invalid (e.g. zero).
     /// * `Err(RingBufferError::PoolAllocationFailed)` - System memory pool exhaustion.
     pub fn initialize(&self) -> Result<(), RingBufferError> {
-        if self.is_active() {
-            crate::driver_warn!("[ring_buffer::initialize] Ring buffer is already initialized");
-            return Err(RingBufferError::AlreadyInitialized);
-        }
-
         // NonPaged pool allocation is only permitted at or below DISPATCH_LEVEL.
         if let Err(current_irql) = ensure_max_irql(DISPATCH_LEVEL as u8) {
-            crate::driver_error!(
-                "[ring_buffer::initialize] Invalid IRQL {current_irql} (must be <= DISPATCH_LEVEL)"
-            );
+            crate::driver_error!("[ring_buffer::initialize] Invalid IRQL {current_irql}");
             return Err(RingBufferError::InvalidIrql {
                 current: current_irql,
                 max: DISPATCH_LEVEL as u8,
             });
         }
 
+        if self.is_active() {
+            crate::driver_warn!("[ring_buffer::initialize] Ring buffer is already initialized");
+            return Err(RingBufferError::AlreadyInitialized);
+        }
+
         let data_buffer = Self::allocate_pool(DATA_BUFFER_SIZE)?;
         let status_page = match Self::allocate_pool(STATUS_BUFFER_SIZE) {
-            Ok(ptr) => ptr,
+            Ok(ptr) => {
+                // Zero-fill status page immediately to prevent kernel memory disclosure
+                // and ensure initial atomic loads (e.g. user_tail) read 0.
+                unsafe {
+                    core::ptr::write_bytes(ptr as *mut u8, 0, STATUS_BUFFER_SIZE as usize);
+                }
+                ptr
+            }
             Err(err) => {
-                // SAFETY:
-                // `data_buffer` was successfully allocated from NonPaged pool with `POOL_TAG`
+                // SAFETY:`data_buffer` was successfully allocated from NonPaged pool with `POOL_TAG`
                 // and has not yet been exposed to any other subsystem, making immediate deallocation safe.
                 unsafe {
                     ExFreePoolWithTag(data_buffer, POOL_TAG);
@@ -88,7 +103,28 @@ impl RingBufferManager {
             }
         };
 
-        self.data_buffer.store(data_buffer, Ordering::Release);
+        // Atomically claim initialization state. If another thread won the initialization race,
+        // free newly allocated buffers to prevent pool leaks and fail-fast.
+        if self
+            .data_buffer
+            .compare_exchange(
+                core::ptr::null_mut(),
+                data_buffer,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            unsafe {
+                ExFreePoolWithTag(status_page, POOL_TAG);
+                ExFreePoolWithTag(data_buffer, POOL_TAG);
+            }
+            return Err(RingBufferError::AlreadyInitialized);
+        }
+
+        // Reset monotonic counters strictly on initialization
+        self.write_head.store(0, Ordering::Relaxed);
+        self.sequence.store(0, Ordering::Relaxed);
         self.status_page.store(status_page, Ordering::Release);
 
         crate::driver_info!(
@@ -99,9 +135,8 @@ impl RingBufferManager {
 
     /// Releases all owned kernel pool allocations and nulls the internal pointers.
     ///
-    /// Atomically swaps the active buffer pointers with null, ensuring complete idempotency
-    /// against duplicate or concurrent teardown invocations. Verifies that the execution context
-    /// satisfies `IRQL <= DISPATCH_LEVEL` as mandated by `ExFreePoolWithTag`.
+    /// Atomically swaps the active buffer pointers with null so new callers fail-fast, drains
+    /// all in-flight `push_event` invocations via `active_writers`, and frees pool memory.
     pub fn cleanup(&self) {
         if let Err(current_irql) = ensure_max_irql(DISPATCH_LEVEL as u8) {
             crate::driver_error!(
@@ -110,6 +145,7 @@ impl RingBufferManager {
             return;
         }
 
+        // Atomically swap buffer pointers to null so new callers fail-fast with NotInitialized
         let data_buffer = self
             .data_buffer
             .swap(core::ptr::null_mut(), Ordering::AcqRel);
@@ -117,11 +153,20 @@ impl RingBufferManager {
             .status_page
             .swap(core::ptr::null_mut(), Ordering::AcqRel);
 
+        if data_buffer.is_null() && status_page.is_null() {
+            return;
+        }
+
+        // Wait for all in-flight push_event calls to finish before freeing pool memory
+        while self.active_writers.load(Ordering::Acquire) > 0 {
+            core::hint::spin_loop();
+        }
+
         if !data_buffer.is_null() {
             // SAFETY:
             // The data buffer pointer was allocated from NonPaged pool with POOL_TAG and is
-            // guaranteed to be valid and safe to free at <= DISPATCH_LEVEL. Swapping the pointer
-            // atomically with null prior to deallocation eliminates dangling references and double-free hazards.
+            // guaranteed to be valid and safe to free at <= DISPATCH_LEVEL. All in-flight writers
+            // have drained, eliminating use-after-free hazards.
             unsafe {
                 ExFreePoolWithTag(data_buffer, POOL_TAG);
             }
@@ -130,16 +175,14 @@ impl RingBufferManager {
         if !status_page.is_null() {
             // SAFETY:
             // The status page pointer was allocated from NonPaged pool with POOL_TAG and is
-            // guaranteed to be valid and safe to free at <= DISPATCH_LEVEL. Swapping the pointer
-            // atomically with null prior to deallocation eliminates dangling references and double-free hazards.
+            // guaranteed to be valid and safe to free at <= DISPATCH_LEVEL. All in-flight writers
+            // have drained, eliminating use-after-free hazards.
             unsafe {
                 ExFreePoolWithTag(status_page, POOL_TAG);
             }
         }
 
-        if !data_buffer.is_null() || !status_page.is_null() {
-            crate::driver_info!("[ring_buffer::cleanup] Ring buffer memory released successfully");
-        }
+        crate::driver_info!("[ring_buffer::cleanup] Ring buffer memory released successfully");
     }
 
     /// Returns the raw pointer to the NonPaged telemetry data buffer.
@@ -154,8 +197,53 @@ impl RingBufferManager {
         self.status_page.load(Ordering::Acquire)
     }
 
-    pub fn push_event() {
-        todo!()
+    /// Internal helper borrowing an ephemeral RingQueue view over self.
+    #[inline(always)]
+    fn queue_view(&self) -> Result<RingQueue<'_>, RingBufferError> {
+        let data = self.data_buffer();
+        let status = self.status_page();
+        if data.is_null() || status.is_null() {
+            return Err(RingBufferError::NotInitialized);
+        }
+
+        // SAFETY: `status` is non-null, 8-byte aligned, and points to a 4 KB NonPaged buffer
+        // containing `ConsumerStatusPage` with atomic fields.
+        let status_ref = unsafe { &*(status as *const ConsumerStatusPage) };
+
+        Ok(RingQueue {
+            data_buffer: data as *mut u8,
+            capacity: DATA_BUFFER_SIZE as usize,
+            status_page: status_ref,
+            write_head: &self.write_head,
+            sequence: &self.sequence,
+        })
+    }
+
+    /// Enqueues a driver telemetry event into the shared memory ring buffer.
+    ///
+    /// Computes the aligned frame size, reserves an exclusive slot via lock-free CAS,
+    /// and commits the event payload into memory. Operates with zero heap allocations
+    /// and is safe to call from arbitrary IRQLs up to `DISPATCH_LEVEL`.
+    pub fn push_event(&self, event: &impl DriverEvent) -> Result<(), RingBufferError> {
+        // Track active writers so cleanup() never frees pool memory underneath an in-flight push
+        self.active_writers.fetch_add(1, Ordering::AcqRel);
+
+        let result = (|| {
+            let queue = self.queue_view()?;
+            let total_size = calculate_event_size(event)?;
+            let slot = queue.reserve_slot(total_size)?;
+
+            // SAFETY: `slot` was exclusively reserved from `queue` with `slot.total_size` bytes.
+            // The slot range is guaranteed non-overlapping and strictly within buffer capacity.
+            unsafe {
+                queue.commit_event(slot, event);
+            }
+
+            Ok(())
+        })();
+
+        self.active_writers.fetch_sub(1, Ordering::Release);
+        result
     }
 
     /// Allocates a contiguous NonPaged pool buffer of the specified size.

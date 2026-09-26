@@ -11,6 +11,12 @@ pub enum RingBufferError {
     /// Ring buffer is already initialized and active.
     AlreadyInitialized,
 
+    /// Ring buffer is not initialized or currently inactive.
+    NotInitialized,
+
+    /// Ring buffer is full; unconsumed records exceed buffer capacity.
+    BufferFull,
+
     /// Execution occurred at an invalid IRQL level for pool allocation.
     InvalidIrql { current: u8, max: u8 },
 
@@ -26,6 +32,8 @@ impl RingBufferError {
     pub const fn to_ntstatus(&self) -> NTSTATUS {
         match self {
             Self::AlreadyInitialized => STATUS_ALREADY_INITIALIZED,
+            Self::NotInitialized => STATUS_UNSUCCESSFUL,
+            Self::BufferFull => STATUS_INSUFFICIENT_RESOURCES,
             Self::InvalidIrql { .. } => STATUS_UNSUCCESSFUL,
             Self::InvalidParameter => STATUS_INVALID_PARAMETER,
             Self::PoolAllocationFailed => STATUS_INSUFFICIENT_RESOURCES,
@@ -37,11 +45,20 @@ impl core::fmt::Display for RingBufferError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::AlreadyInitialized => write!(f, "Ring buffer is already initialized"),
+            Self::NotInitialized => write!(f, "Ring buffer is not initialized or inactive"),
+            Self::BufferFull => write!(f, "Ring buffer is full (event dropped)"),
             Self::InvalidIrql { current, max } => {
-                write!(f, "Invalid IRQL for allocation: {current} (max allowed: {max})")
+                write!(
+                    f,
+                    "Invalid IRQL for allocation: {current} (max allowed: {max})"
+                )
             }
-            Self::InvalidParameter => write!(f, "Invalid parameter supplied for ring buffer allocation"),
-            Self::PoolAllocationFailed => write!(f, "ExAllocatePool2 failed due to insufficient resources"),
+            Self::InvalidParameter => {
+                write!(f, "Invalid parameter supplied for ring buffer allocation")
+            }
+            Self::PoolAllocationFailed => {
+                write!(f, "ExAllocatePool2 failed due to insufficient resources")
+            }
         }
     }
 }

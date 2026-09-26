@@ -1,14 +1,19 @@
 //! Shared memory ring buffer transport primitives and wire formats.
 
+use core::sync::atomic::{AtomicU16, AtomicU64};
+
+/// 32-bit magic framing signature for telemetry records ('QSAR').
+pub const RECORD_MAGIC: u32 = 0x5153_4152;
+
 #[repr(C, align(8))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct RecordHeader {
     pub magic: u32,      // 0x5153_4152 ('QSAR')
     pub total_size: u32, // Header + trailing payload length (aligned to 8 bytes)
     pub sequence: u64,   // Monotonic sequence number
     pub timestamp: i64,  // QPC timestamp
     pub event_type: u16, // DriverEventType
-    pub status: u16,     // RecordStatus (AtomicU16 transition)
+    pub status: AtomicU16, // RecordStatus transition (Reserved -> Committed/Wrap)
     pub _reserved: u32,
 }
 
@@ -20,11 +25,25 @@ pub enum RecordStatus {
     Wrap = 2,      // Sentinel indicating end of buffer; consumer must wrap to offset 0
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Dedicated 4 KB status page shared between kernel driver and user mode for zero-syscall synchronization.
+///
+/// Both fields use [`AtomicU64`] to guarantee safe concurrent reads and stores across privilege
+/// boundaries without acquiring kernel locks or issuing system calls.
+#[repr(C, align(8))]
 pub struct ConsumerStatusPage {
-    pub user_tail: u64,      // Monotonic byte offset consumed by user mode
-    pub dropped_events: u64, // Total dropped events due to buffer full
+    /// Monotonic byte offset consumed and retired by the user-mode pipeline.
+    pub user_tail: AtomicU64,
+    /// Total cumulative events dropped due to buffer capacity exhaustion.
+    pub dropped_events: AtomicU64,
+}
+
+impl Default for ConsumerStatusPage {
+    fn default() -> Self {
+        Self {
+            user_tail: AtomicU64::new(0),
+            dropped_events: AtomicU64::new(0),
+        }
+    }
 }
 
 impl TryFrom<u16> for RecordStatus {
