@@ -1,7 +1,7 @@
-//! Domain event payloads for shared memory ring buffer telemetry.
+//! Telemetry payload definitions for process and thread handle operations.
 
-use super::contract::TemplateEvent;
-use super::types::DriverEventType;
+use crate::ring_buffer::contract::TemplateEvent;
+use crate::ring_buffer::types::DriverEventType;
 
 /// Telemetry payload emitted prior to a process or thread handle creation or duplication operation.
 ///
@@ -35,6 +35,10 @@ impl HandlePreOpEvent {
     /// * `desired_access` - Mask of requested access rights.
     /// * `operation` - Handle operation type (`1` = Create, `2` = Duplicate).
     /// * `source_short_name` - Truncated short image name of the source process.
+    ///
+    /// # Return values
+    ///
+    /// * `HandlePreOpEvent` - The newly constructed event payload.
     pub fn new(
         source_pid: u32,
         target_pid: u32,
@@ -63,7 +67,7 @@ impl TemplateEvent for HandlePreOpEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::contract::DriverEvent;
+    use crate::ring_buffer::contract::DriverEvent;
     use core::mem::{align_of, offset_of, size_of};
 
     #[test]

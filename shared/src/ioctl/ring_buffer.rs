@@ -1,48 +1,73 @@
-//! Shared memory ring buffer initialization IOCTL definitions and payload structures.
+//! Per-CPU shared memory ring buffer IOCTL definitions and message contracts.
+//!
+//! Provides the control codes and payload structures required to:
+//! 1. Project the contiguous per-CPU shared data and status memory pools into user space.
+//! 2. Register a user-mode Win32 notification event with the kernel.
 
 use crate::ctl_code;
 use super::{IoctlMessage, FILE_ANY_ACCESS, METHOD_BUFFERED, SINGULARITY_DEVICE_TYPE};
 
-/// Custom Function Code for ring buffer initialization (>= 2048 / 0x800).
-pub const FUNCTION_INIT_RING: u32 = 0x802;
+/// Custom Function Code for per-CPU ring buffer memory mapping (>= 2048 / 0x800).
+pub const FUNCTION_MAP_PER_CPU_BUFFER: u32 = 0x802;
 
-/// IOCTL control code instructing the driver to initialize the shared memory ring buffer.
-pub const IOCTL_INIT_RING_BUFFER: u32 = ctl_code!(
+/// Custom Function Code for registering a user-mode Win32 notification event handle.
+pub const FUNCTION_REGISTER_EVENT: u32 = 0x803;
+
+/// IOCTL control code instructing the driver to project per-CPU buffers into the calling process.
+pub const IOCTL_MAP_PER_CPU_BUFFER: u32 = ctl_code!(
     SINGULARITY_DEVICE_TYPE,
-    FUNCTION_INIT_RING,
+    FUNCTION_MAP_PER_CPU_BUFFER,
     METHOD_BUFFERED,
     FILE_ANY_ACCESS
 );
 
-/// Request payload to initialize the shared memory ring buffer.
+/// IOCTL control code instructing the driver to register a Win32 event for kernel notification.
+pub const IOCTL_REGISTER_EVENT: u32 = ctl_code!(
+    SINGULARITY_DEVICE_TYPE,
+    FUNCTION_REGISTER_EVENT,
+    METHOD_BUFFERED,
+    FILE_ANY_ACCESS
+);
+
+/// Request payload to map the per-CPU shared ring buffers.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MapPerCpuBuffer;
+
+/// Response payload containing mapped user-mode virtual addresses and per-CPU geometry.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InitRingBuffer {
-    /// User-mode Win32 Event handle (passed as u64 for 64-bit ABI stability).
+pub struct PerCpuMapResponse {
+    /// Base address of the contiguous data buffer mapped into user space (Read-Only).
+    pub data_address: u64,
+    /// Base address of the contiguous status buffer mapped into user space (Read-Write).
+    pub status_address: u64,
+    /// Number of active logical CPU cores allocated.
+    pub cpu_count: u32,
+    /// Size in bytes of each core's data section partition.
+    pub per_cpu_data_size: u32,
+    /// Size in bytes of each core's status header structure (including 64-byte padding).
+    pub per_cpu_status_size: u32,
+    /// Explicit padding to ensure 8-byte alignment of the response payload.
+    pub _reserved: u32,
+}
+
+/// Request structure sent by user-mode to register a notification event handle.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisterEventRequest {
+    /// Win32 Event handle (passed as u64 for 64-bit ABI stability across architectures).
     pub event_handle: u64,
 }
 
-/// Response payload containing mapped user-mode virtual addresses and capacities.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InitRingBufferResponse {
-    /// User-mode mapped base address of the 4 MB data buffer (PAGE_READONLY).
-    pub data_buffer_ptr: u64,
-    /// Size of the data buffer in bytes.
-    pub data_buffer_size: u32,
-    /// Explicit padding to align status_page_ptr to 8 bytes.
-    pub _reserved1: u32,
-    /// User-mode mapped base address of the 4 KB consumer status page (PAGE_READWRITE).
-    pub status_page_ptr: u64,
-    /// Size of the status page in bytes.
-    pub status_page_size: u32,
-    /// Explicit tail padding to align struct size to 8 bytes.
-    pub _reserved2: u32,
+impl IoctlMessage for MapPerCpuBuffer {
+    const CODE: u32 = IOCTL_MAP_PER_CPU_BUFFER;
+    type Response = PerCpuMapResponse;
 }
 
-impl IoctlMessage for InitRingBuffer {
-    const CODE: u32 = IOCTL_INIT_RING_BUFFER;
-    type Response = InitRingBufferResponse;
+impl IoctlMessage for RegisterEventRequest {
+    const CODE: u32 = IOCTL_REGISTER_EVENT;
+    type Response = ();
 }
 
 #[cfg(test)]
@@ -51,21 +76,21 @@ mod tests {
     use core::mem::{align_of, offset_of, size_of};
 
     #[test]
-    fn test_init_ring_buffer_layout() {
-        assert_eq!(size_of::<InitRingBuffer>(), 8);
-        assert_eq!(align_of::<InitRingBuffer>(), 8);
-        assert_eq!(offset_of!(InitRingBuffer, event_handle), 0);
+    fn test_per_cpu_map_response_layout() {
+        assert_eq!(size_of::<PerCpuMapResponse>(), 32);
+        assert_eq!(align_of::<PerCpuMapResponse>(), 8);
+        assert_eq!(offset_of!(PerCpuMapResponse, data_address), 0);
+        assert_eq!(offset_of!(PerCpuMapResponse, status_address), 8);
+        assert_eq!(offset_of!(PerCpuMapResponse, cpu_count), 16);
+        assert_eq!(offset_of!(PerCpuMapResponse, per_cpu_data_size), 20);
+        assert_eq!(offset_of!(PerCpuMapResponse, per_cpu_status_size), 24);
+        assert_eq!(offset_of!(PerCpuMapResponse, _reserved), 28);
     }
 
     #[test]
-    fn test_init_ring_buffer_response_layout() {
-        assert_eq!(size_of::<InitRingBufferResponse>(), 32);
-        assert_eq!(align_of::<InitRingBufferResponse>(), 8);
-        assert_eq!(offset_of!(InitRingBufferResponse, data_buffer_ptr), 0);
-        assert_eq!(offset_of!(InitRingBufferResponse, data_buffer_size), 8);
-        assert_eq!(offset_of!(InitRingBufferResponse, _reserved1), 12);
-        assert_eq!(offset_of!(InitRingBufferResponse, status_page_ptr), 16);
-        assert_eq!(offset_of!(InitRingBufferResponse, status_page_size), 24);
-        assert_eq!(offset_of!(InitRingBufferResponse, _reserved2), 28);
+    fn test_register_event_request_layout() {
+        assert_eq!(size_of::<RegisterEventRequest>(), 8);
+        assert_eq!(align_of::<RegisterEventRequest>(), 8);
+        assert_eq!(offset_of!(RegisterEventRequest, event_handle), 0);
     }
 }

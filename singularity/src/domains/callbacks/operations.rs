@@ -50,9 +50,13 @@ impl CallbackType {
     /// Resolves the raw pointer to the kernel exported object type.
     ///
     /// # Safety
+    /// Caller must only invoke this in an environment where NTOSKRNL object manager types
+    /// are initialized.
     ///
-    /// Kernel object types are global exports initialized by NTOSKRNL during startup.
-    pub unsafe fn as_raw_object_type(self) -> *mut POBJECT_TYPE {
+    /// # Return values
+    ///
+    /// * `*mut POBJECT_TYPE` - Pointer to the kernel-exported object type pointer.
+    pub(crate) unsafe fn as_raw_object_type(self) -> *mut POBJECT_TYPE {
         // SAFETY: The kernel initializes these globals before driver entry.
         unsafe {
             match self {
@@ -82,7 +86,13 @@ pub enum OperationType {
 
 impl OperationType {
     /// Returns the corresponding WDK bitmask value.
-    pub const fn to_raw(self) -> u32 {
+    ///
+    /// Maps the strongly-typed enum variant into `OB_OPERATION_HANDLE_*` constants.
+    ///
+    /// # Return values
+    ///
+    /// * `u32` - Raw Windows bitmask flags.
+    pub(crate) const fn to_raw(self) -> u32 {
         match self {
             Self::Create => OB_OPERATION_HANDLE_CREATE,
             Self::Duplicate => OB_OPERATION_HANDLE_DUPLICATE,
@@ -121,10 +131,10 @@ pub type PostOperationCallbackFn = unsafe extern "C" fn(
 
 /// Defines an individual object callback hook.
 pub struct Callback {
-    pub kind: CallbackType,
-    pub operation: OperationType,
-    pub pre_operation: Option<PreOperationCallbackFn>,
-    pub post_operation: Option<PostOperationCallbackFn>,
+    pub(crate) kind: CallbackType,
+    pub(crate) operation: OperationType,
+    pub(crate) pre_operation: Option<PreOperationCallbackFn>,
+    pub(crate) post_operation: Option<PostOperationCallbackFn>,
 }
 
 impl Callback {
@@ -132,6 +142,17 @@ impl Callback {
     ///
     /// At least one callback function should be provided. Supplying both allows synchronous
     /// access restriction before creation and telemetry logging after the handle is generated.
+    ///
+    /// # Arguments
+    ///
+    /// * `kind` - Target object type to monitor (e.g. process or thread).
+    /// * `operation` - Handle operations to intercept.
+    /// * `pre_operation` - Optional pre-operation inspection and access reduction routine.
+    /// * `post_operation` - Optional post-operation auditing and telemetry routine.
+    ///
+    /// # Return values
+    ///
+    /// * `Self` - Initialized callback configuration structure.
     pub const fn new(
         kind: CallbackType,
         operation: OperationType,

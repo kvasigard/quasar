@@ -25,6 +25,12 @@ pub struct CallbackManager {
     handle: AtomicPtr<core::ffi::c_void>,
 }
 
+impl Default for CallbackManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CallbackManager {
     /// Creates a new uninitialized `CallbackManager` instance.
     pub const fn new() -> Self {
@@ -47,6 +53,10 @@ impl CallbackManager {
     /// Configures the callback registration structures and submits them to `ObRegisterCallbacks`
     /// at `PASSIVE_LEVEL`. On success, stores the opaque kernel handle atomically.
     ///
+    /// # Safety
+    /// Caller must ensure `altitude` points to a valid null-terminated wide string (UTF-16) that
+    /// remains valid for the duration of this call.
+    ///
     /// # Arguments
     ///
     /// * `altitude` - Null-terminated wide string specifying the filter altitude.
@@ -60,7 +70,7 @@ impl CallbackManager {
     /// * `Err(CallbackError::MaxCapacityExceeded)` - Number of callbacks exceeds internal limit.
     /// * `Err(CallbackError::MissingRoutine)` - Callback defines neither pre- nor post-operation routine.
     /// * `Err(CallbackError)` - Kernel registration failure or access denial.
-    pub fn register(&self, altitude: *const u16, callbacks: &[Callback]) -> Result<(), CallbackError> {
+    pub unsafe fn register(&self, altitude: *const u16, callbacks: &[Callback]) -> Result<(), CallbackError> {
         if self.is_active() {
             crate::driver_warn!("[callbacks::register] Callbacks are already initialized");
             return Err(CallbackError::AlreadyInitialized);
@@ -121,7 +131,14 @@ impl CallbackManager {
         // Calling `ObRegisterCallbacks` is safe because the stack-allocated registration arrays
         // and unicode altitude string remain valid throughout the synchronous call duration, and
         // the Windows kernel copies all registration data into internal executive memory before returning.
+        crate::driver_debug!(
+            "[callbacks::register] Calling ObRegisterCallbacks with {} operation(s)...",
+            callbacks.len()
+        );
         let status = unsafe { ObRegisterCallbacks(&mut registration, &mut handle) };
+        crate::driver_debug!(
+            "[callbacks::register] ObRegisterCallbacks returned status: {status:#010X}"
+        );
         if !nt_success(status) {
             match status {
                 wdk_sys::STATUS_FLT_INSTANCE_ALTITUDE_COLLISION => {

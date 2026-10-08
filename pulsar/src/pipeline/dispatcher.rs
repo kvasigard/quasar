@@ -2,13 +2,16 @@
 //!
 //! This module provides the [`EventDispatcher`] background worker that reads raw ETW
 //! records from the ingestion channel, processes them through the [`Pipeline`](crate::pipeline::Pipeline)
-//! engine, and broadcasts assembled [`Event`] objects to all registered [`EventListener`] subscribers.
+//! engine, processes driver events from the kernel ring buffer, and broadcasts assembled [`Event`]
+//! objects to all registered [`EventListener`] subscribers.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use shared::ring_buffer::HandlePreOpEvent;
 
 use crate::model::events::{ProcessEvent, SyscallEvent};
 use crate::pipeline::engine::Pipeline;
@@ -17,7 +20,7 @@ use crate::sensors::etw::EventRecord;
 
 /// The event listener contract defining strongly-typed domain event callbacks.
 ///
-/// Implementors can override specific domain callbacks (e.g. `on_process`, `on_syscall`)
+/// Implementors can override specific domain callbacks (e.g. `on_process`, `on_syscall`, `on_handle_pre_op`)
 /// or override `on_event` to receive all telemetry events uniformly.
 pub trait EventListener: Send + Sync {
     /// Generic dispatch hook invoked for every domain event flowing through the pipeline.
@@ -32,6 +35,7 @@ pub trait EventListener: Send + Sync {
         match event {
             Event::Process(process_event) => self.on_process(process_event),
             Event::Syscall(syscall_event) => self.on_syscall(syscall_event),
+            Event::HandlePreOp(handle_event) => self.on_handle_pre_op(handle_event),
         }
     }
 
@@ -48,33 +52,48 @@ pub trait EventListener: Send + Sync {
     ///
     /// * `_event` - The [`SyscallEvent`] details.
     fn on_syscall(&self, _event: &SyscallEvent) {}
+
+    /// Called when a kernel handle pre-operation event occurs.
+    ///
+    /// # Arguments
+    ///
+    /// * `_event` - The [`HandlePreOpEvent`] details.
+    fn on_handle_pre_op(&self, _event: &HandlePreOpEvent) {}
 }
 
 /// Central event dispatcher distributing ingested telemetry across registered analytics listeners.
 ///
-/// Consumes raw [`EventRecord`] items from a channel, passes them through the synchronous
-/// [`Pipeline`] engine to resolve stack walks, and broadcasts completed [`Event`] instances
-/// to all attached [`EventListener`] sinks.
+/// Consumes raw [`EventRecord`] items from an ETW channel, passes them through the synchronous
+/// [`Pipeline`] engine to resolve stack walks, drains driver events from the kernel ring buffer,
+/// and broadcasts completed [`Event`] instances to all attached [`EventListener`] sinks.
 pub struct EventDispatcher {
-    rx: Receiver<EventRecord>,
+    etw_rx: Receiver<EventRecord>,
+    driver_rx: Option<Receiver<Event>>,
     listeners: Vec<Box<dyn EventListener>>,
 }
 
 impl EventDispatcher {
-    /// Creates a new `EventDispatcher` consuming from the specified channel receiver.
+    /// Creates a new `EventDispatcher` consuming from the specified ETW channel receiver.
     ///
     /// # Arguments
     ///
-    /// * `rx` - Channel receiver yielding raw ETW records from sensors.
+    /// * `etw_rx` - Channel receiver yielding raw ETW records from sensors.
     ///
     /// # Returns
     ///
     /// An initialized [`EventDispatcher`] with no attached listeners.
-    pub fn new(rx: Receiver<EventRecord>) -> Self {
+    pub fn new(etw_rx: Receiver<EventRecord>) -> Self {
         Self {
-            rx,
+            etw_rx,
+            driver_rx: None,
             listeners: Vec::new(),
         }
+    }
+
+    /// Attaches an auxiliary receiver for events originating from the kernel driver ring buffer sensor.
+    pub fn with_driver_receiver(mut self, driver_rx: Receiver<Event>) -> Self {
+        self.driver_rx = Some(driver_rx);
+        self
     }
 
     /// Registers a new event listener sink to receive dispatched events.
@@ -86,7 +105,7 @@ impl EventDispatcher {
         self.listeners.push(listener);
     }
 
-    /// Launches the dispatch routing loop in a background worker thread.
+    /// Launches the dispatch routing loop in a named background worker thread.
     ///
     /// # Arguments
     ///
@@ -96,7 +115,10 @@ impl EventDispatcher {
     ///
     /// A `JoinHandle` for the spawned background worker thread.
     pub fn start(self, shutdown_flag: Arc<AtomicBool>) -> JoinHandle<()> {
-        thread::spawn(move || self.run(shutdown_flag))
+        thread::Builder::new()
+            .name("pulsar-dispatcher".to_string())
+            .spawn(move || self.run(shutdown_flag))
+            .expect("Failed to spawn pulsar-dispatcher thread")
     }
 
     /// Internal worker loop processing records and broadcasting events until shutdown.
@@ -105,7 +127,14 @@ impl EventDispatcher {
         let mut pipeline = Pipeline::new();
 
         while !shutdown_flag.load(Ordering::Relaxed) {
-            match self.rx.recv_timeout(Duration::from_millis(100)) {
+            // Drain any pending driver events
+            if let Some(ref driver_rx) = self.driver_rx {
+                while let Ok(event) = driver_rx.try_recv() {
+                    self.dispatch(&event);
+                }
+            }
+
+            match self.etw_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(record) => {
                     if let Some(event) = pipeline.feed(&record) {
                         self.dispatch(&event);
@@ -118,6 +147,13 @@ impl EventDispatcher {
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        // Final sweep of driver events upon termination
+        if let Some(ref driver_rx) = self.driver_rx {
+            while let Ok(event) = driver_rx.try_recv() {
+                self.dispatch(&event);
             }
         }
 
@@ -142,28 +178,50 @@ mod tests {
 
     struct MockListener {
         process_count: Arc<AtomicUsize>,
+        handle_count: Arc<AtomicUsize>,
     }
 
     impl EventListener for MockListener {
         fn on_process(&self, _event: &ProcessEvent) {
             self.process_count.fetch_add(1, Ordering::SeqCst);
         }
+
+        fn on_handle_pre_op(&self, _event: &HandlePreOpEvent) {
+            self.handle_count.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
-    fn create_dummy_process_record() -> EventRecord {
+    #[test]
+    fn test_dispatcher_worker_and_listener_invocation() {
+        let (tx, rx) = mpsc::channel();
+        let (driver_tx, driver_rx) = mpsc::channel();
+        let mut dispatcher = EventDispatcher::new(rx).with_driver_receiver(driver_rx);
+
+        let process_count = Arc::new(AtomicUsize::new(0));
+        let handle_count = Arc::new(AtomicUsize::new(0));
+
+        dispatcher.add_listener(Box::new(MockListener {
+            process_count: Arc::clone(&process_count),
+            handle_count: Arc::clone(&handle_count),
+        }));
+
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let handle = dispatcher.start(Arc::clone(&shutdown_flag));
+
+        // Send a mock process event through ETW
         let mut user_data = Vec::new();
         user_data.extend_from_slice(&(0xAAAA_BBBBusize).to_ne_bytes()); // UniqueProcessKey
-        user_data.extend_from_slice(&5555u32.to_ne_bytes());             // ProcessId
-        user_data.extend_from_slice(&4u32.to_ne_bytes());                // ParentId
-        user_data.extend_from_slice(&1u32.to_ne_bytes());                // SessionId
-        user_data.extend_from_slice(&0i32.to_ne_bytes());                // ExitStatus
-        user_data.extend_from_slice(&(0x200000usize).to_ne_bytes());     // DirectoryTableBase
+        user_data.extend_from_slice(&1234u32.to_ne_bytes());            // ProcessId
+        user_data.extend_from_slice(&4u32.to_ne_bytes());               // ParentId
+        user_data.extend_from_slice(&1u32.to_ne_bytes());               // SessionId
+        user_data.extend_from_slice(&0i32.to_ne_bytes());               // ExitStatus
+        user_data.extend_from_slice(&(0x200000usize).to_ne_bytes());    // DirectoryTableBase
         user_data.extend_from_slice(&[1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]); // SID S-1-5-18
         user_data.extend_from_slice(b"test.exe\0");
         let cmd: Vec<u8> = "test.exe\0".encode_utf16().flat_map(|u| u.to_ne_bytes()).collect();
         user_data.extend_from_slice(&cmd);
 
-        EventRecord {
+        let record = EventRecord {
             provider_id: GUID {
                 data1: 0x22fb2cd6,
                 data2: 0x0e7b,
@@ -174,38 +232,26 @@ mod tests {
             version: 2,
             opcode: 1, // Start
             level: 0,
-            process_id: 5555,
+            process_id: 1234,
             thread_id: 100,
-            timestamp: 50_000,
+            timestamp: 100_000,
             user_data,
             stack_trace: None,
-        }
-    }
+        };
 
-    /// Verifies that EventDispatcher properly feeds records through the pipeline and invokes listener callbacks.
-    #[test]
-    fn test_dispatcher_worker_and_listener_invocation() {
-        let (tx, rx) = mpsc::channel();
-        let mut dispatcher = EventDispatcher::new(rx);
+        tx.send(record).unwrap();
 
-        let process_count = Arc::new(AtomicUsize::new(0));
-        dispatcher.add_listener(Box::new(MockListener {
-            process_count: Arc::clone(&process_count),
-        }));
+        // Send a mock handle pre-op event through driver channel
+        let handle_event = HandlePreOpEvent::new(5000, 4, 0x1FFFFF, 1, b"malware.exe");
+        driver_tx.send(Event::HandlePreOp(handle_event)).unwrap();
 
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
-        let handle = dispatcher.start(Arc::clone(&shutdown_flag));
+        // Allow worker thread to drain
+        std::thread::sleep(Duration::from_millis(150));
 
-        // Send a record to the dispatcher
-        tx.send(create_dummy_process_record()).expect("Send must succeed");
-
-        // Wait briefly for worker to process
-        thread::sleep(Duration::from_millis(50));
-
-        // Signal shutdown
         shutdown_flag.store(true, Ordering::SeqCst);
-        handle.join().expect("Worker thread must terminate cleanly");
+        handle.join().unwrap();
 
         assert_eq!(process_count.load(Ordering::SeqCst), 1);
+        assert_eq!(handle_count.load(Ordering::SeqCst), 1);
     }
 }

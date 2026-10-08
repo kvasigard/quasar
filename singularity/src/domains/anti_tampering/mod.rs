@@ -1,7 +1,7 @@
 //! Anti-tampering and process protection domain.
 
-pub mod error;
-pub mod ppl;
+pub(crate) mod error;
+pub(crate) mod ppl;
 
-pub use error::AntiTamperingError;
-pub use ppl::change_process_ppl;
+pub(crate) use error::AntiTamperingError;
+pub(crate) use ppl::change_process_ppl;

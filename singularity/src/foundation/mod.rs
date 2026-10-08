@@ -13,16 +13,13 @@
 //! * **Single Responsibility**: Every file in this module must address a single,
 //!   isolated foundational need.
 
-pub mod error;
-pub mod irql;
-pub mod log;
-pub mod raii;
-pub mod state;
-pub mod string;
+pub(crate) mod error;
+pub(crate) mod irql;
+pub(crate) mod log;
+pub(crate) mod raii;
+pub(crate) mod state;
+pub(crate) mod string;
 
 // Re-export common foundation types for driver-wide convenience
-pub use error::{DeviceError, DriverError};
-pub use irql::{current_irql, ensure_max_irql};
-pub use raii::EprocessGuard;
-pub use state::DRIVER_STATE;
-pub use string::init_unicode_string;
+pub(crate) use irql::ensure_max_irql;
+pub(crate) use string::init_unicode_string;

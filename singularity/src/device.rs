@@ -1,7 +1,8 @@
 use wdk::nt_success;
 use wdk_sys::{
-    _WDF_IO_QUEUE_CONFIG, NTSTATUS, STATUS_INSUFFICIENT_RESOURCES, ULONG,
-    WDF_NO_OBJECT_ATTRIBUTES, WDFDEVICE, WDFDRIVER, WDFQUEUE, call_unsafe_wdf_function_binding,
+    _WDF_FILEOBJECT_CLASS, _WDF_FILEOBJECT_CONFIG, _WDF_IO_QUEUE_CONFIG, _WDF_TRI_STATE, NTSTATUS,
+    STATUS_INSUFFICIENT_RESOURCES, ULONG, WDF_NO_OBJECT_ATTRIBUTES, WDFDEVICE, WDFFILEOBJECT,
+    WDFDRIVER, WDFQUEUE, call_unsafe_wdf_function_binding,
 };
 
 use crate::foundation::init_unicode_string;
@@ -63,14 +64,42 @@ impl core::fmt::Display for DeviceError {
 
 impl core::error::Error for DeviceError {}
 
-/// Creates and initializes the Non-PnP Control Device.
+/// Callback invoked by KMDF when a user-mode process closes its handle or terminates.
+///
+/// # Critical Safety Rationale (Process CR3 Context)
+/// `EvtFileCleanup` executes while the processor is still running in the virtual memory context
+/// of the terminating user process (i.e. the CR3 page directory register still references
+/// the user process's page tables). This guarantees that [`MmUnmapLockedPages`] can safely walk
+/// and dismantle user-mode Page Table Entries (PTEs) without triggering bugchecks.
 ///
 /// # Arguments
-/// * `driver_handle` - The framework driver object created in DriverEntry.
+///
+/// * `_file_object` - Framework file object representing the open device instance being closed.
+unsafe extern "C" fn device_file_cleanup(_file_object: WDFFILEOBJECT) {
+    crate::driver_info!(
+        "[device::file_cleanup] User client handle closed or process terminated. Unmapping per-CPU ring buffers."
+    );
+    crate::comm::ring_buffer::teardown_user_mapping();
+}
+
+/// Creates and initializes the Non-PnP Control Device and sequential dispatch queue.
 ///
 /// # Safety
 /// The caller must ensure `driver_handle` is a valid, initialized WDFDRIVER object.
-pub unsafe fn create_control_device(driver_handle: WDFDRIVER) -> Result<(), DeviceError> {
+///
+/// # Arguments
+///
+/// * `driver_handle` - The framework driver object created in DriverEntry.
+///
+/// # Return values
+///
+/// * `Ok(())` - Control device, symbolic link, and default I/O queue initialized.
+/// * `Err(DeviceError::ControlDeviceInitAllocateFailed)` - WDF failed to allocate init block.
+/// * `Err(DeviceError::DeviceInitAssignNameFailed)` - Device object name assignment failed.
+/// * `Err(DeviceError::DeviceCreateFailed)` - WDF device object creation failed.
+/// * `Err(DeviceError::SymbolicLinkCreateFailed)` - DosDevices symlink creation failed.
+/// * `Err(DeviceError::QueueCreateFailed)` - Framework I/O queue creation failed.
+pub(crate) unsafe fn create_control_device(driver_handle: WDFDRIVER) -> Result<(), DeviceError> {
     // Construct the SDDL string to secure the control device (System and Administrators only).
     let sddl_buffer = windows_sys::w!("D:P(A;;GA;;;SY)(A;;GA;;;BA)");
     let sddl_string = unsafe { init_unicode_string(sddl_buffer) };
@@ -103,6 +132,25 @@ pub unsafe fn create_control_device(driver_handle: WDFDRIVER) -> Result<(), Devi
             call_unsafe_wdf_function_binding!(WdfDeviceInitFree, device_init);
         }
         return Err(DeviceError::DeviceInitAssignNameFailed(nt_status));
+    }
+
+    // Configure file tracking so EvtFileCleanup executes when user handle closes
+    let mut file_config = _WDF_FILEOBJECT_CONFIG {
+        Size: core::mem::size_of::<_WDF_FILEOBJECT_CONFIG>() as ULONG,
+        EvtFileCleanup: Some(device_file_cleanup),
+        EvtFileClose: None,
+        EvtDeviceFileCreate: None,
+        AutoForwardCleanupClose: _WDF_TRI_STATE::WdfFalse,
+        FileObjectClass: _WDF_FILEOBJECT_CLASS::WdfFileObjectWdfCannotUseFsContexts,
+    };
+
+    unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceInitSetFileObjectConfig,
+            device_init,
+            &raw mut file_config,
+            WDF_NO_OBJECT_ATTRIBUTES,
+        );
     }
 
     let mut device: WDFDEVICE = core::ptr::null_mut();

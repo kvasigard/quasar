@@ -84,16 +84,22 @@ pub enum PoolFlag {
 
 impl PoolFlag {
     /// Alias to `PoolFlag::UseQuota`, marking the start of required parameter flags.
-    #[allow(non_upper_case_globals)]
-    pub const RequiredStart: Self = Self::UseQuota;
+    #[allow(non_upper_case_globals, dead_code)]
+    pub(crate) const RequiredStart: Self = Self::UseQuota;
 
     /// Alias to `PoolFlag::SpecialPool`, marking the start of optional parameter flags.
-    #[allow(non_upper_case_globals)]
-    pub const OptionalStart: Self = Self::SpecialPool;
+    #[allow(non_upper_case_globals, dead_code)]
+    pub(crate) const OptionalStart: Self = Self::SpecialPool;
 
     /// Explicit conversion helper to `wdk_sys::ULONG64` (`u64`).
+    ///
+    /// Converts the enum discriminant to a raw 64-bit integer bitmask.
+    ///
+    /// # Return values
+    ///
+    /// * `ULONG64` - Raw numerical representation suitable for `ExAllocatePool2`.
     #[inline]
-    pub const fn to_ulong64(self) -> ULONG64 {
+    pub(crate) const fn to_ulong64(self) -> ULONG64 {
         self as ULONG64
     }
 }

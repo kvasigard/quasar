@@ -15,6 +15,7 @@ pub(crate) use crate::state::process_tree::ProcessTreeError;
 use crate::model::types::{ExitStatus, ProcessId};
 use crate::model::{ProcessKey, ProcessNode};
 
+#[allow(dead_code)]
 pub(crate) static STATE: LazyLock<SystemState> = LazyLock::new(SystemState::default);
 
 /// Returns a reference to the global `SystemState` singleton.
@@ -23,11 +24,13 @@ pub(crate) static STATE: LazyLock<SystemState> = LazyLock::new(SystemState::defa
 ///
 /// A static reference to the shared [`SystemState`].
 #[inline]
+#[allow(dead_code)]
 pub(crate) fn system_state() -> &'static SystemState {
     &STATE
 }
 
 /// Central state manager tracking processes and system context.
+#[allow(dead_code)]
 pub(crate) struct SystemState {
     process_tree: RwLock<ProcessTree>,
 }
@@ -38,6 +41,7 @@ impl Default for SystemState {
     }
 }
 
+#[allow(dead_code)]
 impl SystemState {
     /// Creates a new, empty `SystemState` instance.
     ///

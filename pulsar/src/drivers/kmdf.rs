@@ -131,4 +131,33 @@ impl Singularity {
 
         Ok(initialized_response)
     }
+
+    /// Maps the per-CPU shared ring buffers into this process's virtual address space.
+    ///
+    /// # Returns
+    ///
+    /// A [`shared::ioctl::PerCpuMapResponse`] containing base virtual addresses and layout descriptors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError`] if the IOCTL communication fails.
+    pub fn map_per_cpu_buffer(&self) -> Result<shared::ioctl::PerCpuMapResponse, DriverError> {
+        self.send(&shared::ioctl::MapPerCpuBuffer)
+    }
+
+    /// Registers a Win32 notification event handle with the Singularity driver.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_handle` - Raw Win32 event handle to signal when events are written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError`] if the driver fails to reference the event object.
+    pub fn register_event(&self, event_handle: HANDLE) -> Result<(), DriverError> {
+        self.send(&shared::ioctl::RegisterEventRequest {
+            event_handle: event_handle as usize as u64,
+        })
+    }
 }
+

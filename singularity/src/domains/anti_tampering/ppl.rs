@@ -12,6 +12,12 @@ use crate::foundation::raii::EprocessGuard;
 /// Resolves the EPROCESS Protection byte offset dynamically by checking the Windows kernel build number.
 ///
 /// Hardcoding a single offset corrupts adjacent kernel memory and triggers BSODs on differing Windows builds.
+///
+/// # Return values
+///
+/// * `Ok(usize)` - Verified byte offset of `PS_PROTECTION` inside `EPROCESS`.
+/// * `Err(AntiTamperingError::VersionDetectionFailed)` - `RtlGetVersion` call failed.
+/// * `Err(AntiTamperingError::UnsupportedWindowsBuild)` - Running on an untested or incompatible Windows kernel build.
 fn get_eprocess_protection_offset() -> Result<usize, AntiTamperingError> {
     let mut version_info: RTL_OSVERSIONINFOW = unsafe { core::mem::zeroed() };
     version_info.dwOSVersionInfoSize = core::mem::size_of::<RTL_OSVERSIONINFOW>() as u32;
@@ -47,19 +53,23 @@ fn get_eprocess_protection_offset() -> Result<usize, AntiTamperingError> {
 
 /// Changes the protection level byte of the specified process.
 ///
+/// Looks up the target `PEPROCESS` via `PsLookupProcessByProcessId`, computes the version-specific
+/// `PS_PROTECTION` offset, and applies the new protection byte atomically using volatile writes.
+///
 /// # Arguments
 ///
 /// * `pid` - The Process ID of the user-mode target to modify.
 /// * `level` - The raw protection byte value to apply (e.g., 0x31 for PPL-Antimalware).
 ///
-/// # Errors
+/// # Return values
 ///
-/// Returns [`AntiTamperingError`] if:
-/// * The PID is invalid (e.g., PID 0).
-/// * The protection level byte specifies an invalid `PS_PROTECTION.Type`.
-/// * The Windows build is unsupported.
-/// * The process lookup fails or returns a null pointer.
-pub fn change_process_ppl(pid: u32, level: u8) -> Result<(), AntiTamperingError> {
+/// * `Ok(())` - Process protection byte updated successfully.
+/// * `Err(AntiTamperingError::InvalidProcessId)` - Target PID is invalid (e.g. PID 0).
+/// * `Err(AntiTamperingError::InvalidProtectionLevel)` - Protection byte specifies invalid type.
+/// * `Err(AntiTamperingError::UnsupportedWindowsBuild)` - Kernel build unsupported.
+/// * `Err(AntiTamperingError::ProcessLookupFailed)` - `PsLookupProcessByProcessId` returned NT error.
+/// * `Err(AntiTamperingError::ProcessNotFound)` - Process lookup returned null.
+pub(crate) fn change_process_ppl(pid: u32, level: u8) -> Result<(), AntiTamperingError> {
     // Validate target PID (PID 0 is System Idle process)
     if pid == 0 {
         crate::driver_error!("[anti_tampering::ppl] Rejected modification for PID 0 (System Idle)");

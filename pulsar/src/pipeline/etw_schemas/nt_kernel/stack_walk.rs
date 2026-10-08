@@ -84,7 +84,7 @@ impl<'a> TryFrom<&'a [u8]> for StackWalk_TypeGroup1<'a> {
         let stack_thread = u32::from_ne_bytes(bytes[12..16].try_into().unwrap());
 
         let raw_frames = &bytes[HEADER_SIZE..];
-        if raw_frames.len() % PTR_SIZE != 0 {
+        if !raw_frames.len().is_multiple_of(PTR_SIZE) {
             return Err(DtoStackWalkError::UnalignedFrames(raw_frames.len()));
         }
 

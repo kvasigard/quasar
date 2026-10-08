@@ -8,7 +8,7 @@
 //! **Important Architectural Note:**
 //! This module acts strictly as the **control plane**. It should only issue commands to
 //! the kernel (e.g., sending AM-PPL signature updates via IOCTLs, or starting/stopping a service).
-//! It must *not* be used to read telemetry or handle event streams—those responsibilities
+//! It must *not* be used to read telemetry or handle event streams - those responsibilities
 //! belong to the `sensors` and `comm` modules.
 
 pub mod error;

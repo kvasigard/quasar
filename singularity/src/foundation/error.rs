@@ -5,15 +5,15 @@
 
 use wdk_sys::NTSTATUS;
 
-pub use crate::comm::ring_buffer::RingBufferError;
-pub use crate::device::DeviceError;
-pub use crate::domains::anti_tampering::AntiTamperingError;
-pub use crate::domains::callbacks::CallbackError;
-pub use crate::ioctl::IoctlError;
+pub(crate) use crate::comm::ring_buffer::RingBufferError;
+pub(crate) use crate::device::DeviceError;
+pub(crate) use crate::domains::anti_tampering::AntiTamperingError;
+pub(crate) use crate::domains::callbacks::CallbackError;
+pub(crate) use crate::ioctl::IoctlError;
 
 /// Unified driver error enum aggregating errors from all functional domains and lifecycle phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DriverError {
+pub(crate) enum DriverError {
     /// WDF driver object creation failed during initialization.
     WdfDriverCreate(NTSTATUS),
 

@@ -1,1 +1,1 @@
-pub mod ring_buffer;
+pub(crate) mod ring_buffer;

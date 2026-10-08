@@ -3,10 +3,10 @@
 //! Provides the entry point for user-mode requests, decodes payloads, and routes
 //! commands to the appropriate domain handlers.
 
-pub mod dispatch;
-pub mod handlers;
+pub(crate) mod dispatch;
+pub(crate) mod handlers;
 
-pub use dispatch::singularity_device_control;
+pub(crate) use dispatch::singularity_device_control;
 
 use wdk_sys::{NTSTATUS, STATUS_INVALID_DEVICE_REQUEST};
 

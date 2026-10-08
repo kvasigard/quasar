@@ -46,6 +46,7 @@ mod tests {
         assert_eq!(IOCTL_CHANGE_PPL_LEVEL, 0x80002004u32);
         let ring_code = ctl_code!(0x8000u32, 0x802u32, 0u32, 0u32);
         assert_eq!(ring_code, 0x80002008u32);
-        assert_eq!(IOCTL_INIT_RING_BUFFER, 0x80002008u32);
+        assert_eq!(IOCTL_MAP_PER_CPU_BUFFER, 0x80002008u32);
     }
 }
+

@@ -1,6 +1,8 @@
 //! Central IOCTL queue event callback and request completion router.
 
-use shared::ioctl::IOCTL_CHANGE_PPL_LEVEL;
+use shared::ioctl::{
+    IOCTL_CHANGE_PPL_LEVEL, IOCTL_MAP_PER_CPU_BUFFER, IOCTL_REGISTER_EVENT,
+};
 use wdk_sys::{call_unsafe_wdf_function_binding, NTSTATUS, STATUS_SUCCESS, WDFQUEUE__, WDFREQUEST__};
 
 use super::handlers;
@@ -11,7 +13,19 @@ use crate::foundation::error::DriverError;
 ///
 /// Dispatches the request to the appropriate handler, maps any resulting [`DriverError`]
 /// to an `NTSTATUS` code, and completes the `WDFREQUEST`.
-pub unsafe extern "C" fn singularity_device_control(
+///
+/// # Safety
+/// Invoked by KMDF as a framework queue callback. `request` must be a valid, uncompleted `WDFREQUEST`
+/// managed by the framework.
+///
+/// # Arguments
+///
+/// * `_queue` - Framework I/O queue handling the request.
+/// * `request` - Framework request object pointer.
+/// * `_output_buffer_length` - Declared length of the output buffer.
+/// * `_input_buffer_length` - Declared length of the input buffer.
+/// * `io_control_code` - 32-bit IOCTL control code determining the target operation.
+pub(crate) unsafe extern "C" fn singularity_device_control(
     _queue: *mut WDFQUEUE__,
     request: *mut WDFREQUEST__,
     _output_buffer_length: usize,
@@ -23,6 +37,8 @@ pub unsafe extern "C" fn singularity_device_control(
 
     let result: Result<usize, DriverError> = match io_control_code {
         IOCTL_CHANGE_PPL_LEVEL => unsafe { handlers::handle_change_ppl(request) },
+        IOCTL_MAP_PER_CPU_BUFFER => unsafe { handlers::handle_map_per_cpu_buffer(request) },
+        IOCTL_REGISTER_EVENT => unsafe { handlers::handle_register_event(request) },
         unknown => {
             crate::driver_warn!("[ioctl::dispatch] Unrecognized IOCTL: {unknown:#010X}");
             Err(DriverError::Ioctl(IoctlError::InvalidDeviceRequest(unknown)))
