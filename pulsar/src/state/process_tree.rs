@@ -38,6 +38,7 @@ pub enum ProcessTreeError {
 /// the currently active process instance for immediate $O(1)$ access and preserves
 /// terminated generations in chronological order for historical telemetry correlation.
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub(super) struct ProcessTimeline {
     /// The currently running process instance bound to this PID.
     pub(super) active: Option<ProcessNode>,
@@ -45,6 +46,7 @@ pub(super) struct ProcessTimeline {
     pub(super) history: Vec<ProcessNode>,
 }
 
+#[allow(dead_code)]
 impl ProcessTimeline {
     /// Resolves the process key whose lifetime covers the given timestamp.
     ///
@@ -57,10 +59,10 @@ impl ProcessTimeline {
     /// The [`ProcessKey`] of the active or historical process if found, or `None`.
     pub fn resolve_at_time(&self, timestamp: i64) -> Option<ProcessKey> {
         // Fast-path: Check if the active process was created prior to or at the event timestamp.
-        if let Some(ref active) = self.active {
-            if active.creation_timestamp() <= timestamp {
-                return Some(active.key());
-            }
+        if let Some(ref active) = self.active
+            && active.creation_timestamp() <= timestamp
+        {
+            return Some(active.key());
         }
 
         // Search history in reverse (most recent generations first)
@@ -109,10 +111,10 @@ impl ProcessTimeline {
     ///
     /// A mutable reference to the [`ProcessNode`] if present, or `None`.
     pub fn get_mut(&mut self, creation_timestamp: i64) -> Option<&mut ProcessNode> {
-        if let Some(ref mut active) = self.active {
-            if active.creation_timestamp() == creation_timestamp {
-                return Some(active);
-            }
+        if let Some(ref mut active) = self.active
+            && active.creation_timestamp() == creation_timestamp
+        {
+            return Some(active);
         }
 
         self.history
@@ -127,10 +129,12 @@ impl ProcessTimeline {
 /// This structure eliminates redundant secondary maps while facilitating $O(1)$ live-process
 /// lookups and temporal resolution for recycled PIDs.
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub(super) struct ProcessTree {
     pub(super) processes: HashMap<ProcessId, ProcessTimeline>,
 }
 
+#[allow(dead_code)]
 impl ProcessTree {
     /// Inserts a new process upon receiving a process start lifecycle event.
     ///
@@ -165,10 +169,10 @@ impl ProcessTree {
             process.parent = ParentProcess::Resolved(parent_key);
 
             // Link child into parent's children collection for O(1) subtree traversal
-            if let Some(parent_node) = self.get_mut(&parent_key) {
-                if !parent_node.children.contains(&child_key) {
-                    parent_node.children.push(child_key);
-                }
+            if let Some(parent_node) = self.get_mut(&parent_key)
+                && !parent_node.children.contains(&child_key)
+            {
+                parent_node.children.push(child_key);
             }
         }
 

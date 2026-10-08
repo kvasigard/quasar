@@ -6,3 +6,4 @@
 #![no_std]
 
 pub mod ioctl;
+pub mod ring_buffer;

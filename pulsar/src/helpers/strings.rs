@@ -34,7 +34,7 @@ pub fn parse_ansi_string(bytes: &[u8]) -> Result<(&str, usize), StringError> {
 /// # Returns
 /// A tuple of `(&[u16], usize)` containing the borrowed UTF-16 slice and total bytes consumed.
 pub fn parse_utf16_slice(bytes: &[u8]) -> Result<(&[u16], usize), StringError> {
-    let (aligned_bytes, padding) = if (bytes.as_ptr() as usize) % 2 != 0 {
+    let (aligned_bytes, padding) = if !(bytes.as_ptr() as usize).is_multiple_of(2) {
         if bytes.is_empty() {
             return Ok((&[], 0));
         }
@@ -148,9 +148,9 @@ mod tests {
         assert_eq!(consumed, 8);
 
         // Dynamically align padding byte so the slice passed to parse_utf16_slice has an odd pointer address
-        let mut raw_buf = vec![0x00u8; 32];
+        let mut raw_buf = [0x00u8; 32];
         let base_ptr = raw_buf.as_ptr() as usize;
-        let odd_offset = if base_ptr % 2 == 0 { 1 } else { 0 };
+        let odd_offset = if base_ptr.is_multiple_of(2) { 1 } else { 0 };
         // The byte at odd_offset is the padding byte; the aligned u16 payload starts at odd_offset + 1 (even address)
         raw_buf[odd_offset + 1..odd_offset + 1 + aligned_bytes.len()].copy_from_slice(aligned_bytes);
 

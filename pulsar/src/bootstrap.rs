@@ -92,7 +92,7 @@ impl BootstrapError {
 ///
 /// Returns a [`BootstrapError`] if non-elevated, if package files cannot be located,
 /// if driver loading fails, or if PPL elevation cannot be confirmed.
-pub fn initialize() -> Result<(), BootstrapError> {
+pub fn initialize() -> Result<kmdf::Singularity, BootstrapError> {
     log::debug!(target: "bootstrap", "Starting bootstrap sequence...");
 
     // Check if the program is running as administrator
@@ -155,8 +155,6 @@ pub fn initialize() -> Result<(), BootstrapError> {
     }
 
     log::debug!(target: "bootstrap", "Connecting to the Singularity driver...");
-    // kmdf_client goes out of scope here when this function returns, and its RAII
-    // Drop implementation will call CloseHandle(), detaching from the driver.
     let kmdf_client = kmdf::Singularity::connect().map_err(BootstrapError::PplElevation)?;
 
     log::debug!(target: "bootstrap", "Requesting PPL-Antimalware elevation from the driver...");
@@ -176,8 +174,9 @@ pub fn initialize() -> Result<(), BootstrapError> {
     }
 
     log::info!(target: "bootstrap", "Bootstrap successful. Running with PPL-Antimalware protection.");
-    Ok(())
+    Ok(kmdf_client)
 }
+
 
 /// Normalizes and cleans service binary paths by expanding system root macros and stripping prefixes.
 ///

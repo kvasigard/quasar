@@ -1,4 +1,7 @@
+pub mod handle;
 pub mod strings;
+
+pub use handle::SafeHandle;
 
 
 use windows_sys::core::GUID;

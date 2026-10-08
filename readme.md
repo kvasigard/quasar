@@ -6,26 +6,31 @@
 
 Quasar is designed as a multi-component workspace, split between user-mode analysis, kernel-mode visibility, and shared definitions:
 
-* **Pulsar (User-Mode):** This is the user-mode agent in charge of collecting system telemetry and routing it through an internal processing pipeline for real-time analysis. It manages data ingestion via "Sensors", dispatches the events across threads without blocking, and feeds them into analytical "Sinks" where the actual detection logic lives. It also orchestrates kernel-mode component lifecycles.
-* **Singularity (Kernel-Mode):** A Windows Kernel-Mode Driver Framework (KMDF) driver written purely in Rust. It serves as the privileged component of the EDR, providing deep system visibility, Direct Kernel Object Manipulation (DKOM) capabilities, and robust event tracing that is otherwise inaccessible from user-land.
-* **Shared:** A common `no_std` Rust crate used to bridge the gap between `pulsar` and `singularity`. It houses shared data structures, enum definitions, and IOCTL codes ensuring strict memory layout and communication consistency between user-mode and kernel-mode.
+* **Pulsar (User-Mode):** This is the user-mode agent in charge of collecting system telemetry and routing it through an internal processing pipeline for real-time analysis. It manages data ingestion via "Sensors" (ETW NT Kernel Logger and Singularity Per-CPU Ring Buffer), dispatches the events across threads without blocking, and feeds them into analytical "Sinks" (DirectSyscallSink, TamperDetectionSink) where the actual detection logic lives. It also orchestrates kernel-mode component lifecycles and self-elevation to PPL-Antimalware.
+* **Singularity (Kernel-Mode):** A Windows Kernel-Mode Driver Framework (KMDF) driver written purely in Rust. It serves as the privileged component of the EDR, providing deep system visibility, Object Manager pre-operation handle interception (`ObRegisterCallbacks`), Process Protection Level (PPL) modification, and lock-free Per-CPU shared memory ring buffer telemetry streaming (<500 ns latency).
+* **Shared:** A common `no_std` Rust crate bridging the gap between `pulsar` and `singularity`. It houses binary record layouts (`EventHeader`), domain event contracts (`TemplateEvent`, `DriverEvent`), modular event payloads (`shared::ring_buffer::events`), and IOCTL command definitions ensuring strict C-ABI stability and zero-copy synchronization.
 
 ## Project Structure
 ```text
 quasar/
-├── shared/                   # Common definitions between um and km (IOCTLs, Structs)
+├── shared/                   # Common definitions between um and km (IOCTLs, Structs, Contracts)
+│   └── src/
+│       ├── ioctl/            # IOCTL codes and parameter structures (PPL, RingBuffer)
+│       └── ring_buffer/      # Binary record headers, types, and modular domain events
+│           └── events/       # Domain event payloads (handle, etc.)
 ├── pulsar/                   # Core EDR Engine (User-Mode)
 │   └── src/
 │       ├── main.rs           # Modularized orchestration & CLI parsing
 │       ├── lib.rs            # Library core
 │       ├── error.rs          # Custom AppError implementation
-│       ├── comm/             # Inter-process communication and transport primitives
-│       ├── context/          # In-memory process graph and module mapping topology
+│       ├── bootstrap.rs      # PPL elevation & driver orchestration
 │       ├── drivers/          # Driver lifecycle management and SCM control
-│       ├── pipeline/         # Event dispatcher and routing logic
-│       ├── sensors/          # Telemetry ingestion (ETW NT Kernel Logger)
-│       ├── sinks/            # Analytical detection modules (DirectSyscallSink, SystemContextSink)
-│       └── helpers/          # Stack correlator, symbol resolver, string decoding
+│       ├── model/            # Normalized domain entities and events
+│       ├── pipeline/         # Event dispatcher, call stack correlator, engine, and Event enum
+│       ├── sensors/          # Ingestion sensors: ETW (kernel/user) and Driver (per-CPU ring buffer)
+│       ├── sinks/            # Analytical detection modules (DirectSyscallSink, TamperDetectionSink)
+│       ├── state/            # ProcessTree timeline and temporal context
+│       └── helpers/          # Safe handle wrappers, string utilities
 └── singularity/              # KMDF Driver (Kernel-Mode)
     ├── .cargo/config.toml    # Compiler flags for kernel environment
     ├── Makefile.toml         # cargo-make configuration for driver packaging
@@ -33,26 +38,26 @@ quasar/
     ├── singularity.inx       # Driver installation and isolated package template
     └── src/
         ├── lib.rs            # DriverEntry and core kernel logic
-        ├── device.rs         # WDF Device initialization and context
-        ├── raii.rs           # Safe Resource Acquisition Is Initialization wrappers
-        ├── internals/        # Implementation logic
-        │   ├── mod.rs
-        │   └── dkom.rs       # Direct Kernel Object Manipulation logic
-        └── ioctls/           # IOCTL dispatching and handlers
-            ├── mod.rs
-            └── elevate.rs    # Token elevation handler
+        ├── device.rs         # Non-PnP WDF Control Device and sequential queue
+        ├── comm/             # Lock-free Per-CPU shared memory ring buffer & double MDL mapping
+        ├── domains/          # Core security domains (callbacks, anti_tampering PPL)
+        ├── foundation/       # Error handling, IRQL guards, spinlocks, logging, driver state
+        ├── ioctl/            # IOCTL dispatching and handlers
+        └── wrappers/         # Safe EPROCESS and pool flag wrappers
 ```
 
 ## Features
 
-At the time of writing this, the project features are aligned with only one purpose: detect stack anomalies. More features will be added hopefully in the future.
+Quasar combines kernel-level hooks with user-mode analytics to detect modern post-exploitation techniques with low system latency:
 
 ### Telemetry Sources
-* **ETW (Event Tracing for Windows):** Programmatically builds, starts, and consumes NT Kernel Logger ETW sessions. This allows the engine to capture real-time, high-fidelity, and verbose system events (like system calls and process/image lifecycles) directly from the Windows kernel.
+* **ETW (Event Tracing for Windows):** Programmatically builds, starts, and consumes NT Kernel Logger ETW sessions to capture real-time system calls, process lifecycles, and kernel call stack walking.
+* **Singularity Per-CPU Ring Buffer:** A zero-copy lock-free ring buffer backed by `NonPagedPool` allocations. Partitions memory per logical core to eliminate cross-core lock contention, streaming kernel Object Manager handle events to user-space with sub-microsecond latency.
 
 ### Detections & Analytics
-* **Direct Syscall Detection:** Identifies processes attempting to bypass standard user-land API hooking by executing `syscall` instructions directly. It achieves this by capturing kernel-level system call events and utilizing stack unwinding/correlation to verify if the execution origin is legitimate.
-* **Process & Context Tracking:** Maintains an in-memory graph (`SystemTree`) mapping active process lifecycles, DLL image loads, and ancestry hierarchies with $O(1)$ lookups and historical retention.
+* **Direct Syscall Detection:** Identifies processes attempting to bypass user-land API hooking by executing `syscall` instructions directly, verified via ETW kernel stack trace unwinding.
+* **Anti-Tampering & Credential Access:** Monitors sensitive handle operations (`PROCESS_VM_READ`, `PROCESS_DUP_HANDLE`, `PROCESS_CREATE_PROCESS`) targeting critical processes like `lsass.exe` using Object Manager callbacks (`ObRegisterCallbacks`).
+* **Process & Context Tracking:** Maintains an in-memory graph (`ProcessTree`) mapping active process lifecycles, ancestry hierarchies, and temporal resolution for recycled PIDs.
 
 ## Prerequisites
 

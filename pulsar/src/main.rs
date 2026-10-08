@@ -9,11 +9,13 @@ use std::thread::JoinHandle;
 
 use clap::Parser;
 use pulsar::error::AppError;
-use pulsar::pipeline::EventDispatcher;
+use pulsar::pipeline::{Event, EventDispatcher};
+use pulsar::sensors::driver::DriverSensor;
 use pulsar::sensors::etw::director::SessionDirector;
 use pulsar::sensors::etw::{
     EtwError, EtwSession, EventRecord, KernelSession, KernelSessionBuilder,
 };
+use pulsar::sinks::TamperDetectionSink;
 
 /// Pulsar Endpoint Detection and Response (EDR) Telemetry Agent.
 #[derive(Parser, Debug)]
@@ -38,10 +40,10 @@ pub struct Cli {
     )]
     pub disable_syscalls: bool,
 
-    /// Disable system process tree and module mapping context tracking.
+    /// Disable ETW kernel process and image load event tracing.
     #[arg(
         long,
-        help = "Disable system process tree and module mapping context tracking"
+        help = "Disable ETW kernel process and image load event tracing"
     )]
     pub disable_context: bool,
 
@@ -62,26 +64,33 @@ fn handle_uninstall() -> Result<(), AppError> {
 }
 
 /// Orchestrates pre-flight driver installation, SCM service start, and PPL-Antimalware elevation.
-fn init_driver_and_ppl(skip_driver: bool) -> Result<(), AppError> {
+fn init_driver_and_ppl(skip_driver: bool) -> Result<Option<pulsar::drivers::kmdf::Singularity>, AppError> {
     if !skip_driver {
-        pulsar::bootstrap::initialize()?;
+        let client = pulsar::bootstrap::initialize()?;
+        Ok(Some(client))
     } else {
         log::warn!("Running in standalone mode: driver initialization and PPL elevation skipped.");
+        Ok(None)
     }
-    Ok(())
 }
 
 /// Initializes the telemetry ingestion channel and starts the event dispatcher thread.
 fn setup_event_pipeline(
     enable_syscalls: bool,
     enable_context: bool,
+    driver_rx: Option<mpsc::Receiver<Event>>,
     shutdown_flag: Arc<AtomicBool>,
 ) -> (mpsc::SyncSender<EventRecord>, JoinHandle<()>) {
     // Bound the channel queue to 50,000 items to prevent unbounded memory allocation under heavy telemetry bursts.
-    // Avoid allocating millions of queue items which can consume hundreds of megabytes if the consumer thread lags.
     let (tx, rx) = mpsc::sync_channel::<EventRecord>(50_000);
 
-    let dispatcher = EventDispatcher::new(rx);
+    let mut dispatcher = EventDispatcher::new(rx);
+    if let Some(drx) = driver_rx {
+        dispatcher = dispatcher.with_driver_receiver(drx);
+    }
+
+    // Register analytical sinks
+    dispatcher.add_listener(Box::new(TamperDetectionSink::new()));
 
     if enable_syscalls {
         log::info!("Feature enabled: Syscall Tracing.");
@@ -144,11 +153,12 @@ fn wait_for_shutdown(shutdown_flag: Arc<AtomicBool>) {
     let _ = shutdown_rx.recv();
 }
 
-/// Gracefully stops the ETW kernel trace session and joins background worker threads.
+/// Gracefully stops the ETW kernel trace session, driver sensor, and joins background worker threads.
 fn teardown_session(
     mut kernel_session: KernelSession,
     consumer_handle: JoinHandle<Result<(), EtwError>>,
     dispatcher_handle: JoinHandle<()>,
+    driver_sensor_handle: Option<JoinHandle<()>>,
 ) {
     log::info!("Initiating graceful shutdown sequence...");
 
@@ -158,6 +168,12 @@ fn teardown_session(
 
     if let Err(e) = consumer_handle.join() {
         log::error!("Consumer thread panicked during execution: {:?}", e);
+    }
+
+    if let Some(sensor_handle) = driver_sensor_handle
+        && let Err(e) = sensor_handle.join()
+    {
+        log::error!("Driver sensor thread panicked during execution: {:?}", e);
     }
 
     if let Err(e) = dispatcher_handle.join() {
@@ -174,19 +190,33 @@ fn run(cli: Cli) -> Result<(), AppError> {
 
     log::info!("Starting Quasar EDR Engine (Pulsar)...");
 
-    // Phase 1: Initialize driver and request PPL elevation
-    init_driver_and_ppl(cli.skip_driver)?;
-
     let shutdown_flag = Arc::new(AtomicBool::new(false));
 
-    // Phase 2: Setup event bus and dispatching pipeline
+    // Initialize driver service and elevate to PPL
+    let driver_client = init_driver_and_ppl(cli.skip_driver)?;
+
+    // Initialize driver telemetry sensor if driver is present
+    let (driver_rx, driver_sensor_handle) = if let Some(ref driver) = driver_client {
+        log::info!("Initializing Singularity driver telemetry sensor (Per-CPU ring buffer)...");
+        let sensor = DriverSensor::initialize(driver)?;
+        let (dtx, drx) = mpsc::channel();
+        let flag = Arc::clone(&shutdown_flag);
+        let handle = sensor.start(flag, move |event| {
+            let _ = dtx.send(event);
+        });
+        (Some(drx), Some(handle))
+    } else {
+        (None, None)
+    };
+
+    // Setup event bus and dispatching pipeline
     let enable_syscalls = !cli.disable_syscalls;
     let enable_context = !cli.disable_context;
 
     let (tx, dispatcher_handle) =
-        setup_event_pipeline(enable_syscalls, enable_context, Arc::clone(&shutdown_flag));
+        setup_event_pipeline(enable_syscalls, enable_context, driver_rx, Arc::clone(&shutdown_flag));
 
-    // Phase 3: Build and start NT Kernel Logger ETW session
+    // Launch NT Kernel Logger ETW trace session
     let (kernel_session, consumer_handle) =
         start_kernel_session(enable_syscalls, enable_context, tx)?;
 
@@ -194,11 +224,19 @@ fn run(cli: Cli) -> Result<(), AppError> {
         "Quasar EDR Engine is active and capturing telemetry. Press Ctrl+C to safely stop..."
     );
 
-    // Phase 4: Wait for user termination signal
+    // Wait for user termination signal
     wait_for_shutdown(shutdown_flag);
 
-    // Phase 5: Teardown session and join worker threads
-    teardown_session(kernel_session, consumer_handle, dispatcher_handle);
+    // Teardown trace sessions and background workers
+    teardown_session(
+        kernel_session,
+        consumer_handle,
+        dispatcher_handle,
+        driver_sensor_handle,
+    );
+
+    // Dropping driver_client triggers EvtFileCleanup in driver
+    drop(driver_client);
 
     Ok(())
 }
@@ -212,7 +250,6 @@ fn main() -> std::process::ExitCode {
     if let Err(e) = run(cli) {
         log::error!("Application error encountered: {e}");
 
-        // Print causal source chain if available
         let mut source = std::error::Error::source(&e);
         while let Some(cause) = source {
             log::error!("  Caused by: {cause}");
