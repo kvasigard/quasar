@@ -32,11 +32,6 @@ pub struct LsassAccessEvent {
     pub short_name: [u8; 16],
 }
 
-/// Backwards-compatible alias for [`LsassAccessEvent`].
-pub type ProcessHandlePreOpEvent = LsassAccessEvent;
-/// Backwards-compatible alias for [`LsassAccessEvent`].
-pub type HandlePreOpEvent = LsassAccessEvent;
-
 impl LsassAccessEvent {
     /// Creates a new `LsassAccessEvent` payload.
     ///

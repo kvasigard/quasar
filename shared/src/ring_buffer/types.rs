@@ -74,15 +74,6 @@ pub enum DriverEventType {
     LsassAccess = 0x0001,
 }
 
-impl DriverEventType {
-    /// Backwards-compatible alias for [`DriverEventType::LsassAccess`].
-    #[allow(non_upper_case_globals)]
-    pub const ProcessHandlePreOperation: Self = Self::LsassAccess;
-    /// Backwards-compatible alias for [`DriverEventType::LsassAccess`].
-    #[allow(non_upper_case_globals)]
-    pub const HandlePreOperation: Self = Self::LsassAccess;
-}
-
 impl TryFrom<u16> for DriverEventType {
     type Error = ();
 
@@ -125,7 +116,7 @@ mod tests {
     fn test_driver_event_type_try_from() {
         assert_eq!(
             DriverEventType::try_from(0x0001),
-            Ok(DriverEventType::HandlePreOperation)
+            Ok(DriverEventType::LsassAccess)
         );
         assert_eq!(DriverEventType::try_from(0x9999), Err(()));
     }

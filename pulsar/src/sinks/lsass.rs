@@ -75,6 +75,3 @@ impl EventListener for LsassAccessSink {
         }
     }
 }
-
-/// Backwards-compatible alias for [`LsassAccessSink`].
-pub type TamperDetectionSink = LsassAccessSink;

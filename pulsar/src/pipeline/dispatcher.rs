@@ -59,11 +59,6 @@ pub trait EventListener: Send + Sync {
     ///
     /// * `_event` - The [`LsassAccessEvent`] details.
     fn on_lsass_access(&self, _event: &LsassAccessEvent) {}
-
-    /// Backwards-compatible alias for [`EventListener::on_lsass_access`].
-    fn on_handle_pre_op(&self, event: &LsassAccessEvent) {
-        self.on_lsass_access(event);
-    }
 }
 
 /// Central event dispatcher distributing ingested telemetry across registered analytics listeners.

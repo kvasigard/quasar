@@ -102,7 +102,7 @@
 //! pub enum Event {
 //!     Process(ProcessEvent),
 //!     Syscall(SyscallEvent),
-//!     HandlePreOp(HandlePreOpEvent),
+//!     LsassAccess(LsassAccessEvent),
 //!     ImageLoad(ImageLoadEvent), // <--- New variant
 //! }
 //! ```
@@ -148,7 +148,7 @@
 //! pub enum Event {
 //!     Process(ProcessEvent),
 //!     Syscall(SyscallEvent),
-//!     HandlePreOp(HandlePreOpEvent),
+//!     LsassAccess(LsassAccessEvent),
 //!     ProcessCreate(ProcessCreateEvent), // <--- New driver variant
 //! }
 //! ```

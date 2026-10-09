@@ -142,7 +142,7 @@ mod tests {
     }
 
     impl TemplateEvent for MockFixedEvent {
-        const EVENT_TYPE: DriverEventType = DriverEventType::HandlePreOperation;
+        const EVENT_TYPE: DriverEventType = DriverEventType::LsassAccess;
     }
 
     #[test]
@@ -152,7 +152,7 @@ mod tests {
             value_b: 0x9ABC_DEF0_1234_5678,
         };
 
-        assert_eq!(event.event_type(), DriverEventType::HandlePreOperation);
+        assert_eq!(event.event_type(), DriverEventType::LsassAccess);
         assert_eq!(event.payload_len(), core::mem::size_of::<MockFixedEvent>());
 
         let mut buffer = [0u8; core::mem::size_of::<MockFixedEvent>()];
