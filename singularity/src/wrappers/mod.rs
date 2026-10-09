@@ -1,4 +1,9 @@
 mod eprocess;
-mod pool_flags;
-pub(crate) use eprocess::Eprocess;
-pub(crate) use pool_flags::PoolFlag;
+mod pool;
+mod token;
+
+pub(crate) use eprocess::{
+    Eprocess, PsProtectedSigner, PsProtectedType, PsProtection, SeSigningLevel,
+};
+pub(crate) use pool::{PoolFlag, PoolGuard};
+pub(crate) use token::{IntegrityLevel, TokenGuard};

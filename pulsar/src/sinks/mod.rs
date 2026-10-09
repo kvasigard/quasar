@@ -1,5 +1,5 @@
 //! Analytical and detection sinks.
 
-pub mod tamper;
+pub mod lsass;
 
-pub use tamper::TamperDetectionSink;
+pub use lsass::*;

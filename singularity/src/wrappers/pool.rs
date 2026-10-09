@@ -3,8 +3,10 @@
 //! Wraps `POOL_FLAGS` used by `ExAllocatePool2` and `POOL_EXTENDED_PARAMETER` used by
 //! `ExAllocatePool3` into idiomatic, zero-cost Rust abstractions with full bitwise operations.
 
-use core::ops::{BitOr, BitOrAssign};
-use wdk_sys::ULONG64;
+use core::ops::{BitOr, BitOrAssign, Deref, DerefMut};
+use core::ptr::NonNull;
+use wdk_sys::ntddk::ExFreePool;
+use wdk_sys::{PVOID, ULONG64};
 
 /// Bitmask flags passed to `ExAllocatePool2` indicating the type of pool memory,
 /// required attributes (low 32 bits), and optional attributes (high 32 bits).
@@ -27,7 +29,7 @@ pub enum PoolFlag {
     ///
     /// The contents are indeterminant. Drivers must be extremely cautious never to leak
     /// uninitialized memory to untrusted destinations (user-mode buffers, network, etc.).
-    /// 
+    ///
     Uninitialized = 0x0000_0000_0000_0002,
 
     /// Allocates from the session-specific pool. Reserved for internal operating system use.
@@ -136,5 +138,159 @@ impl BitOrAssign<PoolFlag> for ULONG64 {
     #[inline]
     fn bitor_assign(&mut self, rhs: PoolFlag) {
         *self |= rhs as ULONG64;
+    }
+}
+
+/// An RAII memory guard that manages ownership and automatic deallocation of Windows kernel pool memory.
+///
+/// Automatically invokes `ExFreePool` when dropped, preventing pool memory leaks and system instability.
+/// Supports both typed structures (`PoolGuard<T>`) and untyped buffers (`PoolGuard<core::ffi::c_void>`).
+#[derive(Debug)]
+pub(crate) struct PoolGuard<T = core::ffi::c_void> {
+    ptr: NonNull<T>,
+}
+
+impl<T> PoolGuard<T> {
+    /// Constructs a `PoolGuard` from a raw kernel pool allocation pointer.
+    ///
+    /// Validates that the supplied pointer is non-null before taking ownership.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `ptr` points to a valid kernel pool memory allocation
+    /// (e.g. from `ExAllocatePool2`, `SeQueryInformationToken`, or `SeLocateProcessImageName`)
+    /// that must be freed using `ExFreePool`. The caller transfers exclusive ownership to this guard.
+    ///
+    /// # Arguments
+    ///
+    /// * `ptr` - Raw pool memory pointer.
+    ///
+    /// # Return values
+    ///
+    /// * `Some(Self)` - Valid non-null pool guard wrapping `ptr`.
+    /// * `None` - Supplied pointer was null.
+    #[inline]
+    pub(crate) unsafe fn from_raw(ptr: *mut T) -> Option<Self> {
+        NonNull::new(ptr).map(|ptr| Self { ptr })
+    }
+
+    /// Constructs a `PoolGuard` from a raw `PVOID` pointer.
+    ///
+    /// Validates that the supplied pointer is non-null before casting and wrapping it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `pvoid` points to a valid kernel pool memory allocation
+    /// that must be freed using `ExFreePool`.
+    ///
+    /// # Arguments
+    ///
+    /// * `pvoid` - Raw kernel `PVOID` pool pointer.
+    ///
+    /// # Return values
+    ///
+    /// * `Some(Self)` - Valid non-null pool guard wrapping `pvoid`.
+    /// * `None` - Supplied pointer was null.
+    #[inline]
+    pub(crate) unsafe fn from_pvoid(pvoid: PVOID) -> Option<Self> {
+        NonNull::new(pvoid as *mut T).map(|ptr| Self { ptr })
+    }
+
+    /// Constructs a `PoolGuard` from a known non-null pool memory pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `ptr` is non-null and points to a valid kernel pool allocation
+    /// that must be freed using `ExFreePool`.
+    ///
+    /// # Arguments
+    ///
+    /// * `ptr` - Non-null raw pool pointer.
+    ///
+    /// # Return values
+    ///
+    /// * `Self` - Pool guard wrapping `ptr`.
+    #[inline]
+    pub(crate) unsafe fn from_raw_unchecked(ptr: *mut T) -> Self {
+        Self {
+            ptr: NonNull::new_unchecked(ptr),
+        }
+    }
+
+    /// Returns the raw pointer to the underlying pool memory.
+    ///
+    /// # Return values
+    ///
+    /// * `*mut T` - Raw pointer to the allocated pool memory.
+    #[inline(always)]
+    pub(crate) fn as_ptr(&self) -> *mut T {
+        self.ptr.as_ptr()
+    }
+
+    /// Returns a `NonNull` pointer to the underlying pool memory.
+    ///
+    /// # Return values
+    ///
+    /// * `NonNull<T>` - Wrapped non-null pointer.
+    #[inline(always)]
+    pub(crate) fn as_non_null(&self) -> NonNull<T> {
+        self.ptr
+    }
+
+    /// Casts this pool guard into a guard of a different target type.
+    ///
+    /// Useful when receiving untyped `PVOID` pool buffers from APIs like `SeQueryInformationToken`
+    /// and casting them into typed structures (e.g. `TOKEN_MANDATORY_LABEL`).
+    ///
+    /// # Arguments
+    ///
+    /// * `self` - The current pool guard.
+    ///
+    /// # Return values
+    ///
+    /// * `PoolGuard<U>` - Pool guard reinterpreted as type `U`.
+    #[inline]
+    pub(crate) fn cast<U>(self) -> PoolGuard<U> {
+        let ptr = self.ptr.cast::<U>();
+        core::mem::forget(self);
+        PoolGuard { ptr }
+    }
+
+    /// Releases ownership of the pool memory without deallocating it.
+    ///
+    /// Suppresses the invocation of `ExFreePool` upon drop, returning the raw pointer to the caller.
+    ///
+    /// # Return values
+    ///
+    /// * `*mut T` - Raw pointer to the leaked pool memory.
+    #[inline(always)]
+    pub(crate) fn leak(self) -> *mut T {
+        let ptr = self.ptr.as_ptr();
+        core::mem::forget(self);
+        ptr
+    }
+}
+
+impl<T> Deref for PoolGuard<T> {
+    type Target = T;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl<T> DerefMut for PoolGuard<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.ptr.as_mut() }
+    }
+}
+
+impl<T> Drop for PoolGuard<T> {
+    fn drop(&mut self) {
+        unsafe {
+            ExFreePool(self.ptr.as_ptr() as PVOID);
+        }
     }
 }

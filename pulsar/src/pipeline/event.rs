@@ -30,7 +30,7 @@
 //!                     +-------------------+-------------------+
 //!                     |                   |                   |
 //!                     v                   v                   v
-//!               on_process()         on_syscall()       on_handle_pre_op()
+//!               on_process()         on_syscall()       on_lsass_access()
 //!                     |                   |                   |
 //!                     +-------------------+-------------------+
 //!                                         |
@@ -102,7 +102,7 @@
 //! pub enum Event {
 //!     Process(ProcessEvent),
 //!     Syscall(SyscallEvent),
-//!     HandlePreOp(HandlePreOpEvent),
+//!     LsassAccess(LsassAccessEvent),
 //!     ImageLoad(ImageLoadEvent), // <--- New variant
 //! }
 //! ```
@@ -148,7 +148,7 @@
 //! pub enum Event {
 //!     Process(ProcessEvent),
 //!     Syscall(SyscallEvent),
-//!     HandlePreOp(HandlePreOpEvent),
+//!     LsassAccess(LsassAccessEvent),
 //!     ProcessCreate(ProcessCreateEvent), // <--- New driver variant
 //! }
 //! ```
@@ -199,17 +199,17 @@
 //!         Event::Syscall(sys) => {
 //!             println!("Syscall Execution: Address {:#X} from PID {}", sys.syscall_address, sys.process_id);
 //!         }
-//!         Event::HandlePreOp(handle) => {
+//!         Event::LsassAccess(lsass) => {
 //!             println!(
-//!                 "Driver Alert: Process PID {} opened handle to Target PID {} (Access: {:#010X})",
-//!                 handle.source_pid, handle.target_pid, handle.desired_access
+//!                 "Driver Alert: Process PID {} attempted unauthorized access to LSASS PID {} (Requested: {:#010X}, Granted: {:#010X})",
+//!                 lsass.source_pid, lsass.target_pid, lsass.desired_access, lsass.granted_access
 //!             );
 //!         }
 //!     }
 //! }
 //! ```
 
-use shared::ring_buffer::HandlePreOpEvent;
+use shared::ring_buffer::LsassAccessEvent;
 
 use crate::model::events::{ProcessEvent, SyscallEvent};
 use crate::model::types::StackTrace;
@@ -225,8 +225,8 @@ pub enum Event {
     /// Kernel system call execution event.
     Syscall(SyscallEvent),
 
-    /// Pre-operation handle creation or duplication intercepted by kernel driver callbacks.
-    HandlePreOp(HandlePreOpEvent),
+    /// Pre-operation handle creation or duplication targeting `lsass.exe` intercepted by kernel driver callbacks.
+    LsassAccess(LsassAccessEvent),
 }
 
 impl Event {
@@ -239,7 +239,7 @@ impl Event {
         match self {
             Event::Process(e) => e.timestamp,
             Event::Syscall(e) => e.timestamp,
-            Event::HandlePreOp(_) => 0,
+            Event::LsassAccess(_) => 0,
         }
     }
 
@@ -252,7 +252,7 @@ impl Event {
         match self {
             Event::Process(e) => e.stack_trace = Some(stack_trace),
             Event::Syscall(e) => e.stack_trace = Some(stack_trace),
-            Event::HandlePreOp(_) => {}
+            Event::LsassAccess(_) => {}
         }
     }
 

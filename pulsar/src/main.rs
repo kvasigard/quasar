@@ -15,7 +15,7 @@ use pulsar::sensors::etw::director::SessionDirector;
 use pulsar::sensors::etw::{
     EtwError, EtwSession, EventRecord, KernelSession, KernelSessionBuilder,
 };
-use pulsar::sinks::TamperDetectionSink;
+use pulsar::sinks::LsassAccessSink;
 
 /// Pulsar Endpoint Detection and Response (EDR) Telemetry Agent.
 #[derive(Parser, Debug)]
@@ -90,7 +90,7 @@ fn setup_event_pipeline(
     }
 
     // Register analytical sinks
-    dispatcher.add_listener(Box::new(TamperDetectionSink::new()));
+    dispatcher.add_listener(Box::new(LsassAccessSink::new()));
 
     if enable_syscalls {
         log::info!("Feature enabled: Syscall Tracing.");

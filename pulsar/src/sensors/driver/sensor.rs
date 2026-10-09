@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
-use shared::ring_buffer::{DriverEventType, HandlePreOpEvent};
+use shared::ring_buffer::{DriverEventType, LsassAccessEvent};
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
@@ -96,17 +96,17 @@ impl DriverSensor {
 
                 while !shutdown_flag.load(Ordering::Relaxed) {
                     let drained = self.ring_manager.drain_all(|cpu_id, event_type, latency_us, payload| {
-                        if event_type == DriverEventType::HandlePreOperation as u16 {
-                            if payload.len() >= core::mem::size_of::<HandlePreOpEvent>() {
-                                let event = unsafe { core::ptr::read_unaligned(payload.as_ptr() as *const HandlePreOpEvent) };
+                        if event_type == DriverEventType::LsassAccess as u16 {
+                            if payload.len() >= core::mem::size_of::<LsassAccessEvent>() {
+                                let event = unsafe { core::ptr::read_unaligned(payload.as_ptr() as *const LsassAccessEvent) };
                                 log::trace!(
                                     target: "driver_sensor",
-                                    "[CPU {cpu_id}] Ingested HandlePreOp: Source PID {} -> Target PID {} (Latency: {:.2} us)",
+                                    "[CPU {cpu_id}] Ingested LsassAccess: Source PID {} -> Target PID {} (Latency: {:.2} us)",
                                     event.source_pid,
                                     event.target_pid,
                                     latency_us
                                 );
-                                event_callback(Event::HandlePreOp(event));
+                                event_callback(Event::LsassAccess(event));
                             }
                         } else {
                             log::trace!(
@@ -135,9 +135,9 @@ impl DriverSensor {
 
             // Final sweep on shutdown
             let trailing = self.ring_manager.drain_all(|_cpu_id, event_type, _latency_us, payload| {
-                if event_type == DriverEventType::HandlePreOperation as u16 && payload.len() >= core::mem::size_of::<HandlePreOpEvent>() {
-                    let event = unsafe { core::ptr::read_unaligned(payload.as_ptr() as *const HandlePreOpEvent) };
-                    event_callback(Event::HandlePreOp(event));
+                if event_type == DriverEventType::LsassAccess as u16 && payload.len() >= core::mem::size_of::<LsassAccessEvent>() {
+                    let event = unsafe { core::ptr::read_unaligned(payload.as_ptr() as *const LsassAccessEvent) };
+                    event_callback(Event::LsassAccess(event));
                 }
             });
 

@@ -70,8 +70,8 @@ const _: () = assert!(core::mem::align_of::<EventHeader>() == 8);
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverEventType {
-    /// Pre-operation handle creation or duplication intercepted via Object Manager callback.
-    HandlePreOperation = 0x0001,
+    /// Pre-operation handle creation or duplication targeting `lsass.exe`.
+    LsassAccess = 0x0001,
 }
 
 impl TryFrom<u16> for DriverEventType {
@@ -80,7 +80,7 @@ impl TryFrom<u16> for DriverEventType {
     #[inline]
     fn try_from(val: u16) -> Result<Self, Self::Error> {
         match val {
-            0x0001 => Ok(Self::HandlePreOperation),
+            0x0001 => Ok(Self::LsassAccess),
             _ => Err(()),
         }
     }
@@ -116,7 +116,7 @@ mod tests {
     fn test_driver_event_type_try_from() {
         assert_eq!(
             DriverEventType::try_from(0x0001),
-            Ok(DriverEventType::HandlePreOperation)
+            Ok(DriverEventType::LsassAccess)
         );
         assert_eq!(DriverEventType::try_from(0x9999), Err(()));
     }
