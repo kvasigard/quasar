@@ -1,6 +1,7 @@
 //! Object Manager callback registration and lifecycle management domain.
 
 pub(crate) mod error;
+pub(crate) mod filters;
 pub(crate) mod handlers;
 pub(crate) mod manager;
 pub(crate) mod operations;

@@ -1,7 +1,7 @@
 //! Models and definitions for Object Manager callback targets and operations.
 
 use wdk_sys::{
-    ExDesktopObjectType, OB_OPERATION_HANDLE_CREATE, OB_OPERATION_HANDLE_DUPLICATE,
+    ACCESS_MASK, ExDesktopObjectType, OB_OPERATION_HANDLE_CREATE, OB_OPERATION_HANDLE_DUPLICATE,
     POBJECT_TYPE, PVOID, PsProcessType, PsThreadType,
 };
 
@@ -167,3 +167,44 @@ impl Callback {
         }
     }
 }
+
+/// Extracts the requested access mask from the pre-operation parameters based on the operation type.
+///
+/// Inspects `CreateHandleInformation` or `DuplicateHandleInformation` depending on the operation discriminator.
+///
+/// # Arguments
+///
+/// * `op_info` - Reference to the kernel pre-operation information structure.
+///
+/// # Return values
+///
+/// * `Some(ACCESS_MASK)` - Requested access rights bitmask.
+/// * `None` - Operation parameters pointer was null or operation type was unrecognized.
+#[inline(always)]
+pub(crate) fn extract_desired_access(
+    op_info: &wdk_sys::_OB_PRE_OPERATION_INFORMATION,
+) -> Option<ACCESS_MASK> {
+    if op_info.Parameters.is_null() {
+        return None;
+    }
+
+    // SAFETY:
+    // The Windows Object Manager guarantees `op_info.Parameters` is a non-null, valid pointer
+    // for the synchronous duration of the pre-operation callback routine.
+    let access = unsafe {
+        match op_info.Operation {
+            OB_OPERATION_HANDLE_CREATE => {
+                (*op_info.Parameters).CreateHandleInformation.DesiredAccess
+            }
+            OB_OPERATION_HANDLE_DUPLICATE => {
+                (*op_info.Parameters)
+                    .DuplicateHandleInformation
+                    .DesiredAccess
+            }
+            _ => return None,
+        }
+    };
+
+    Some(access)
+}
+

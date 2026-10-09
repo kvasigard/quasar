@@ -6,19 +6,19 @@
 
 Quasar is designed as a multi-component workspace, split between user-mode analysis, kernel-mode visibility, and shared definitions:
 
-* **Pulsar (User-Mode):** This is the user-mode agent in charge of collecting system telemetry and routing it through an internal processing pipeline for real-time analysis. It manages data ingestion via "Sensors" (ETW NT Kernel Logger and Singularity Per-CPU Ring Buffer), dispatches the events across threads without blocking, and feeds them into analytical "Sinks" (DirectSyscallSink, TamperDetectionSink) where the actual detection logic lives. It also orchestrates kernel-mode component lifecycles and self-elevation to PPL-Antimalware.
-* **Singularity (Kernel-Mode):** A Windows Kernel-Mode Driver Framework (KMDF) driver written purely in Rust. It serves as the privileged component of the EDR, providing deep system visibility, Object Manager pre-operation handle interception (`ObRegisterCallbacks`), Process Protection Level (PPL) modification, and lock-free Per-CPU shared memory ring buffer telemetry streaming (<500 ns latency).
+* **Pulsar (User-Mode):** This is the user-mode agent in charge of collecting system telemetry and routing it through an internal processing pipeline for real-time analysis. It manages data ingestion via "Sensors" (ETW NT Kernel Logger and Singularity Per-CPU Ring Buffer), dispatches the events across threads without blocking, and feeds them into analytical "Sinks" (DirectSyscallSink, LsassAccessSink) where the actual detection logic lives. It also orchestrates kernel-mode component lifecycles and self-elevation to PPL-Antimalware.
+* **Singularity (Kernel-Mode):** A Windows Kernel-Mode Driver Framework (KMDF) driver written purely in Rust. It serves as the privileged component of the EDR, providing deep system visibility, Object Manager pre-operation handle interception (`ObRegisterCallbacks`), Process Protection Level (PPL) modification, in-flight credential dumping mitigation, and lock-free Per-CPU shared memory ring buffer telemetry streaming (<500 ns latency).
 * **Shared:** A common `no_std` Rust crate bridging the gap between `pulsar` and `singularity`. It houses binary record layouts (`EventHeader`), domain event contracts (`TemplateEvent`, `DriverEvent`), modular event payloads (`shared::ring_buffer::events`), and IOCTL command definitions ensuring strict C-ABI stability and zero-copy synchronization.
 
 ## Project Structure
 ```text
 quasar/
-├── shared/                   # Common definitions between um and km (IOCTLs, Structs, Contracts)
+├── shared/                   # Common definitions between um and km 
 │   └── src/
-│       ├── ioctl/            # IOCTL codes and parameter structures (PPL, RingBuffer)
+│       ├── ioctl/            # IOCTL codes and parameter structures 
 │       └── ring_buffer/      # Binary record headers, types, and modular domain events
-│           └── events/       # Domain event payloads (handle, etc.)
-├── pulsar/                   # Core EDR Engine (User-Mode)
+│           └── events/       # Domain event payloads 
+├── pulsar/                   # Core EDR Engine 
 │   └── src/
 │       ├── main.rs           # Modularized orchestration & CLI parsing
 │       ├── lib.rs            # Library core
@@ -28,7 +28,7 @@ quasar/
 │       ├── model/            # Normalized domain entities and events
 │       ├── pipeline/         # Event dispatcher, call stack correlator, engine, and Event enum
 │       ├── sensors/          # Ingestion sensors: ETW (kernel/user) and Driver (per-CPU ring buffer)
-│       ├── sinks/            # Analytical detection modules (DirectSyscallSink, TamperDetectionSink)
+│       ├── sinks/            # Analytical detection modules 
 │       ├── state/            # ProcessTree timeline and temporal context
 │       └── helpers/          # Safe handle wrappers, string utilities
 └── singularity/              # KMDF Driver (Kernel-Mode)
@@ -40,10 +40,10 @@ quasar/
         ├── lib.rs            # DriverEntry and core kernel logic
         ├── device.rs         # Non-PnP WDF Control Device and sequential queue
         ├── comm/             # Lock-free Per-CPU shared memory ring buffer & double MDL mapping
-        ├── domains/          # Core security domains (callbacks, anti_tampering PPL)
+        ├── domains/          # Core security domains 
         ├── foundation/       # Error handling, IRQL guards, spinlocks, logging, driver state
         ├── ioctl/            # IOCTL dispatching and handlers
-        └── wrappers/         # Safe EPROCESS and pool flag wrappers
+        └── wrappers/         # Safe RAII wrappers
 ```
 
 ## Features
@@ -56,7 +56,7 @@ Quasar combines kernel-level hooks with user-mode analytics to detect modern pos
 
 ### Detections & Analytics
 * **Direct Syscall Detection:** Identifies processes attempting to bypass user-land API hooking by executing `syscall` instructions directly, verified via ETW kernel stack trace unwinding.
-* **Anti-Tampering & Credential Access:** Monitors sensitive handle operations (`PROCESS_VM_READ`, `PROCESS_DUP_HANDLE`, `PROCESS_CREATE_PROCESS`) targeting critical processes like `lsass.exe` using Object Manager callbacks (`ObRegisterCallbacks`).
+* **Anti-Tampering & In-Flight Credential Guard:** Protects `lsass.exe` from credential dumping attacks (e.g. Mimikatz, MiniDumpWriteDump, ProcDump) using Object Manager callbacks (`ObRegisterCallbacks`). Evaluates caller trust across 4 kernel invariant gates (Session 0 verification, sensitive access bitmasks, PPL attributes, and SYSTEM/Authenticode signatures) and actively neutralizes unauthorized handle access in-flight by stripping sensitive rights down to `0x1000` (`PROCESS_QUERY_LIMITED_INFORMATION`). Emits cache-line aligned telemetry to Pulsar in real-time.
 * **Process & Context Tracking:** Maintains an in-memory graph (`ProcessTree`) mapping active process lifecycles, ancestry hierarchies, and temporal resolution for recycled PIDs.
 
 ## Prerequisites

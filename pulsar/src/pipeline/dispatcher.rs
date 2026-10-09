@@ -11,7 +11,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use shared::ring_buffer::HandlePreOpEvent;
+use shared::ring_buffer::LsassAccessEvent;
 
 use crate::model::events::{ProcessEvent, SyscallEvent};
 use crate::pipeline::engine::Pipeline;
@@ -35,7 +35,7 @@ pub trait EventListener: Send + Sync {
         match event {
             Event::Process(process_event) => self.on_process(process_event),
             Event::Syscall(syscall_event) => self.on_syscall(syscall_event),
-            Event::HandlePreOp(handle_event) => self.on_handle_pre_op(handle_event),
+            Event::LsassAccess(lsass_event) => self.on_lsass_access(lsass_event),
         }
     }
 
@@ -53,12 +53,17 @@ pub trait EventListener: Send + Sync {
     /// * `_event` - The [`SyscallEvent`] details.
     fn on_syscall(&self, _event: &SyscallEvent) {}
 
-    /// Called when a kernel handle pre-operation event occurs.
+    /// Called when an unauthorized or sensitive handle operation targeting `lsass.exe` is intercepted.
     ///
     /// # Arguments
     ///
-    /// * `_event` - The [`HandlePreOpEvent`] details.
-    fn on_handle_pre_op(&self, _event: &HandlePreOpEvent) {}
+    /// * `_event` - The [`LsassAccessEvent`] details.
+    fn on_lsass_access(&self, _event: &LsassAccessEvent) {}
+
+    /// Backwards-compatible alias for [`EventListener::on_lsass_access`].
+    fn on_handle_pre_op(&self, event: &LsassAccessEvent) {
+        self.on_lsass_access(event);
+    }
 }
 
 /// Central event dispatcher distributing ingested telemetry across registered analytics listeners.
@@ -178,7 +183,7 @@ mod tests {
 
     struct MockListener {
         process_count: Arc<AtomicUsize>,
-        handle_count: Arc<AtomicUsize>,
+        lsass_count: Arc<AtomicUsize>,
     }
 
     impl EventListener for MockListener {
@@ -186,8 +191,8 @@ mod tests {
             self.process_count.fetch_add(1, Ordering::SeqCst);
         }
 
-        fn on_handle_pre_op(&self, _event: &HandlePreOpEvent) {
-            self.handle_count.fetch_add(1, Ordering::SeqCst);
+        fn on_lsass_access(&self, _event: &LsassAccessEvent) {
+            self.lsass_count.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -198,11 +203,11 @@ mod tests {
         let mut dispatcher = EventDispatcher::new(rx).with_driver_receiver(driver_rx);
 
         let process_count = Arc::new(AtomicUsize::new(0));
-        let handle_count = Arc::new(AtomicUsize::new(0));
+        let lsass_count = Arc::new(AtomicUsize::new(0));
 
         dispatcher.add_listener(Box::new(MockListener {
             process_count: Arc::clone(&process_count),
-            handle_count: Arc::clone(&handle_count),
+            lsass_count: Arc::clone(&lsass_count),
         }));
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -241,9 +246,9 @@ mod tests {
 
         tx.send(record).unwrap();
 
-        // Send a mock handle pre-op event through driver channel
-        let handle_event = HandlePreOpEvent::new(5000, 4, 0x1FFFFF, 1, b"malware.exe");
-        driver_tx.send(Event::HandlePreOp(handle_event)).unwrap();
+        // Send a mock LSASS access event through driver channel
+        let lsass_event = LsassAccessEvent::new(5000, 816, 0x1FFFFF, 0x1000, 0x3000, 1, 0, 1, b"malware.exe");
+        driver_tx.send(Event::LsassAccess(lsass_event)).unwrap();
 
         // Allow worker thread to drain
         std::thread::sleep(Duration::from_millis(150));
@@ -252,6 +257,6 @@ mod tests {
         handle.join().unwrap();
 
         assert_eq!(process_count.load(Ordering::SeqCst), 1);
-        assert_eq!(handle_count.load(Ordering::SeqCst), 1);
+        assert_eq!(lsass_count.load(Ordering::SeqCst), 1);
     }
 }
