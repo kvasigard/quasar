@@ -1,5 +1,7 @@
 //! Analytical and detection sinks.
 
-pub mod lsass;
+pub mod context;
+pub mod detection;
 
-pub use lsass::*;
+pub use context::ProcessContextSink;
+pub use detection::DetectionSink;
