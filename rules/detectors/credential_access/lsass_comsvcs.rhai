@@ -22,19 +22,26 @@ fn rule_info() {
     }
 }
 
-// 1. Any rundll32 instance targeting LSASS is intrinsically malicious
-// 2. Any process passing comsvcs.dll or minidump arguments to access LSASS
-if contains_ic(event.short_name, "rundll32.exe")
-   || contains_ic(actor.image_path, "rundll32.exe")
-   || contains_ic(actor.command_line, "comsvcs")
-   || contains_ic(actor.command_line, "minidump") {
+// 1. Any rundll32 instance or comsvcs/minidump CLI targeting LSASS with sensitive access rights
+let has_sensitive_access = has_mask(event.desired_access, 0x0010)
+    || has_mask(event.desired_access, 0x0040)
+    || event.desired_access == 0x001FFFFF;
+
+if has_sensitive_access
+   && (contains_ic(event.short_name, "rundll32.exe")
+       || contains_ic(actor.image_path, "rundll32.exe")
+       || contains_ic(actor.command_line, "comsvcs")
+       || contains_ic(actor.command_line, "minidump")) {
+
+    let mitigation_note = if event.is_mitigated {
+        "In-flight kernel mitigation reduced access rights down to query status."
+    } else {
+        "Handle rights were NOT stripped in-flight (monitoring/audit mode)."
+    };
 
     return alert(
-        "Critical",
         "LSASS Memory Access via Rundll32 / Comsvcs DLL",
-        `Process ${event.short_name} (PID ${event.source_pid}) attempted to access LSASS memory using living-off-the-land techniques (comsvcs.dll / rundll32). In-flight kernel mitigation reduced access rights down to query status.`,
-        "Credential Access",
-        "T1003.001"
+        `Process ${event.short_name} (PID ${event.source_pid}) attempted to access LSASS memory using living-off-the-land techniques (comsvcs.dll / rundll32). ${mitigation_note}`
     );
 }
 

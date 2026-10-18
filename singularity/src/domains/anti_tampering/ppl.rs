@@ -2,23 +2,31 @@
 
 use wdk::nt_success;
 use wdk_sys::{
-    PEPROCESS, RTL_OSVERSIONINFOW,
+    PASSIVE_LEVEL, PEPROCESS, RTL_OSVERSIONINFOW, STATUS_INVALID_DEVICE_STATE,
     ntddk::{PsLookupProcessByProcessId, RtlGetVersion},
 };
 
 use super::error::AntiTamperingError;
+use crate::foundation::irql::ensure_max_irql;
 use crate::foundation::raii::EprocessGuard;
 
 /// Resolves the EPROCESS Protection byte offset dynamically by checking the Windows kernel build number.
 ///
 /// Hardcoding a single offset corrupts adjacent kernel memory and triggers BSODs on differing Windows builds.
+/// Only explicitly verified Windows build numbers are permitted.
 ///
 /// # Return values
 ///
 /// * `Ok(usize)` - Verified byte offset of `PS_PROTECTION` inside `EPROCESS`.
-/// * `Err(AntiTamperingError::VersionDetectionFailed)` - `RtlGetVersion` call failed.
+/// * `Err(AntiTamperingError::VersionDetectionFailed)` - `RtlGetVersion` call failed or IRQL > `PASSIVE_LEVEL`.
 /// * `Err(AntiTamperingError::UnsupportedWindowsBuild)` - Running on an untested or incompatible Windows kernel build.
 fn get_eprocess_protection_offset() -> Result<usize, AntiTamperingError> {
+    if ensure_max_irql(PASSIVE_LEVEL as u8).is_err() {
+        return Err(AntiTamperingError::VersionDetectionFailed(
+            STATUS_INVALID_DEVICE_STATE,
+        ));
+    }
+
     let mut version_info: RTL_OSVERSIONINFOW = unsafe { core::mem::zeroed() };
     version_info.dwOSVersionInfoSize = core::mem::size_of::<RTL_OSVERSIONINFOW>() as u32;
 
@@ -35,11 +43,11 @@ fn get_eprocess_protection_offset() -> Result<usize, AntiTamperingError> {
     );
 
     match build {
-        // Windows 11 24H2+ (Build 26100+)
-        b if b >= 26100 => Ok(0x5FA),
-        // Windows 11 21H2 - 23H2 (Build 22000..26100)
-        22000..26100 => Ok(0x87A),
-        // Windows 10 2004 - 22H2 (Build 19041 - 19045)
+        // Windows 11 24H2 / 25H2 (Verified builds 26100, 26200)
+        26100 | 26200 => Ok(0x5FA),
+        // Windows 11 21H2, 22H2, 23H2 (Verified builds 22000, 22621, 22631)
+        22000 | 22621 | 22631 => Ok(0x87A),
+        // Windows 10 2004 - 22H2 (Verified builds 19041 - 19045)
         19041..=19045 => Ok(0x87A),
         _ => {
             crate::driver_error!(
@@ -64,25 +72,34 @@ fn get_eprocess_protection_offset() -> Result<usize, AntiTamperingError> {
 /// # Return values
 ///
 /// * `Ok(())` - Process protection byte updated successfully.
-/// * `Err(AntiTamperingError::InvalidProcessId)` - Target PID is invalid (e.g. PID 0).
-/// * `Err(AntiTamperingError::InvalidProtectionLevel)` - Protection byte specifies invalid type.
+/// * `Err(AntiTamperingError::InvalidProcessId)` - Target PID is invalid (e.g. PID 0 or PID 4).
+/// * `Err(AntiTamperingError::InvalidProtectionLevel)` - Protection byte specifies invalid type or signer, or attempts to strip protection (`0`).
 /// * `Err(AntiTamperingError::UnsupportedWindowsBuild)` - Kernel build unsupported.
 /// * `Err(AntiTamperingError::ProcessLookupFailed)` - `PsLookupProcessByProcessId` returned NT error.
 /// * `Err(AntiTamperingError::ProcessNotFound)` - Process lookup returned null.
 pub(crate) fn change_process_ppl(pid: u32, level: u8) -> Result<(), AntiTamperingError> {
-    // Validate target PID (PID 0 is System Idle process)
-    if pid == 0 {
-        crate::driver_error!("[anti_tampering::ppl] Rejected modification for PID 0 (System Idle)");
+    if ensure_max_irql(PASSIVE_LEVEL as u8).is_err() {
+        return Err(AntiTamperingError::ProcessLookupFailed(
+            STATUS_INVALID_DEVICE_STATE,
+        ));
+    }
+
+    // Validate target PID (PID 0 is System Idle process, PID 4 is System process)
+    if pid == 0 || pid == 4 {
+        crate::driver_error!(
+            "[anti_tampering::ppl] Rejected modification for protected system PID {pid}"
+        );
         return Err(AntiTamperingError::InvalidProcessId(pid));
     }
 
-    // Validate PS_PROTECTION format:
-    // Bits 0..2 represent Type (0 = None, 1 = ProtectedLight, 2 = Protected).
-    // Types > 2 are invalid/undefined in the NT kernel.
+    // Reject stripping PPL protection (level == 0) and validate PS_PROTECTION bitfields:
+    // Bits 0..2: Type (1 = ProtectedLight, 2 = Protected)
+    // Bits 4..7: Signer (1..=8)
     let protection_type = level & 0x07;
-    if protection_type > 2 {
+    let signer = (level >> 4) & 0x0F;
+    if level == 0 || !(1..=2).contains(&protection_type) || !(1..=8).contains(&signer) {
         crate::driver_error!(
-            "[anti_tampering::ppl] Rejected invalid protection type ({protection_type}) in byte {level:#02X}"
+            "[anti_tampering::ppl] Rejected invalid protection byte {level:#02X} (type: {protection_type}, signer: {signer})"
         );
         return Err(AntiTamperingError::InvalidProtectionLevel(level));
     }
@@ -109,7 +126,8 @@ pub(crate) fn change_process_ppl(pid: u32, level: u8) -> Result<(), AntiTamperin
         return Err(AntiTamperingError::ProcessNotFound);
     }
 
-    let process_guard = EprocessGuard::new(process);
+    // SAFETY: `process` is a valid, newly-referenced PEPROCESS returned by PsLookupProcessByProcessId.
+    let process_guard = unsafe { EprocessGuard::new(process) };
 
     // SAFETY: We hold a valid, reference-counted pointer to the EPROCESS structure
     // managed by EprocessGuard. Volatile reads and writes are mandatory here because

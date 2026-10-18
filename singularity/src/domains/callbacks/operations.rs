@@ -9,6 +9,7 @@ use wdk_sys::{
 pub const DEFAULT_ALTITUDE: *const u16 = windows_sys::w!("320013");
 
 /// Supported kernel object types for callback registration.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallbackType {
     /// Process object callback (`PsProcessType`).
@@ -69,6 +70,7 @@ impl CallbackType {
 }
 
 /// Operation mask specifying handle creation, handle duplication, or both.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationType {
     /// Intercepts handle creation requests such as `OpenProcess` or `OpenThread`.

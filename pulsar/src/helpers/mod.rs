@@ -1,5 +1,6 @@
 pub mod handle;
 pub mod strings;
+pub mod time;
 
 pub use handle::SafeHandle;
 

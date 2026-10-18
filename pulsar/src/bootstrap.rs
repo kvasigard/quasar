@@ -158,10 +158,10 @@ pub fn initialize() -> Result<kmdf::Singularity, BootstrapError> {
     let kmdf_client = kmdf::Singularity::connect().map_err(BootstrapError::PplElevation)?;
 
     log::debug!(target: "bootstrap", "Requesting PPL-Antimalware elevation from the driver...");
-    let ppl_request = shared::ioctl::ChangeProcessPplLevel {
-        process_id: std::process::id(),
-        level: 0x31, // PPL-Antimalware (Signer: 0x3 | Type: 0x1)
-    };
+    let ppl_request = shared::ioctl::ChangeProcessPplLevel::new(
+        std::process::id(),
+        0x31, // PPL-Antimalware (Signer: 0x3 | Type: 0x1)
+    );
 
     kmdf_client
         .send(&ppl_request)
@@ -203,6 +203,12 @@ fn clean_driver_path(path: &str) -> String {
     cleaned = cleaned.replace("\\systemroot\\", &format!("{}\\", system_root));
     cleaned = cleaned.replace("%SystemRoot%", &system_root);
     cleaned = cleaned.replace("%systemroot%", &system_root);
+
+    // INF installations using %12% (Drivers directory) frequently record a relative "System32\drivers\..." path in SCM
+    if cleaned.len() >= 9 && cleaned[..9].eq_ignore_ascii_case("system32\\") {
+        cleaned = format!("{}\\{}", system_root.trim_end_matches('\\'), cleaned);
+    }
+
     cleaned
 }
 

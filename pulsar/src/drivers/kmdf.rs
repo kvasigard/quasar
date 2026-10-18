@@ -5,7 +5,9 @@ use std::ptr;
 
 use super::error::DriverError;
 use shared::ioctl::IoctlMessage;
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
@@ -13,6 +15,10 @@ use windows_sys::Win32::System::IO::DeviceIoControl;
 
 /// Safe RAII handle to the `\Device\SingularityDevice` kernel device object.
 pub struct Singularity(HANDLE);
+
+// SAFETY: Win32 device handles are thread-safe kernel object handles that can be shared across threads.
+unsafe impl Send for Singularity {}
+unsafe impl Sync for Singularity {}
 
 impl Drop for Singularity {
     fn drop(&mut self) {
@@ -40,11 +46,11 @@ impl Singularity {
         let device_path = windows_sys::w!("\\\\.\\SingularityDevice");
 
         // SAFETY: Device path is built to guarantee proper null-termination via the `w!` macro.
-        // Access rights are restricted to the minimum required.
+        // Request GENERIC_READ | GENERIC_WRITE to satisfy FILE_READ_WRITE_ACCESS IOCTLs.
         let handle = unsafe {
             CreateFileW(
                 device_path,
-                0, // 0 access is sufficient for many IOCTLs depending on device ACLs
+                GENERIC_READ | GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 ptr::null(),
                 OPEN_EXISTING,

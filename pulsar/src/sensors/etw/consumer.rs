@@ -60,12 +60,17 @@ unsafe extern "system" fn etw_callback(record: *mut EVENT_RECORD) {
             return;
         }
 
-        // Discard System (4), Idle (0), and our own tracer PID to avoid infinite loops
-        // or processing irrelevant background OS noise.
+        // Discard System (4), Idle (0), and our own tracer PID only on high-volume PerfInfo
+        // syscall events to avoid feedback loops while preserving Process (Start/DCStart/End)
+        // and StackWalk events emitted in System or tracer thread context.
         let process_id = (*record).EventHeader.ProcessId;
         let current_pid = (*ctx_ptr).current_pid;
+        let is_perfinfo = crate::pipeline::constants::guid_eq(
+            &(*record).EventHeader.ProviderId,
+            &crate::pipeline::constants::NT_KERNEL_PERFINFO_GUID,
+        );
 
-        if process_id == 0 || process_id == 4 || process_id == current_pid {
+        if is_perfinfo && (process_id == 0 || process_id == 4 || process_id == current_pid) {
             return;
         }
 

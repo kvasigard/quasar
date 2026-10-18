@@ -18,20 +18,24 @@ pub struct UserModeMemory {
     pub(crate) status_section: MdlSection,
     pub(crate) notification_event: Option<KernelNotificationEvent>,
     pub(crate) cpu_count: u32,
+    pub(crate) file_object: usize,
+    pub(crate) owner_process: usize,
 }
 
 unsafe impl Send for UserModeMemory {}
 
 impl UserModeMemory {
-    /// Constructs a new active user-mode mapping session.
+    /// Constructs a new active user-mode mapping session bound to the originating file object and process.
     ///
-    /// Stores mapped MDL sections alongside host processor geometry.
+    /// Stores mapped MDL sections alongside host processor geometry and ownership identifiers.
     ///
     /// # Arguments
     ///
     /// * `data_section` - Mapped user-mode data section.
     /// * `status_section` - Mapped user-mode status section.
     /// * `cpu_count` - Number of active logical processor partitions.
+    /// * `file_object` - Originating `WDFFILEOBJECT` identifier.
+    /// * `owner_process` - Originating `PEPROCESS` identifier.
     ///
     /// # Return values
     ///
@@ -40,13 +44,29 @@ impl UserModeMemory {
         data_section: MdlSection,
         status_section: MdlSection,
         cpu_count: u32,
+        file_object: usize,
+        owner_process: usize,
     ) -> Self {
         Self {
             data_section,
             status_section,
             notification_event: None,
             cpu_count,
+            file_object,
+            owner_process,
         }
+    }
+
+    /// Returns the `WDFFILEOBJECT` address that owns this user-mode mapping.
+    #[inline(always)]
+    pub(crate) fn file_object(&self) -> usize {
+        self.file_object
+    }
+
+    /// Returns the `PEPROCESS` address of the process into which these MDL pages are mapped.
+    #[inline(always)]
+    pub(crate) fn owner_process(&self) -> usize {
+        self.owner_process
     }
 
     /// Formats the mapped virtual addresses into a [`PerCpuMapResponse`] structure.
@@ -67,15 +87,21 @@ impl UserModeMemory {
         }
     }
 
-    /// Attaches a registered kernel notification event to this active session.
-    ///
-    /// Stores the referenced `KEVENT` object for asynchronous wakeups.
+    /// Attaches a registered kernel notification event to this active session, returning any
+    /// previously attached event so the caller can drop it outside the spinlock at `PASSIVE_LEVEL`.
     ///
     /// # Arguments
     ///
     /// * `event` - RAII wrapped kernel event object.
-    pub(crate) fn set_notification_event(&mut self, event: KernelNotificationEvent) {
-        self.notification_event = Some(event);
+    ///
+    /// # Return values
+    ///
+    /// * `Option<KernelNotificationEvent>` - Previously registered event object, if any.
+    pub(crate) fn set_notification_event(
+        &mut self,
+        event: KernelNotificationEvent,
+    ) -> Option<KernelNotificationEvent> {
+        self.notification_event.replace(event)
     }
 
     /// Signals the user-mode reader thread to wake up.

@@ -148,7 +148,7 @@ impl ProcessEvent {
             exit_status,
             user_sid,
             image_file_name: dto.ImageFileName.to_string(),
-            command_line: String::from_utf16_lossy(dto.CommandLine),
+            command_line: crate::helpers::strings::decode_utf16le_bytes(dto.CommandLine),
         })
     }
 

@@ -11,13 +11,12 @@ use thiserror::Error;
 use crate::model::types::{ExitStatus, ProcessId};
 use crate::model::{ParentProcess, ProcessKey, ProcessNode};
 
+/// Maximum number of terminated process generations retained per OS PID.
+const MAX_HISTORY_PER_PID: usize = 16;
+
 /// Errors that can occur during process tree lifecycle state transitions.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ProcessTreeError {
-    /// An active process is already registered under the specified PID without terminating.
-    #[error("An active process already exists for PID: {0:?}")]
-    ActiveProcessConflict(ProcessId),
-
     /// A process could not be found for the given PID and timestamp.
     #[error("No process found for PID {pid:?} at timestamp {timestamp}")]
     ProcessNotFound {
@@ -26,10 +25,6 @@ pub enum ProcessTreeError {
         /// Query timestamp used during lookup.
         timestamp: i64,
     },
-
-    /// The process requested for termination has already exited.
-    #[error("Process with key {0:?} has already terminated")]
-    AlreadyTerminated(ProcessKey),
 }
 
 /// Represents the generational lifetime history of processes sharing a single OS PID.
@@ -38,7 +33,6 @@ pub enum ProcessTreeError {
 /// the currently active process instance for immediate $O(1)$ access and preserves
 /// terminated generations in chronological order for historical telemetry correlation.
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub(super) struct ProcessTimeline {
     /// The currently running process instance bound to this PID.
     pub(super) active: Option<ProcessNode>,
@@ -46,13 +40,12 @@ pub(super) struct ProcessTimeline {
     pub(super) history: Vec<ProcessNode>,
 }
 
-#[allow(dead_code)]
 impl ProcessTimeline {
     /// Resolves the process key whose lifetime covers the given timestamp.
     ///
     /// # Arguments
     ///
-    /// * `timestamp` - The telemetry event timestamp to correlate.
+    /// * `timestamp` - The telemetry event timestamp (QPC ticks) to correlate.
     ///
     /// # Returns
     ///
@@ -60,7 +53,7 @@ impl ProcessTimeline {
     pub fn resolve_at_time(&self, timestamp: i64) -> Option<ProcessKey> {
         // Fast-path: Check if the active process was created prior to or at the event timestamp.
         if let Some(ref active) = self.active
-            && active.creation_timestamp() <= timestamp
+            && (timestamp <= 0 || active.creation_timestamp() <= timestamp)
         {
             return Some(active.key());
         }
@@ -76,6 +69,13 @@ impl ProcessTimeline {
                     return Some(historical.key());
                 }
             }
+        }
+
+        // If no historical generation matched and an active process exists (e.g. a rundown
+        // DCStart process whose enumeration timestamp was recorded slightly after an event),
+        // fall back to the active process when history is empty.
+        if self.history.is_empty() {
+            return self.active.as_ref().map(|a| a.key());
         }
 
         None
@@ -129,14 +129,16 @@ impl ProcessTimeline {
 /// This structure eliminates redundant secondary maps while facilitating $O(1)$ live-process
 /// lookups and temporal resolution for recycled PIDs.
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub(super) struct ProcessTree {
     pub(super) processes: HashMap<ProcessId, ProcessTimeline>,
 }
 
-#[allow(dead_code)]
 impl ProcessTree {
     /// Inserts a new process upon receiving a process start lifecycle event.
+    ///
+    /// If a prior process instance is still marked active on the same PID (for example, if its
+    /// ETW `End` event was dropped under load), it is automatically retired into the PID's
+    /// historical timeline at `process.creation_timestamp` before inserting the new generation.
     ///
     /// Automatically attempts to resolve the parent [`ProcessKey`] at `process.creation_timestamp`.
     /// If resolved, establishes bidirectional parent-child links. If the parent was created before
@@ -149,23 +151,32 @@ impl ProcessTree {
     /// # Returns
     ///
     /// The unique [`ProcessKey`] assigned to the inserted process.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProcessTreeError::ActiveProcessConflict`] if an active, un-terminated process
-    /// already occupies the same PID.
     pub fn handle_start(&mut self, mut process: ProcessNode) -> Result<ProcessKey, ProcessTreeError> {
         let child_key = process.key();
         let pid = child_key.pid;
         let creation_ts = child_key.creation_timestamp;
 
-        let timeline = self.processes.entry(pid).or_default();
-        if timeline.active.is_some() {
-            return Err(ProcessTreeError::ActiveProcessConflict(pid));
+        {
+            let timeline = self.processes.entry(pid).or_default();
+            if let Some(mut prev_active) = timeline.active.take() {
+                prev_active.exit_timestamp = Some(creation_ts);
+                prev_active.is_alive = false;
+                prev_active.exit_status = Some(ExitStatus::Success);
+                if timeline.history.len() >= MAX_HISTORY_PER_PID {
+                    timeline.history.remove(0);
+                }
+                timeline.history.push(prev_active);
+            }
         }
 
         // Attempt to resolve parent key at creation time
-        if let Some(parent_key) = self.resolve_key(process.parent_pid(), creation_ts) {
+        let parent_pid = process.parent_pid();
+        if parent_pid.0 != 0
+            && parent_pid != pid
+            && let Some(parent_key) = self
+                .resolve_key(parent_pid, creation_ts)
+                .or_else(|| self.get_active(parent_pid).map(|p| p.key()))
+        {
             process.parent = ParentProcess::Resolved(parent_key);
 
             // Link child into parent's children collection for O(1) subtree traversal
@@ -185,7 +196,7 @@ impl ProcessTree {
     /// Records a process termination event.
     ///
     /// Marks the active process for `pid` as terminated, sets its exit timestamp and status,
-    /// and transitions it into the historical timeline.
+    /// and transitions it into the historical timeline (capped at `MAX_HISTORY_PER_PID`).
     ///
     /// # Arguments
     ///
@@ -227,6 +238,9 @@ impl ProcessTree {
         active.exit_status = Some(exit_status);
 
         let key = active.key();
+        if timeline.history.len() >= MAX_HISTORY_PER_PID {
+            timeline.history.remove(0);
+        }
         timeline.history.push(active);
 
         Ok(key)
@@ -244,6 +258,11 @@ impl ProcessTree {
     /// The matching [`ProcessKey`] if a process generation covers the timestamp, or `None`.
     pub fn resolve_key(&self, pid: ProcessId, timestamp: i64) -> Option<ProcessKey> {
         self.processes.get(&pid).and_then(|timeline| timeline.resolve_at_time(timestamp))
+    }
+
+    /// Returns an immutable reference to the currently active [`ProcessNode`] for `pid`, if any.
+    pub fn get_active(&self, pid: ProcessId) -> Option<&ProcessNode> {
+        self.processes.get(&pid).and_then(|timeline| timeline.active.as_ref())
     }
 
     /// Retrieves an immutable reference to a [`ProcessNode`] using its composite key.

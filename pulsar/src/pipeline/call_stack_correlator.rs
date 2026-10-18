@@ -32,13 +32,17 @@ struct PendingStack {
     inserted_at: Instant,
 }
 
+/// Composite key `(EventTimeStamp, ProcessId, ThreadId)` uniquely identifying a thread's
+/// kernel event across concurrent logical processors.
+type CorrelationKey = (u64, u32, u32);
+
 /// Correlates asynchronous ETW StackWalk records with triggering domain events.
 ///
 /// Designed for the NT Kernel Logger where stack walking is emitted as an out-of-band event
-/// with a matching `EventTimeStamp`.
+/// with a matching `(EventTimeStamp, StackProcess, StackThread)` tuple.
 pub struct CallStackCorrelator {
-    pending_triggers: HashMap<u64, PendingTrigger>,
-    pending_stacks: HashMap<u64, PendingStack>,
+    pending_triggers: HashMap<CorrelationKey, PendingTrigger>,
+    pending_stacks: HashMap<CorrelationKey, PendingStack>,
     max_pending: usize,
     max_age: Duration,
 }
@@ -61,24 +65,24 @@ impl CallStackCorrelator {
     /// in the pending stack pool awaiting the trigger event.
     pub fn process_stack_walk(&mut self, record: &EventRecord) -> Option<Event> {
         let dto = StackWalk_TypeGroup1::try_from(record.user_data.as_slice()).ok()?;
-        let timestamp_key = dto.EventTimeStamp;
+        let key: CorrelationKey = (dto.EventTimeStamp, dto.StackProcess, dto.StackThread);
         let stack_trace = StackTrace::new(dto.to_frames());
 
-        if let Some(pending) = self.pending_triggers.remove(&timestamp_key) {
+        if let Some(pending) = self.pending_triggers.remove(&key) {
             let mut event = pending.event;
             event.attach_stack_trace(stack_trace);
             return Some(event);
         }
 
         self.pending_stacks.insert(
-            timestamp_key,
+            key,
             PendingStack {
                 stack_trace,
                 inserted_at: Instant::now(),
             },
         );
 
-        self.evict_stale();
+        self.evict_stale_stacks();
         None
     }
 
@@ -95,22 +99,26 @@ impl CallStackCorrelator {
             return Some(event);
         }
 
-        let timestamp_key = event.timestamp() as u64;
+        let key: CorrelationKey = (
+            event.timestamp() as u64,
+            event.process_id(),
+            event.thread_id(),
+        );
 
-        if let Some(pending_stack) = self.pending_stacks.remove(&timestamp_key) {
+        if let Some(pending_stack) = self.pending_stacks.remove(&key) {
             event.attach_stack_trace(pending_stack.stack_trace);
             return Some(event);
         }
 
         self.pending_triggers.insert(
-            timestamp_key,
+            key,
             PendingTrigger {
                 event,
                 inserted_at: Instant::now(),
             },
         );
 
-        self.evict_stale();
+        self.evict_stale_stacks();
         None
     }
 
@@ -137,12 +145,12 @@ impl CallStackCorrelator {
         expired_events
     }
 
-    /// Enforces the memory threshold by purging oldest entries when capacity is reached.
-    fn evict_stale(&mut self) {
-        if self.pending_triggers.len() > self.max_pending
-            || self.pending_stacks.len() > self.max_pending
-        {
-            self.flush_expired();
+    /// Purges expired orphan stacks when `pending_stacks` exceeds capacity without dropping pending triggers.
+    fn evict_stale_stacks(&mut self) {
+        if self.pending_stacks.len() > self.max_pending {
+            let now = Instant::now();
+            self.pending_stacks
+                .retain(|_, item| now.duration_since(item.inserted_at) <= self.max_age);
         }
     }
 }

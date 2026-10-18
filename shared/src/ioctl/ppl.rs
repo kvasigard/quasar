@@ -1,7 +1,7 @@
 //! Process Protection Level (PPL) IOCTL definitions and payload structures.
 
 use crate::ctl_code;
-use super::{IoctlMessage, FILE_ANY_ACCESS, METHOD_BUFFERED, SINGULARITY_DEVICE_TYPE};
+use super::{IoctlMessage, FILE_READ_WRITE_ACCESS, METHOD_BUFFERED, SINGULARITY_DEVICE_TYPE};
 
 /// Custom Function Code for elevation control (>= 2048 / 0x800).
 pub const FUNCTION_ELEVATE: u32 = 0x801;
@@ -11,7 +11,7 @@ pub const IOCTL_CHANGE_PPL_LEVEL: u32 = ctl_code!(
     SINGULARITY_DEVICE_TYPE,
     FUNCTION_ELEVATE,
     METHOD_BUFFERED,
-    FILE_ANY_ACCESS
+    FILE_READ_WRITE_ACCESS
 );
 
 /// Request payload to modify the Process Protection Level (PPL) of a target process.
@@ -22,6 +22,24 @@ pub struct ChangeProcessPplLevel {
     pub process_id: u32,
     /// The bitmask representing the protection level (e.g. 0x31 for PPL-Antimalware).
     pub level: u8,
+    /// Explicit zero-initialized padding to eliminate uninitialized trailing struct bytes.
+    pub _reserved: [u8; 3],
+}
+
+// Compile-time layout guarantees: 8 bytes, 4-byte aligned, zero implicit padding
+const _: () = assert!(core::mem::size_of::<ChangeProcessPplLevel>() == 8);
+const _: () = assert!(core::mem::align_of::<ChangeProcessPplLevel>() == 4);
+
+impl ChangeProcessPplLevel {
+    /// Constructs a new `ChangeProcessPplLevel` request with zeroed padding bytes.
+    #[inline]
+    pub const fn new(process_id: u32, level: u8) -> Self {
+        Self {
+            process_id,
+            level,
+            _reserved: [0; 3],
+        }
+    }
 }
 
 impl IoctlMessage for ChangeProcessPplLevel {
@@ -42,5 +60,6 @@ mod tests {
         assert_eq!(align_of::<ChangeProcessPplLevel>(), 4);
         assert_eq!(offset_of!(ChangeProcessPplLevel, process_id), 0);
         assert_eq!(offset_of!(ChangeProcessPplLevel, level), 4);
+        assert_eq!(offset_of!(ChangeProcessPplLevel, _reserved), 5);
     }
 }

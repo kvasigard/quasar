@@ -84,7 +84,13 @@ impl LsassAccessEvent {
     }
 }
 
-impl TemplateEvent for LsassAccessEvent {
+// Compile-time layout guarantees: 40 bytes, 4-byte aligned, zero implicit padding
+const _: () = assert!(core::mem::size_of::<LsassAccessEvent>() == 40);
+const _: () = assert!(core::mem::align_of::<LsassAccessEvent>() == 4);
+
+// SAFETY: `LsassAccessEvent` is `#[repr(C)]`, `Copy`, contains only primitive integer and array fields,
+// and uses explicit `_reserved` padding so zero uninitialized bytes exist.
+unsafe impl TemplateEvent for LsassAccessEvent {
     const EVENT_TYPE: DriverEventType = DriverEventType::LsassAccess;
 }
 

@@ -91,6 +91,11 @@ impl EventListener for DetectionSink {
                     mitre_technique,
                     rule_name,
                 } => {
+                    let (technique_id, subtechnique_id) = match mitre_technique.split_once('.') {
+                        Some((base, _)) => (base.to_string(), Some(mitre_technique)),
+                        None => (mitre_technique, None),
+                    };
+
                     let alert = Alert {
                         id: Uuid::new_v4(),
                         timestamp: now_ms,
@@ -99,8 +104,8 @@ impl EventListener for DetectionSink {
                         description,
                         mitre: MitreAttack {
                             tactic: mitre_tactic,
-                            technique_id: mitre_technique.clone(),
-                            subtechnique_id: Some(mitre_technique),
+                            technique_id,
+                            subtechnique_id,
                             technique_name: "OS Credential Dumping: LSASS Memory".to_string(),
                         },
                         actor: enriched.actor,

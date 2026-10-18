@@ -41,11 +41,6 @@ pub unsafe extern "C" fn on_pre_process_operation(
     _registration_context: PVOID,
     operation_information: POB_PRE_OPERATION_INFORMATION,
 ) -> wdk_sys::OB_PREOP_CALLBACK_STATUS {
-    // Dynamic gate: if feature is disabled, return immediately without altering access
-    if (CALLBACK_GATES.load(Ordering::Relaxed) & GATE_PROCESS_PROTECTION) == 0 {
-        return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS;
-    }
-
     if operation_information.is_null() {
         return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS;
     }
@@ -59,12 +54,25 @@ pub unsafe extern "C" fn on_pre_process_operation(
         return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS;
     }
 
-    let target_process_raw: PEPROCESS = unsafe {
+    let gates = CALLBACK_GATES.load(Ordering::Relaxed);
+
+    let (target_process_raw, is_thread_handle): (PEPROCESS, bool) = unsafe {
         match op_info.ObjectType {
-            obj if obj == *PsProcessType => op_info.Object as PEPROCESS,
+            obj if obj == *PsProcessType => {
+                if (gates & GATE_PROCESS_PROTECTION) == 0 {
+                    return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS;
+                }
+                (op_info.Object as PEPROCESS, false)
+            }
             obj if obj == *PsThreadType => {
+                if (gates & GATE_THREAD_PROTECTION) == 0 {
+                    return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS;
+                }
                 // Target is an ETHREAD, resolve to parent process
-                wdk_sys::ntddk::PsGetThreadProcess(op_info.Object as PETHREAD)
+                (
+                    wdk_sys::ntddk::PsGetThreadProcess(op_info.Object as PETHREAD),
+                    true,
+                )
             }
             _ => return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS,
         }
@@ -76,14 +84,19 @@ pub unsafe extern "C" fn on_pre_process_operation(
         None => return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS,
     };
 
-    // Skip processes trying to open a handle to themselves
+    // Skip processes trying to open a handle to themselves (unless duplicating a handle to another process)
     if target_process.pid() == current_process.pid() {
         return _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS;
     }
 
     // Dispatch to process-specific filters:
     if filters::lsass::is_authentic_lsass(&target_process) {
-        filters::lsass::handle_lsass_pre_operation(&current_process, &target_process, op_info);
+        filters::lsass::handle_lsass_pre_operation(
+            &current_process,
+            &target_process,
+            op_info,
+            is_thread_handle,
+        );
     }
 
     _OB_PREOP_CALLBACK_STATUS::OB_PREOP_SUCCESS

@@ -100,6 +100,7 @@ impl EventRecord {
         let mut stack_trace = None;
 
         if record.ExtendedDataCount > 0 && !record.ExtendedData.is_null() {
+            // SAFETY: ExtendedData is non-null and ExtendedDataCount specifies the array length.
             unsafe {
                 let ext_data_slice = slice::from_raw_parts(
                     record.ExtendedData as *const EVENT_HEADER_EXTENDED_DATA_ITEM,
@@ -107,29 +108,40 @@ impl EventRecord {
                 );
 
                 for item in ext_data_slice {
+                    if item.DataPtr == 0 {
+                        continue;
+                    }
+                    let data_size = item.DataSize as usize;
+                    // Minimum size is 8 bytes for the MatchId header
+                    if data_size <= 8 {
+                        continue;
+                    }
+
                     // Match 64-bit stack traces
                     if item.ExtType == EVENT_HEADER_EXT_TYPE_STACK_TRACE64 as u16 {
-                        let data_size = item.DataSize as usize;
-                        // Minimum size is 8 bytes for the MatchId
-                        if data_size > 8 {
-                            let num_addresses = (data_size - 8) / std::mem::size_of::<u64>();
-                            // Skip the 8-byte MatchId to get directly to the addresses
-                            let ptr = (item.DataPtr as *const u8).add(8) as *const u64;
-                            stack_trace = Some(slice::from_raw_parts(ptr, num_addresses).to_vec());
-                            break;
-                        }
+                        let raw_bytes = slice::from_raw_parts(
+                            (item.DataPtr as *const u8).add(8),
+                            data_size - 8,
+                        );
+                        let frames: Vec<u64> = raw_bytes
+                            .chunks_exact(std::mem::size_of::<u64>())
+                            .map(|chunk| u64::from_ne_bytes(chunk.try_into().unwrap()))
+                            .collect();
+                        stack_trace = Some(frames);
+                        break;
                     }
                     // Match 32-bit stack traces
                     else if item.ExtType == EVENT_HEADER_EXT_TYPE_STACK_TRACE32 as u16 {
-                        let data_size = item.DataSize as usize;
-                        if data_size > 8 {
-                            let num_addresses = (data_size - 8) / std::mem::size_of::<u32>();
-                            let ptr = (item.DataPtr as *const u8).add(8) as *const u32;
-                            let addresses = slice::from_raw_parts(ptr, num_addresses);
-                            // Cast 32-bit addresses to u64 to unify the return type
-                            stack_trace = Some(addresses.iter().map(|&addr| addr as u64).collect());
-                            break;
-                        }
+                        let raw_bytes = slice::from_raw_parts(
+                            (item.DataPtr as *const u8).add(8),
+                            data_size - 8,
+                        );
+                        let frames: Vec<u64> = raw_bytes
+                            .chunks_exact(std::mem::size_of::<u32>())
+                            .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()) as u64)
+                            .collect();
+                        stack_trace = Some(frames);
+                        break;
                     }
                 }
             }

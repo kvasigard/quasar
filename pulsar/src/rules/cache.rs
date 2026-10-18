@@ -7,17 +7,24 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+use super::types::EventType;
+
+/// Maximum safety TTL (300 seconds) for `ProcessLifetime` entries so missed ETW `End` events
+/// can never permanently whitelist a recycled PID.
+const PROCESS_LIFETIME_MAX_TTL: Duration = Duration::from_secs(300);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CacheEntry {
-    /// Suppression lasts for the entire lifetime of the process instance.
-    ProcessLifetime,
+    /// Suppression lasts for the lifetime of the process instance (bounded by a safety max TTL).
+    ProcessLifetime(Instant),
     /// Suppression expires at the specified deadline.
     Timed(Instant),
 }
 
-/// Composite cache key pairing the calling process ID with requested access rights.
+/// Composite cache key pairing the event category, calling process ID, and discriminator (access rights).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct CacheKey {
+    event_type: EventType,
     pid: u32,
     desired_access: u32,
 }
@@ -40,19 +47,24 @@ impl SuppressionCache {
     ///
     /// # Arguments
     ///
+    /// * `event_type` - Telemetry event category.
     /// * `pid` - Caller process identifier.
-    /// * `desired_access` - Requested access rights bitmask.
+    /// * `desired_access` - Requested access rights bitmask (discriminator).
     ///
     /// # Returns
     ///
     /// `true` if an unexpired suppression entry exists; otherwise `false`.
-    pub fn is_suppressed(&self, pid: u32, desired_access: u32) -> bool {
-        let key = CacheKey { pid, desired_access };
+    pub fn is_suppressed(&self, event_type: EventType, pid: u32, desired_access: u32) -> bool {
+        let key = CacheKey {
+            event_type,
+            pid,
+            desired_access,
+        };
         let read_guard = self.entries.read().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(entry) = read_guard.get(&key) {
             match entry {
-                CacheEntry::ProcessLifetime => true,
+                CacheEntry::ProcessLifetime(max_deadline) => Instant::now() < *max_deadline,
                 CacheEntry::Timed(deadline) => Instant::now() < *deadline,
             }
         } else {
@@ -64,18 +76,36 @@ impl SuppressionCache {
     ///
     /// # Arguments
     ///
+    /// * `event_type` - Telemetry event category.
     /// * `pid` - Caller process identifier.
-    /// * `desired_access` - Requested access rights bitmask.
-    /// * `cooldown_seconds` - Duration to cache (0 = process lifetime).
-    pub fn insert(&self, pid: u32, desired_access: u32, cooldown_seconds: u32) {
-        let key = CacheKey { pid, desired_access };
+    /// * `desired_access` - Requested access rights bitmask (discriminator).
+    /// * `cooldown_seconds` - Duration to cache (0 = process lifetime, bounded by 300s safety max TTL).
+    pub fn insert(
+        &self,
+        event_type: EventType,
+        pid: u32,
+        desired_access: u32,
+        cooldown_seconds: u32,
+    ) {
+        let key = CacheKey {
+            event_type,
+            pid,
+            desired_access,
+        };
+        let now = Instant::now();
         let entry = if cooldown_seconds == 0 {
-            CacheEntry::ProcessLifetime
+            CacheEntry::ProcessLifetime(now + PROCESS_LIFETIME_MAX_TTL)
         } else {
-            CacheEntry::Timed(Instant::now() + Duration::from_secs(cooldown_seconds as u64))
+            CacheEntry::Timed(now + Duration::from_secs(cooldown_seconds as u64))
         };
 
         let mut write_guard = self.entries.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if write_guard.len() >= 4096 {
+            write_guard.retain(|_, v| match v {
+                CacheEntry::ProcessLifetime(max_deadline) => now < *max_deadline,
+                CacheEntry::Timed(deadline) => now < *deadline,
+            });
+        }
         write_guard.insert(key, entry);
     }
 
@@ -112,21 +142,21 @@ mod tests {
     #[test]
     fn test_process_lifetime_suppression() {
         let cache = SuppressionCache::new();
-        assert!(!cache.is_suppressed(8800, 0x1410));
+        assert!(!cache.is_suppressed(EventType::ObProcessHandle, 8800, 0x1410));
 
         // Insert with cooldown_seconds = 0 (process lifetime)
-        cache.insert(8800, 0x1410, 0);
-        assert!(cache.is_suppressed(8800, 0x1410));
+        cache.insert(EventType::ObProcessHandle, 8800, 0x1410, 0);
+        assert!(cache.is_suppressed(EventType::ObProcessHandle, 8800, 0x1410));
 
         // Different access mask on same PID should not be suppressed
-        assert!(!cache.is_suppressed(8800, 0x1FFFFF));
+        assert!(!cache.is_suppressed(EventType::ObProcessHandle, 8800, 0x1FFFFF));
 
         // Different PID on same access mask should not be suppressed
-        assert!(!cache.is_suppressed(9999, 0x1410));
+        assert!(!cache.is_suppressed(EventType::ObProcessHandle, 9999, 0x1410));
 
         // Pruning process removes suppression
         cache.prune_process(8800);
-        assert!(!cache.is_suppressed(8800, 0x1410));
+        assert!(!cache.is_suppressed(EventType::ObProcessHandle, 8800, 0x1410));
     }
 
     #[test]
@@ -134,11 +164,11 @@ mod tests {
         let cache = SuppressionCache::new();
 
         // Insert with 1-second timed cooldown
-        cache.insert(1234, 0x0010, 1);
-        assert!(cache.is_suppressed(1234, 0x0010));
+        cache.insert(EventType::ObProcessHandle, 1234, 0x0010, 1);
+        assert!(cache.is_suppressed(EventType::ObProcessHandle, 1234, 0x0010));
 
         // Wait for cooldown to expire
         sleep(Duration::from_millis(1100));
-        assert!(!cache.is_suppressed(1234, 0x0010));
+        assert!(!cache.is_suppressed(EventType::ObProcessHandle, 1234, 0x0010));
     }
 }

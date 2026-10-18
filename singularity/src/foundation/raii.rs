@@ -12,12 +12,17 @@ use wdk_sys::{
 /// Ensures that kernel object references acquired via lookup functions (such as
 /// `PsLookupProcessByProcessId`) are properly decremented when the guard leaves scope,
 /// preventing kernel memory leaks.
-pub(crate) struct EprocessGuard(pub(crate) PEPROCESS);
+pub(crate) struct EprocessGuard(PEPROCESS);
 
 impl EprocessGuard {
-    /// Creates a new guard wrapping a valid `PEPROCESS` reference.
+    /// Creates a new guard wrapping a valid, referenced `PEPROCESS` pointer.
     ///
-    /// Takes ownership of an already referenced process pointer.
+    /// Takes ownership of an already referenced process pointer that will be decremented
+    /// via `ObfDereferenceObject` on drop.
+    ///
+    /// # Safety
+    /// Caller must ensure `process` is a valid kernel `PEPROCESS` pointer with an incremented
+    /// object reference count transferred to this guard.
     ///
     /// # Arguments
     ///
@@ -26,7 +31,7 @@ impl EprocessGuard {
     /// # Return values
     ///
     /// * `Self` - RAII guard wrapping the process object.
-    pub(crate) fn new(process: PEPROCESS) -> Self {
+    pub(crate) unsafe fn new(process: PEPROCESS) -> Self {
         Self(process)
     }
 

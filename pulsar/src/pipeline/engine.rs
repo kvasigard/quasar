@@ -5,7 +5,7 @@
 //! stack walk events.
 
 use crate::pipeline::call_stack_correlator::CallStackCorrelator;
-use crate::pipeline::constants::{stack_walk_opcodes, NT_KERNEL_STACK_WALK_PROVIDER_GUID_DATA1};
+use crate::pipeline::constants::{guid_matches, stack_walk_opcodes, NT_KERNEL_STACK_WALK_GUID};
 use crate::pipeline::event::Event;
 use crate::sensors::etw::EventRecord;
 
@@ -60,7 +60,7 @@ impl Pipeline {
     /// ```
     pub fn feed(&mut self, record: &EventRecord) -> Option<Event> {
         // Handle asynchronous out-of-band StackWalk records
-        if record.provider_id.data1 == NT_KERNEL_STACK_WALK_PROVIDER_GUID_DATA1
+        if guid_matches(&record.provider_id, &NT_KERNEL_STACK_WALK_GUID)
             && record.opcode == stack_walk_opcodes::STACK_WALK
         {
             return self.correlator.process_stack_walk(record);
@@ -143,11 +143,11 @@ mod tests {
         }
     }
 
-    fn create_stack_walk_record(event_ts: u64, frames: &[u64]) -> EventRecord {
+    fn create_stack_walk_record(pid: u32, tid: u32, event_ts: u64, frames: &[u64]) -> EventRecord {
         let mut user_data = Vec::new();
         user_data.extend_from_slice(&event_ts.to_ne_bytes()); // EventTimeStamp
-        user_data.extend_from_slice(&1234u32.to_ne_bytes());  // StackProcess
-        user_data.extend_from_slice(&5678u32.to_ne_bytes());  // StackThread
+        user_data.extend_from_slice(&pid.to_ne_bytes());      // StackProcess
+        user_data.extend_from_slice(&tid.to_ne_bytes());      // StackThread
         for frame in frames {
             user_data.extend_from_slice(&frame.to_ne_bytes());
         }
@@ -163,8 +163,8 @@ mod tests {
             version: 2,
             opcode: 32, // StackWalk
             level: 0,
-            process_id: 1234,
-            thread_id: 5678,
+            process_id: pid,
+            thread_id: tid,
             timestamp: 99_999,
             user_data,
             stack_trace: None,
@@ -198,7 +198,7 @@ mod tests {
         assert!(pending.is_none(), "Syscall should be buffered awaiting StackWalk");
 
         // Feed matching StackWalk record
-        let stack_record = create_stack_walk_record(5_000, &[0x7FFF_AAAA, 0x7FFF_BBBB]);
+        let stack_record = create_stack_walk_record(4321, 100, 5_000, &[0x7FFF_AAAA, 0x7FFF_BBBB]);
         let completed = pipeline
             .feed(&stack_record)
             .expect("Stack walk must complete pending syscall");

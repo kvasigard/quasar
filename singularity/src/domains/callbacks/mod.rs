@@ -43,12 +43,20 @@ pub(crate) fn initialize() -> Result<(), CallbackError> {
         return Err(CallbackError::AlreadyInitialized);
     }
 
-    let callbacks = [Callback::new(
-        CallbackType::Process,
-        OperationType::All,
-        Some(on_pre_process_operation),
-        None,
-    )];
+    let callbacks = [
+        Callback::new(
+            CallbackType::Process,
+            OperationType::All,
+            Some(on_pre_process_operation),
+            None,
+        ),
+        Callback::new(
+            CallbackType::Thread,
+            OperationType::All,
+            Some(on_pre_process_operation),
+            None,
+        ),
+    ];
 
     unsafe { CALLBACK_MANAGER.register(DEFAULT_ALTITUDE, &callbacks) }
 }

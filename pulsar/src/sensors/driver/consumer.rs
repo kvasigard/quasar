@@ -75,43 +75,97 @@ impl CpuRingConsumer {
     where
         F: FnMut(u32, u16, f64, &[u8]),
     {
+        if self.data_size < core::mem::size_of::<EventHeader>() {
+            return 0;
+        }
+
         let header = unsafe { &*self.header };
         let write_cursor = header.write_cursor.load(Ordering::Acquire) as usize;
+        if write_cursor >= self.data_size || !write_cursor.is_multiple_of(8) {
+            log::error!(
+                target: "driver_consumer",
+                "[CPU {}] Out-of-bounds or unaligned write_cursor {} (data_size: {}). Aborting drain.",
+                self.cpu_id,
+                write_cursor,
+                self.data_size
+            );
+            return 0;
+        }
+
         let mut events_drained = 0;
+        let mut bytes_budget = self.data_size;
 
         let mut current_qpc = 0i64;
         unsafe {
             QueryPerformanceCounter(&raw mut current_qpc);
         }
 
-        while self.current_read != write_cursor {
+        while self.current_read != write_cursor && bytes_budget > 0 {
             if self.current_read + core::mem::size_of::<EventHeader>() > self.data_size {
+                // Tail slack (< 24 bytes) cannot hold an EventHeader; wrap to offset 0
+                let tail_slack = self.data_size.saturating_sub(self.current_read);
+                bytes_budget = bytes_budget.saturating_sub(tail_slack.max(1));
                 self.current_read = 0;
+                if self.current_read == write_cursor {
+                    break;
+                }
                 continue;
             }
 
             let event_ptr = unsafe { self.data.add(self.current_read) };
-            let event_header = unsafe { event_ptr.cast::<EventHeader>().read() };
+            let event_header = unsafe { event_ptr.cast::<EventHeader>().read_unaligned() };
 
             if event_header.magic != EVENT_MAGIC {
                 log::warn!(
                     target: "driver_consumer",
-                    "[CPU {}] Invalid magic {:#06X} at read offset {}. Advancing cursor.",
+                    "[CPU {}] Invalid magic {:#06X} at read offset {}. Resynchronizing cursor to write_cursor {}.",
                     self.cpu_id,
                     event_header.magic,
-                    self.current_read
+                    self.current_read,
+                    write_cursor
                 );
+                self.current_read = write_cursor;
                 break;
             }
 
             if event_header.event_type == EVENT_TYPE_WRAP {
+                let tail_bytes = self.data_size.saturating_sub(self.current_read);
+                bytes_budget = bytes_budget.saturating_sub(tail_bytes.max(1));
                 self.current_read = 0;
+                if self.current_read == write_cursor {
+                    break;
+                }
                 continue;
             }
 
             let payload_len = event_header.payload_len as usize;
-            let record_size = core::mem::size_of::<EventHeader>() + payload_len;
-            let aligned_record_size = (record_size + 7) & !7;
+            let Some(record_size) = core::mem::size_of::<EventHeader>().checked_add(payload_len)
+            else {
+                self.current_read = write_cursor;
+                break;
+            };
+            let Some(aligned_record_size) = record_size.checked_next_multiple_of(8) else {
+                self.current_read = write_cursor;
+                break;
+            };
+
+            if aligned_record_size == 0
+                || self
+                    .current_read
+                    .checked_add(aligned_record_size)
+                    .is_none_or(|end| end > self.data_size)
+            {
+                log::error!(
+                    target: "driver_consumer",
+                    "[CPU {}] Corrupted payload_len {} at offset {} exceeds partition size {}. Resynchronizing.",
+                    self.cpu_id,
+                    payload_len,
+                    self.current_read,
+                    self.data_size
+                );
+                self.current_read = write_cursor;
+                break;
+            }
 
             let payload_ptr = unsafe { event_ptr.add(core::mem::size_of::<EventHeader>()) };
             let payload = unsafe { core::slice::from_raw_parts(payload_ptr, payload_len) };
@@ -120,6 +174,10 @@ impl CpuRingConsumer {
             callback(self.cpu_id, event_header.event_type, latency_us, payload);
 
             self.current_read += aligned_record_size;
+            if self.current_read == self.data_size {
+                self.current_read = 0;
+            }
+            bytes_budget = bytes_budget.saturating_sub(aligned_record_size);
             events_drained += 1;
         }
 
@@ -153,14 +211,22 @@ impl DriverRingManager {
 
         let mut consumers = Vec::with_capacity(mapping.cpu_count as usize);
         for cpu_id in 0..mapping.cpu_count {
-            consumers.push(CpuRingConsumer::new(
+            let header_ptr = (mapping.status_address
+                + (cpu_id as u64 * mapping.per_cpu_status_size as u64))
+                as *const PerCpuRingHeader;
+            let initial_read = unsafe { (*header_ptr).read_cursor.load(Ordering::Acquire) as usize };
+            let mut consumer = CpuRingConsumer::new(
                 cpu_id,
                 mapping.status_address,
                 mapping.data_address,
                 mapping.per_cpu_status_size as usize,
                 mapping.per_cpu_data_size as usize,
                 freq as u64,
-            ));
+            );
+            if initial_read < mapping.per_cpu_data_size as usize && initial_read.is_multiple_of(8) {
+                consumer.current_read = initial_read;
+            }
+            consumers.push(consumer);
         }
 
         Self { consumers }
@@ -200,3 +266,60 @@ pub type PerCpuConsumer = CpuRingConsumer;
 
 /// Backward-compatible alias for [`DriverRingManager`].
 pub type MultiCpuRingManager = DriverRingManager;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn make_ring_header() -> PerCpuRingHeader {
+        PerCpuRingHeader::new()
+    }
+
+    #[test]
+    fn test_drain_recovers_from_invalid_magic_and_tail_wrap() {
+        let header = make_ring_header();
+        let mut data = vec![0u8; 128];
+
+        // Case 1: Invalid magic at offset 0 with write_cursor = 32 -> must resync current_read to 32 without infinite loop
+        header.write_cursor.store(32, Ordering::Release);
+        let mut consumer = CpuRingConsumer::new(
+            0,
+            (&raw const header) as u64,
+            data.as_ptr() as u64,
+            core::mem::size_of::<PerCpuRingHeader>(),
+            data.len(),
+            10_000_000,
+        );
+
+        let drained = consumer.drain(|_, _, _, _| {});
+        assert_eq!(drained, 0);
+        assert_eq!(consumer.current_read, 32);
+        assert_eq!(header.read_cursor.load(Ordering::Acquire), 32);
+
+        // Case 2: Valid event at offset 32 (payload 8 bytes -> total 32 bytes -> new offset 64)
+        let ev_header = EventHeader {
+            magic: EVENT_MAGIC,
+            event_type: 1,
+            payload_len: 8,
+            timestamp: 100,
+            cpu_id: 0,
+            _reserved: 0,
+        };
+        unsafe {
+            data.as_mut_ptr()
+                .add(32)
+                .cast::<EventHeader>()
+                .write_unaligned(ev_header);
+        }
+        data[56..64].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        header.write_cursor.store(64, Ordering::Release);
+
+        let mut received = Vec::new();
+        let drained2 = consumer.drain(|_cpu, ev_type, _lat, payload| {
+            received.push((ev_type, payload.to_vec()));
+        });
+        assert_eq!(drained2, 1);
+        assert_eq!(received[0].0, 1);
+        assert_eq!(received[0].1, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(consumer.current_read, 64);
+    }
+}

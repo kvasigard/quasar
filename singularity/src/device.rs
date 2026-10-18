@@ -74,12 +74,12 @@ impl core::error::Error for DeviceError {}
 ///
 /// # Arguments
 ///
-/// * `_file_object` - Framework file object representing the open device instance being closed.
-unsafe extern "C" fn device_file_cleanup(_file_object: WDFFILEOBJECT) {
+/// * `file_object` - Framework file object representing the open device instance being closed.
+unsafe extern "C" fn device_file_cleanup(file_object: WDFFILEOBJECT) {
     crate::driver_info!(
-        "[device::file_cleanup] User client handle closed or process terminated. Unmapping per-CPU ring buffers."
+        "[device::file_cleanup] User client handle closed or process terminated. Checking per-CPU ring buffer ownership."
     );
-    crate::comm::ring_buffer::teardown_user_mapping();
+    crate::comm::ring_buffer::teardown_user_mapping_for_file(file_object);
 }
 
 /// Creates and initializes the Non-PnP Control Device and sequential dispatch queue.

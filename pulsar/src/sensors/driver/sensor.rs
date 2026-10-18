@@ -15,12 +15,36 @@ use crate::helpers::SafeHandle;
 use crate::pipeline::event::Event;
 
 /// Telemetry sensor ingesting events from the Singularity driver's per-CPU shared ring buffers.
+///
+/// Holds an `Arc<Singularity>` reference to guarantee the underlying device file handle (and its
+/// mapped MDL virtual memory pages) remains open for the entire lifetime of the background worker thread.
 pub struct DriverSensor {
     ring_manager: DriverRingManager,
     notification_event: SafeHandle,
+    _driver: Option<Arc<Singularity>>,
 }
 
 impl DriverSensor {
+    /// Initializes the driver sensor with shared ownership of the [`Singularity`] device handle,
+    /// guaranteeing that `EvtFileCleanup` (`MmUnmapLockedPages`) cannot fire until the sensor stops.
+    ///
+    /// # Arguments
+    ///
+    /// * `driver` - Shared [`Singularity`] KMDF driver client handle.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`DriverSensor`] instance ready to start background draining.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError`] if memory mapping or event registration fails.
+    pub fn initialize_shared(driver: Arc<Singularity>) -> Result<Self, DriverError> {
+        let mut sensor = Self::initialize(&driver)?;
+        sensor._driver = Some(driver);
+        Ok(sensor)
+    }
+
     /// Initializes the driver sensor by mapping shared memory and registering an auto-reset Win32 event.
     ///
     /// # Arguments
@@ -67,6 +91,7 @@ impl DriverSensor {
         Ok(Self {
             ring_manager,
             notification_event: auto_event,
+            _driver: None,
         })
     }
 

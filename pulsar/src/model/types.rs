@@ -54,7 +54,7 @@ impl From<i32> for ExitStatus {
         match code {
             0 => Self::Success,
             // STATUS_CONTROL_C_EXIT (0xC000013A = -1073741510) indicates forced termination
-            STATUS_CONTROL_C_EXIT | 1 => Self::Terminated,
+            STATUS_CONTROL_C_EXIT => Self::Terminated,
             other => Self::Other(other),
         }
     }

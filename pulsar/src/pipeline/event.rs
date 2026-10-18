@@ -243,6 +243,24 @@ impl Event {
         }
     }
 
+    /// Returns the OS process identifier associated with this event.
+    pub fn process_id(&self) -> u32 {
+        match self {
+            Event::Process(e) => e.emitter_pid.0,
+            Event::Syscall(e) => e.process_id.0,
+            Event::LsassAccess(e) => e.source_pid,
+        }
+    }
+
+    /// Returns the OS thread identifier associated with this event.
+    pub fn thread_id(&self) -> u32 {
+        match self {
+            Event::Process(e) => e.emitter_tid,
+            Event::Syscall(e) => e.thread_id,
+            Event::LsassAccess(_) => 0,
+        }
+    }
+
     /// Attaches or updates the call stack trace for this domain event.
     ///
     /// # Arguments
@@ -281,28 +299,79 @@ impl Event {
     /// # }
     /// ```
     pub fn from_record(record: &EventRecord) -> Option<(Self, bool)> {
-        match (record.provider_id.data1, record.opcode) {
-            // Process Start / End / DCStart / DCEnd / Defunct (Async stack correlation not required)
-            (
-                NT_KERNEL_PROCESS_PROVIDER_GUID_DATA1,
+        let is_process_provider = guid_matches(&record.provider_id, &NT_KERNEL_PROCESS_GUID)
+            || guid_matches(&record.provider_id, &MANIFEST_KERNEL_PROCESS_GUID);
+
+        if is_process_provider {
+            return match record.opcode {
                 process_opcodes::START
                 | process_opcodes::END
                 | process_opcodes::DC_START
                 | process_opcodes::DC_END
-                | process_opcodes::DEFUNCT,
-            ) => ProcessEvent::try_from(record)
-                .ok()
-                .map(|e| (Event::Process(e), false)),
-
-            // Syscall Enter (Requires asynchronous kernel stack walk correlation)
-            (NT_KERNEL_PERFINFO_PROVIDER_GUID_DATA1, syscall_opcodes::SYSCALL_ENTER) => {
-                SyscallEvent::try_from(record)
+                | process_opcodes::DEFUNCT => ProcessEvent::try_from(record)
                     .ok()
-                    .map(|e| (Event::Syscall(e), true))
-            }
+                    .map(|e| (Event::Process(e), false)),
+                _ => None,
+            };
+        }
 
-            // Unrecognized or unmonitored provider/opcode
-            _ => None,
+        if (guid_matches(&record.provider_id, &NT_KERNEL_PERFINFO_GUID)
+            || record.provider_id.data1 == NT_KERNEL_PERFINFO_PROVIDER_GUID_DATA1)
+            && record.opcode == syscall_opcodes::SYSCALL_ENTER
+        {
+            return SyscallEvent::try_from(record)
+                .ok()
+                .map(|e| (Event::Syscall(e), true));
+        }
+
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classic_nt_kernel_process_guid_decoding() {
+        let ptr_size = std::mem::size_of::<usize>();
+        let mut user_data = Vec::new();
+        user_data.extend_from_slice(&vec![0x11u8; ptr_size]); // UniqueProcessKey
+        user_data.extend_from_slice(&1234u32.to_ne_bytes()); // ProcessId
+        user_data.extend_from_slice(&4u32.to_ne_bytes()); // ParentId
+        user_data.extend_from_slice(&0u32.to_ne_bytes()); // SessionId
+        user_data.extend_from_slice(&0i32.to_ne_bytes()); // ExitStatus
+        user_data.extend_from_slice(&vec![0x22u8; ptr_size]); // DirectoryTableBase
+        user_data.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]); // SID
+        user_data.extend_from_slice(b"explorer.exe\0"); // Even length (12 chars + 1 null = 13 bytes -> odd offset!)
+        for ch in "C:\\Windows\\explorer.exe".encode_utf16() {
+            user_data.extend_from_slice(&ch.to_le_bytes());
+        }
+        user_data.extend_from_slice(&0u16.to_le_bytes());
+
+        let record = EventRecord {
+            provider_id: NT_KERNEL_PROCESS_GUID,
+            event_id: 0,
+            opcode: process_opcodes::START,
+            version: 2,
+            level: 0,
+            process_id: 4,
+            thread_id: 8,
+            timestamp: 100_000,
+            user_data,
+            stack_trace: None,
+        };
+
+        let (event, requires_stack) =
+            Event::from_record(&record).expect("Classic NT Kernel Process GUID must decode");
+        assert!(!requires_stack);
+        match event {
+            Event::Process(proc_ev) => {
+                assert_eq!(proc_ev.process_id.0, 1234);
+                assert_eq!(proc_ev.image_file_name, "explorer.exe");
+                assert_eq!(proc_ev.command_line, "C:\\Windows\\explorer.exe");
+            }
+            other => panic!("Expected Event::Process, got {other:?}"),
         }
     }
 }

@@ -44,7 +44,11 @@ pub(crate) unsafe fn handle_change_ppl(request: *mut WDFREQUEST__) -> Result<usi
         return Err(IoctlError::BufferRetrievalFailed(status).into());
     }
 
-    let req = unsafe { &*(input_buffer as *const ChangeProcessPplLevel) };
+    let req = unsafe {
+        input_buffer
+            .cast::<ChangeProcessPplLevel>()
+            .read_unaligned()
+    };
 
     crate::driver_debug!(
         "[ioctl::handlers] Requesting permissions change for PID: {} to Level: {:#02X}",
@@ -96,7 +100,9 @@ pub(crate) unsafe fn handle_map_per_cpu_buffer(request: *mut WDFREQUEST__) -> Re
         return Err(IoctlError::BufferRetrievalFailed(status).into());
     }
 
-    let response = ring_buffer::create_user_mapping()?;
+    let file_object =
+        unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetFileObject, request) };
+    let response = ring_buffer::create_user_mapping(file_object)?;
 
     crate::driver_debug!(
         "[ioctl::handlers] Mapping successful: Data @ {:#018X}, Status @ {:#018X}, Cores: {}",
@@ -108,7 +114,7 @@ pub(crate) unsafe fn handle_map_per_cpu_buffer(request: *mut WDFREQUEST__) -> Re
     unsafe {
         output_buffer
             .cast::<PerCpuMapResponse>()
-            .write(response);
+            .write_unaligned(response);
     }
 
     Ok(core::mem::size_of::<PerCpuMapResponse>())
@@ -117,7 +123,7 @@ pub(crate) unsafe fn handle_map_per_cpu_buffer(request: *mut WDFREQUEST__) -> Re
 /// Handles the `IOCTL_REGISTER_EVENT` request by registering a Win32 event for kernel notification.
 ///
 /// Decodes the user-mode event handle from the request, references the underlying kernel event object,
-/// and binds it to the active ring buffer session.
+/// and binds it to the active ring buffer session owned by the request's file object.
 ///
 /// # Safety
 /// The caller must ensure `request` is a valid, uncompleted `WDFREQUEST` pointer provided by the framework.
@@ -151,22 +157,28 @@ pub(crate) unsafe fn handle_register_event(request: *mut WDFREQUEST__) -> Result
         return Err(IoctlError::BufferRetrievalFailed(status).into());
     }
 
-    let req = unsafe { *input_buffer.cast::<RegisterEventRequest>() };
+    let req = unsafe {
+        input_buffer
+            .cast::<RegisterEventRequest>()
+            .read_unaligned()
+    };
 
     crate::driver_debug!(
         "[ioctl::handlers] Processing IOCTL_REGISTER_EVENT with handle {:#018X}",
         req.event_handle
     );
 
+    let file_object =
+        unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetFileObject, request) };
     let res = unsafe {
-        ring_buffer::register_notification_event(req.event_handle as wdk_sys::HANDLE)
+        ring_buffer::register_notification_event(file_object, req.event_handle as wdk_sys::HANDLE)
     };
 
     if let Err(status) = res {
         crate::driver_error!(
             "[ioctl::handlers] Failed to reference notification event handle ({status:#010X})"
         );
-        return Err(IoctlError::BufferRetrievalFailed(status).into());
+        return Err(IoctlError::EventRegistrationFailed(status).into());
     }
 
     Ok(0)

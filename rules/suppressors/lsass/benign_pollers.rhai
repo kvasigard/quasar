@@ -22,8 +22,8 @@ fn rule_info() {
     }
 }
 
-// Only evaluate against routine query masks (0x1410)
-if event.desired_access != 0x1410 {
+// Only evaluate against routine query masks (0x1410) from signed binaries (Authenticode/Microsoft >= 8)
+if event.desired_access != 0x1410 || event.signature_level < 8 {
     return pass();
 }
 
@@ -36,13 +36,20 @@ if contains_ic(actor.command_line, "dump")
 }
 
 let name = event.short_name.to_lower();
+let actor_name = actor.name.to_lower();
+
+// Ensure the kernel EPROCESS short name matches the resolved actor name
+if name != actor_name {
+    return pass();
+}
 
 // 1. Windows Task Manager
 // - Must be taskmgr.exe
-// - Must reside in System32 to prevent path spoofing
+// - Must reside at C:\Windows\System32\Taskmgr.exe to prevent path spoofing
 // - Must run at Medium integrity (0x2000) or higher
 if name == "taskmgr.exe" {
     if starts_with_ic(actor.image_path, "c:\\windows\\system32\\")
+       && ends_with_ic(actor.image_path, "\\taskmgr.exe")
        && event.integrity_level >= 0x2000 {
         return suppress("Authentic Windows Task Manager diagnostic query", 0);
     }
@@ -50,10 +57,11 @@ if name == "taskmgr.exe" {
 
 // 2. WMI Provider Host
 // - Must be wmiprvse.exe
-// - Must reside in System32\wbem
+// - Must reside at C:\Windows\System32\wbem\WmiPrvSE.exe
 // - Must run as High/System integrity (0x3000+)
 if name == "wmiprvse.exe" {
     if starts_with_ic(actor.image_path, "c:\\windows\\system32\\wbem\\")
+       && ends_with_ic(actor.image_path, "\\wmiprvse.exe")
        && event.integrity_level >= 0x3000 {
         return suppress("Authentic WMI Provider Host diagnostic query", 0);
     }
@@ -65,6 +73,7 @@ if name == "wmiprvse.exe" {
 // - Must run as System integrity (0x4000)
 if name == "vmtoolsd.exe" {
     if starts_with_ic(actor.image_path, "c:\\program files\\vmware\\")
+       && ends_with_ic(actor.image_path, "\\vmtoolsd.exe")
        && event.integrity_level >= 0x4000 {
         return suppress("Authentic VMware Tools guest diagnostic query", 0);
     }

@@ -45,7 +45,7 @@ impl CallbackManager {
     ///
     /// `true` if callbacks are currently registered with the kernel, `false` otherwise.
     pub fn is_active(&self) -> bool {
-        !self.handle.load(Ordering::Relaxed).is_null()
+        !self.handle.load(Ordering::Acquire).is_null()
     }
 
     /// Registers callbacks with the Windows Object Manager.
@@ -175,7 +175,22 @@ impl CallbackManager {
             return Err(CallbackError::NullHandleReturned);
         }
 
-        self.handle.store(handle, Ordering::Release);
+        if self
+            .handle
+            .compare_exchange(
+                ptr::null_mut(),
+                handle,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            unsafe {
+                ObUnRegisterCallbacks(handle);
+            }
+            return Err(CallbackError::AlreadyInitialized);
+        }
+
         crate::driver_info!("[callbacks::register] Callbacks registered successfully");
         Ok(())
     }

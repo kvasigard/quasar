@@ -10,6 +10,7 @@ use wdk_sys::ntddk::{ObfDereferenceObject, PsReferencePrimaryToken, SeQueryInfor
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct IntegrityLevel(pub u32);
 
+#[allow(dead_code)]
 impl IntegrityLevel {
     /// Anonymous session or deeply restricted sandbox (`S-1-16-0x0000`).
     pub(crate) const UNTRUSTED: Self = Self(0x0000);
@@ -68,18 +69,21 @@ pub(crate) struct TokenGuard(*mut core::ffi::c_void);
 impl TokenGuard {
     /// References the primary token of the specified process.
     ///
-    /// Acquires an executive object reference via `PsReferencePrimaryToken`.
+    /// Acquires an executive object reference via `PsReferencePrimaryToken` at `<= APC_LEVEL`.
     ///
     /// # Arguments
     ///
-    /// * `process` - Raw kernel `PEPROCESS` pointer.
+    /// * `process` - Valid `Eprocess` wrapper.
     ///
     /// # Return values
     ///
     /// * `Some(Self)` - Valid non-null token guard wrapping the referenced token.
-    /// * `None` - Process token unresolvable or NULL.
-    pub(crate) fn from_process(process: wdk_sys::PEPROCESS) -> Option<Self> {
-        let token = unsafe { PsReferencePrimaryToken(process) };
+    /// * `None` - Process token unresolvable, NULL, or IRQL > `APC_LEVEL`.
+    pub(crate) fn from_process(process: &super::eprocess::Eprocess) -> Option<Self> {
+        if crate::foundation::irql::ensure_max_irql(wdk_sys::APC_LEVEL as u8).is_err() {
+            return None;
+        }
+        let token = unsafe { PsReferencePrimaryToken(process.as_raw()) };
         if token.is_null() {
             None
         } else {
@@ -101,29 +105,33 @@ impl TokenGuard {
     ///
     /// Invokes `SeQueryInformationToken` with `TokenIntegrityLevel`.
     ///
-    /// Note: Unlike user-mode `GetTokenInformation`, the kernel routine `SeQueryInformationToken`
-    /// for `TokenIntegrityLevel` directly resolves the mandatory label sub-authority RID
-    /// (e.g. `0x4000` for SYSTEM, `0x3000` for HIGH, `0x2000` for MEDIUM) and writes the `ULONG`
-    /// directly to the supplied buffer address, without allocating pool memory.
+    /// Note: The kernel routine `SeQueryInformationToken` for `TokenIntegrityLevel` writes the
+    /// mandatory label sub-authority RID directly into `*TokenInformation` as a pointer-sized
+    /// value (`PVOID`, 8 bytes on x64) without allocating pool memory. Passing a pointer-sized
+    /// `PVOID` variable prevents 8-byte stack smash corruption on 64-bit targets.
     ///
     /// # Return values
     ///
     /// * `IntegrityLevel` - Mandatory integrity tier classification (e.g. Low, Medium, High, System).
     pub(crate) fn integrity_level(&self) -> IntegrityLevel {
-        let mut rid: u32 = 0;
+        if crate::foundation::irql::ensure_max_irql(wdk_sys::APC_LEVEL as u8).is_err() {
+            return IntegrityLevel::UNTRUSTED;
+        }
+
+        let mut info_ptr: wdk_sys::PVOID = core::ptr::null_mut();
         let status = unsafe {
             SeQueryInformationToken(
                 self.as_ptr(),
                 wdk_sys::_TOKEN_INFORMATION_CLASS::TokenIntegrityLevel,
-                &mut rid as *mut u32 as *mut wdk_sys::PVOID,
+                &raw mut info_ptr,
             )
         };
 
-        if status < 0 {
+        if !wdk::nt_success(status) {
             return IntegrityLevel::UNTRUSTED;
         }
 
-        IntegrityLevel(rid)
+        IntegrityLevel(info_ptr as usize as u32)
     }
 }
 

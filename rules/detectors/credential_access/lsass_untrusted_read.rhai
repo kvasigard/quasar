@@ -19,12 +19,15 @@ fn rule_info() {
 }
 
 if event.signature_level < 8 && has_mask(event.desired_access, 0x0010) {
+    let mitigation_note = if event.is_mitigated {
+        "In-flight kernel mitigation reduced access rights down to query status."
+    } else {
+        "Handle rights were NOT stripped in-flight (monitoring/audit mode)."
+    };
+
     return alert(
-        "High",
         "LSASS Memory Access by Untrusted Process",
-        `Unsigned process ${event.short_name} (PID ${event.source_pid}) requested PROCESS_VM_READ access to LSASS memory. In-flight kernel mitigation reduced access rights down to query status.`,
-        "Credential Access",
-        "T1003.001"
+        `Unsigned process ${event.short_name} (PID ${event.source_pid}) requested PROCESS_VM_READ access to LSASS memory. ${mitigation_note}`
     );
 }
 

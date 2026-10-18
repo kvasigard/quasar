@@ -4,6 +4,8 @@
 
 use std::ffi::c_void;
 use std::ptr;
+use std::thread;
+use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     ERROR_INSUFFICIENT_BUFFER, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST,
     GetLastError,
@@ -11,9 +13,10 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
     OpenServiceW, QueryServiceConfigW, QueryServiceStatus, QUERY_SERVICE_CONFIGW,
-    SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START,
-    SERVICE_ERROR_NORMAL, SERVICE_KERNEL_DRIVER, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS,
-    SERVICE_RUNNING, SERVICE_START, SERVICE_STATUS, SERVICE_STOP, StartServiceW,
+    SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SERVICE_ALL_ACCESS, SERVICE_CONTROL_STOP,
+    SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, SERVICE_KERNEL_DRIVER, SERVICE_QUERY_CONFIG,
+    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_STATUS, SERVICE_STOP,
+    SERVICE_STOPPED, StartServiceW,
 };
 
 use super::error::DriverError;
@@ -155,7 +158,7 @@ pub fn unload_driver() -> Result<(), DriverError> {
         OpenServiceW(
             scm_handle.0,
             service_name,
-            SERVICE_STOP | SERVICE_ALL_ACCESS,
+            SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_ALL_ACCESS,
         )
     };
 
@@ -173,7 +176,20 @@ pub fn unload_driver() -> Result<(), DriverError> {
         unsafe { ControlService(service_handle.0, SERVICE_CONTROL_STOP, &mut status) };
 
     if control_result == 0 {
-        log::warn!(target: "scm", "ControlService stop request failed or service already stopped. Proceeding with deletion.");
+        log::warn!(target: "scm", "ControlService stop request failed or service already stopped. Proceeding with status verification.");
+    } else {
+        // Poll until the driver reaches SERVICE_STOPPED (up to 2.5 seconds) so that DeleteService
+        // removes the service immediately rather than leaving it in a "Marked for Deletion" state.
+        for _ in 0..50 {
+            if status.dwCurrentState == SERVICE_STOPPED {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+            let query_ok = unsafe { QueryServiceStatus(service_handle.0, &mut status) };
+            if query_ok == 0 {
+                break;
+            }
+        }
     }
 
     log::debug!(target: "scm", "Deleting Singularity driver service registration...");
@@ -199,7 +215,7 @@ pub fn unload_driver() -> Result<(), DriverError> {
 pub fn is_driver_service_registered() -> Result<bool, DriverError> {
     log::debug!(target: "scm", "Checking if Singularity driver service is registered...");
 
-    let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS) };
+    let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
     if scm.is_null() {
         let err = unsafe { GetLastError() };
         return Err(DriverError::from_win32_code(err));
@@ -223,6 +239,7 @@ pub fn is_driver_service_registered() -> Result<bool, DriverError> {
         }
         return Err(DriverError::from_win32_code(err));
     }
+    let _service_handle = ScmHandle(service);
 
     Ok(true)
 }
@@ -239,7 +256,7 @@ pub fn is_driver_service_registered() -> Result<bool, DriverError> {
 pub fn get_service_binary_path() -> Result<String, DriverError> {
     log::debug!(target: "scm", "Retrieving Singularity driver service binary path...");
 
-    let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS) };
+    let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
     if scm.is_null() {
         let err = unsafe { GetLastError() };
         return Err(DriverError::from_win32_code(err));
@@ -263,7 +280,7 @@ pub fn get_service_binary_path() -> Result<String, DriverError> {
     let service_handle = ScmHandle(service);
 
     let mut bytes_needed: u32 = 0;
-    
+
     // Query required buffer size
     unsafe {
         QueryServiceConfigW(
@@ -279,15 +296,16 @@ pub fn get_service_binary_path() -> Result<String, DriverError> {
         return Err(DriverError::from_win32_code(err));
     }
 
-    // Allocate buffer with alignment for the struct
-    let mut buffer = vec![0u8; bytes_needed as usize];
+    // Allocate 8-byte aligned buffer for QUERY_SERVICE_CONFIGW
+    let u64_len = (bytes_needed as usize).div_ceil(std::mem::size_of::<u64>());
+    let mut buffer = vec![0u64; u64_len];
     let config_ptr = buffer.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW;
 
     let success = unsafe {
         QueryServiceConfigW(
             service_handle.0,
             config_ptr,
-            bytes_needed,
+            (u64_len * std::mem::size_of::<u64>()) as u32,
             &mut bytes_needed,
         )
     };
@@ -328,7 +346,7 @@ pub fn get_service_binary_path() -> Result<String, DriverError> {
 pub fn is_service_running() -> Result<bool, DriverError> {
     log::debug!(target: "scm", "Checking if Singularity driver service is running...");
 
-    let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS) };
+    let scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
     if scm.is_null() {
         let err = unsafe { GetLastError() };
         return Err(DriverError::from_win32_code(err));

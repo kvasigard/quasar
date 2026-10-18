@@ -57,29 +57,44 @@ pub(crate) fn ensure_max_irql(max_allowed: u8) -> Result<u8, u8> {
 /// or multi-producer CAS loops.
 pub(crate) struct DispatchIrqlGuard {
     old_irql: KIRQL,
+    raised: bool,
 }
 
 impl DispatchIrqlGuard {
-    /// Raises the processor IRQL to `DISPATCH_LEVEL` and returns an RAII guard.
+    /// Ensures the processor IRQL is at least `DISPATCH_LEVEL` and returns an RAII guard.
     ///
-    /// Saves the previous IRQL to restore it upon drop. Caller must not access pageable memory
-    /// while this guard remains active.
+    /// If the processor is currently below `DISPATCH_LEVEL`, raises IRQL to `DISPATCH_LEVEL`
+    /// and saves the previous IRQL to restore it upon drop. If already at or above `DISPATCH_LEVEL`,
+    /// leaves IRQL unchanged to prevent `IRQL_NOT_GREATER_OR_EQUAL` bugchecks.
     ///
     /// # Return values
     ///
-    /// * `Self` - RAII guard holding the previous IRQL.
+    /// * `Self` - RAII guard holding the previous IRQL state.
     #[inline(always)]
     pub(crate) fn raise() -> Self {
-        let old_irql = unsafe { KfRaiseIrql(DISPATCH_LEVEL as KIRQL) };
-        Self { old_irql }
+        let current = current_irql();
+        if current < DISPATCH_LEVEL as u8 {
+            let old_irql = unsafe { KfRaiseIrql(DISPATCH_LEVEL as KIRQL) };
+            Self {
+                old_irql,
+                raised: true,
+            }
+        } else {
+            Self {
+                old_irql: current,
+                raised: false,
+            }
+        }
     }
 }
 
 impl Drop for DispatchIrqlGuard {
     #[inline(always)]
     fn drop(&mut self) {
-        unsafe {
-            KeLowerIrql(self.old_irql);
+        if self.raised {
+            unsafe {
+                KeLowerIrql(self.old_irql);
+            }
         }
     }
 }

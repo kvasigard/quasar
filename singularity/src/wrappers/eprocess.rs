@@ -25,6 +25,7 @@ unsafe extern "system" {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SeSigningLevel(pub u8);
 
+#[allow(dead_code)]
 impl SeSigningLevel {
     /// Image has not been evaluated by Code Integrity.
     pub(crate) const UNCHECKED: Self = Self(0x00);
@@ -56,7 +57,6 @@ impl SeSigningLevel {
     /// * `true` - Signed by Microsoft Production PCA, Windows PCA, or Antimalware PCA.
     /// * `false` - Unsigned, test-signed, or third-party Authenticode.
     #[inline(always)]
-    #[allow(dead_code)]
     pub(crate) fn is_microsoft_or_higher(self) -> bool {
         self.0 >= Self::MICROSOFT.0
     }
@@ -94,6 +94,7 @@ fn resolve_ps_get_process_signature_level() -> Option<FnPsGetProcessSignatureLev
 
 /// Protection type indicating whether a process is Protected (PP) or ProtectedLight (PPL).
 #[repr(u8)]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum PsProtectedType {
     /// Unprotected process.
@@ -135,6 +136,7 @@ pub(crate) enum PsProtectedSigner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PsProtection(pub u8);
 
+#[allow(dead_code)]
 impl PsProtection {
     /// Unprotected process (`0x00`).
     pub(crate) const NONE: Self = Self(0);
@@ -330,7 +332,7 @@ impl Eprocess {
             let level = unsafe { func(self.as_raw(), core::ptr::null_mut()) };
             SeSigningLevel(level)
         } else {
-            SeSigningLevel::UNSIGNED
+            SeSigningLevel::UNCHECKED
         }
     }
 
@@ -350,7 +352,7 @@ impl Eprocess {
             let level = unsafe { func(self.as_raw(), &mut section_level) };
             (SeSigningLevel(level), SeSigningLevel(section_level))
         } else {
-            (SeSigningLevel::UNSIGNED, SeSigningLevel::UNSIGNED)
+            (SeSigningLevel::UNCHECKED, SeSigningLevel::UNCHECKED)
         }
     }
 
@@ -376,7 +378,7 @@ impl Eprocess {
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn integrity_level(&self) -> super::token::IntegrityLevel {
-        super::token::TokenGuard::from_process(self.as_raw())
+        super::token::TokenGuard::from_process(self)
             .map(|token| token.integrity_level())
             .unwrap_or(super::token::IntegrityLevel::UNTRUSTED)
     }
@@ -421,22 +423,28 @@ impl Eprocess {
 
     /// Retrieves the full NT path of the process executable (e.g. `\Device\HarddiskVolume3\...`).
     ///
-    /// Queries `SeLocateProcessImageName` to resolve the full NT image path.
-    /// The caller must free the resulting `UNICODE_STRING` buffer using `ExFreePool`.
+    /// Queries `SeLocateProcessImageName` to resolve the full NT image path and wraps the
+    /// resulting pool allocation in a [`PoolGuard`](super::pool::PoolGuard) so it is automatically
+    /// freed via `ExFreePool` on drop.
     ///
     /// # Return values
     ///
-    /// * `Ok(*mut wdk_sys::_UNICODE_STRING)` - Allocated unicode string containing full image path.
+    /// * `Ok(PoolGuard<wdk_sys::_UNICODE_STRING>)` - RAII-managed unicode string containing full image path.
     /// * `Err(NTSTATUS)` - Query failed or image path unresolvable.
     #[allow(dead_code)]
-    pub(crate) fn full_image_path(&self) -> Result<*mut wdk_sys::_UNICODE_STRING, NTSTATUS> {
+    pub(crate) fn full_image_path(
+        &self,
+    ) -> Result<super::pool::PoolGuard<wdk_sys::_UNICODE_STRING>, NTSTATUS> {
         let mut unicode_str_ptr: PUNICODE_STRING = core::ptr::null_mut();
         let status = unsafe {
             SeLocateProcessImageName(self.as_raw(), &mut unicode_str_ptr as *mut PUNICODE_STRING)
         };
 
-        if status >= 0 && !unicode_str_ptr.is_null() {
-            Ok(unicode_str_ptr)
+        if wdk::nt_success(status) {
+            unsafe {
+                super::pool::PoolGuard::from_raw(unicode_str_ptr)
+                    .ok_or(wdk_sys::STATUS_UNSUCCESSFUL)
+            }
         } else {
             Err(status)
         }

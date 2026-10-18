@@ -106,6 +106,7 @@ impl MdlSection {
     ///
     /// * `NonNull<MDL>` - Non-null pointer to the kernel MDL.
     #[inline(always)]
+    #[allow(dead_code)]
     pub(crate) fn mdl(&self) -> NonNull<MDL> {
         self.mdl
     }

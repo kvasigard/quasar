@@ -94,18 +94,37 @@ impl RhaiActor {
 
     /// Checks if any ancestor process in the execution tree matches `name` (case-insensitive).
     ///
+    /// Because `ancestry` is ordered chronologically from root to actor (`[root, ..., parent, actor]`),
+    /// the last element is the actor itself and is excluded from ancestor matching.
+    ///
     /// # Arguments
     ///
-    /// * `name` - Substring or full binary name to look for in the lineage.
+    /// * `name` - Substring or full binary name to look for in the ancestor lineage.
     ///
     /// # Returns
     ///
-    /// `true` if any ancestor contains the target name; otherwise `false`.
+    /// `true` if any parent/ancestor contains the target name; otherwise `false`.
     pub fn has_ancestor(&self, name: &str) -> bool {
+        let ancestor_slice = if self.ancestry.len() > 1 {
+            &self.ancestry[..self.ancestry.len() - 1]
+        } else {
+            &[]
+        };
         let needle = name.to_lowercase();
-        self.ancestry
+        ancestor_slice
             .iter()
             .any(|ancestor| ancestor.to_lowercase().contains(&needle))
+    }
+}
+
+/// Parses a human-readable severity string into an [`AlertSeverity`] enum variant.
+pub fn parse_severity(severity: &str) -> AlertSeverity {
+    match severity.to_lowercase().as_str() {
+        "critical" => AlertSeverity::Critical,
+        "high" => AlertSeverity::High,
+        "medium" => AlertSeverity::Medium,
+        "low" => AlertSeverity::Low,
+        _ => AlertSeverity::Informational,
     }
 }
 
@@ -174,7 +193,7 @@ pub fn register_bindings(engine: &mut Engine) {
     // 4. Register RuleVerdict
     engine.register_type_with_name::<RuleVerdict>("Verdict");
 
-    // 4. Register Verdict Constructors
+    // 5. Register Verdict Constructors
     engine.register_fn("suppress", |reason: &str, cooldown_seconds: i64| -> RuleVerdict {
         RuleVerdict::Suppress {
             reason: reason.to_string(),
@@ -182,6 +201,20 @@ pub fn register_bindings(engine: &mut Engine) {
         }
     });
 
+    // 2-argument `alert(title, description)` constructor that inherits severity, tactic, and
+    // technique from the rule's `fn rule_info()` metadata during `evaluate_rule`.
+    engine.register_fn("alert", |title: &str, description: &str| -> RuleVerdict {
+        RuleVerdict::Alert {
+            severity: AlertSeverity::Informational,
+            title: title.to_string(),
+            description: description.to_string(),
+            mitre_tactic: String::new(),
+            mitre_technique: String::new(),
+            rule_name: None,
+        }
+    });
+
+    // 5-argument `alert(severity, title, description, mitre_tactic, mitre_technique)` override.
     engine.register_fn(
         "alert",
         |severity: &str,
@@ -190,16 +223,8 @@ pub fn register_bindings(engine: &mut Engine) {
          mitre_tactic: &str,
          mitre_technique: &str|
          -> RuleVerdict {
-            let sev = match severity.to_lowercase().as_str() {
-                "critical" => AlertSeverity::Critical,
-                "high" => AlertSeverity::High,
-                "medium" => AlertSeverity::Medium,
-                "low" => AlertSeverity::Low,
-                _ => AlertSeverity::Informational,
-            };
-
             RuleVerdict::Alert {
-                severity: sev,
+                severity: parse_severity(severity),
                 title: title.to_string(),
                 description: description.to_string(),
                 mitre_tactic: mitre_tactic.to_string(),

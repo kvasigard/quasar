@@ -6,6 +6,7 @@
 //! The [`SystemState`] structure is intended to be accessed across the `pulsar` crate
 //! to correlate telemetry, navigate process lineages, and evaluate detection rules.
 
+use std::collections::HashSet;
 use std::sync::{LazyLock, RwLock};
 
 mod process_tree;
@@ -15,7 +16,9 @@ pub(crate) use crate::state::process_tree::ProcessTreeError;
 use crate::model::types::{ExitStatus, ProcessId};
 use crate::model::{ProcessKey, ProcessNode};
 
-#[allow(dead_code)]
+/// Maximum ancestor chain depth walked during lineage reconstruction.
+const MAX_ANCESTRY_DEPTH: usize = 64;
+
 pub(crate) static STATE: LazyLock<SystemState> = LazyLock::new(SystemState::default);
 
 /// Returns a reference to the global `SystemState` singleton.
@@ -24,13 +27,11 @@ pub(crate) static STATE: LazyLock<SystemState> = LazyLock::new(SystemState::defa
 ///
 /// A static reference to the shared [`SystemState`].
 #[inline]
-#[allow(dead_code)]
 pub(crate) fn system_state() -> &'static SystemState {
     &STATE
 }
 
 /// Central state manager tracking processes and system context.
-#[allow(dead_code)]
 pub(crate) struct SystemState {
     process_tree: RwLock<ProcessTree>,
 }
@@ -56,8 +57,9 @@ impl SystemState {
 
     /// Handles a process start lifecycle event.
     ///
-    /// Ingests a new [`ProcessNode`] into the process tree, automatically resolving its
-    /// parent process identity at `process.creation_timestamp` and linking them bidirectionally.
+    /// Ingests a new [`ProcessNode`] into the process tree, automatically retiring any
+    /// superseded active instance on the same PID, resolving its parent process identity at
+    /// `process.creation_timestamp`, and linking them bidirectionally.
     ///
     /// # Arguments
     ///
@@ -66,15 +68,11 @@ impl SystemState {
     /// # Returns
     ///
     /// The unique [`ProcessKey`] assigned to the started process.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProcessTreeError::ActiveProcessConflict`] if an active process already exists for the PID.
     pub fn on_process_start(&self, process: ProcessNode) -> Result<ProcessKey, ProcessTreeError> {
         let mut tree = self
             .process_tree
             .write()
-            .expect("SystemState process_tree lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         tree.handle_start(process)
     }
 
@@ -105,7 +103,7 @@ impl SystemState {
         let mut tree = self
             .process_tree
             .write()
-            .expect("SystemState process_tree lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         tree.handle_exit(pid, exit_timestamp, exit_status)
     }
 
@@ -114,7 +112,7 @@ impl SystemState {
     /// # Arguments
     ///
     /// * `pid` - The OS process ID to look up.
-    /// * `timestamp` - The telemetry event timestamp being correlated.
+    /// * `timestamp` - The telemetry event timestamp (QPC ticks) being correlated.
     ///
     /// # Returns
     ///
@@ -123,8 +121,81 @@ impl SystemState {
         let tree = self
             .process_tree
             .read()
-            .expect("SystemState process_tree lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         tree.resolve_key(pid, timestamp)
+    }
+
+    /// Resolves an actor process snapshot, its immediate parent's name, and its ordered lineage
+    /// (`root -> ... -> parent -> actor`) in a single read lock acquisition.
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - The OS process identifier of the actor.
+    /// * `timestamp_qpc` - Query timestamp in QPC ticks.
+    ///
+    /// # Returns
+    ///
+    /// `Some((ProcessNode, parent_name, ordered_ancestry))` if the process is tracked, or `None`.
+    pub fn resolve_actor_snapshot(
+        &self,
+        pid: ProcessId,
+        timestamp_qpc: i64,
+    ) -> Option<(ProcessNode, String, Vec<String>)> {
+        let tree = self
+            .process_tree
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let key = tree
+            .resolve_key(pid, timestamp_qpc)
+            .or_else(|| tree.get_active(pid).map(|n| n.key()))?;
+        let node = tree.get(&key)?.clone();
+
+        let parent_name = node
+            .parent_key()
+            .and_then(|pk| tree.get(&pk))
+            .or_else(|| {
+                let ppid = node.parent_pid();
+                if ppid.0 != 0 && ppid != pid {
+                    tree.get_active(ppid)
+                } else {
+                    None
+                }
+            })
+            .map(|pn| pn.image_file_name().to_string())
+            .unwrap_or_default();
+
+        // Walk from actor up to root with cycle detection and depth cap, then reverse
+        // so that lineage is ordered chronologically from root to actor: [root, ..., parent, actor].
+        let mut lineage_reverse = Vec::new();
+        let mut visited = HashSet::new();
+        let mut curr_key = Some(key);
+
+        while let Some(k) = curr_key {
+            if lineage_reverse.len() >= MAX_ANCESTRY_DEPTH || !visited.insert(k) {
+                break;
+            }
+            if let Some(ancestor) = tree.get(&k) {
+                lineage_reverse.push(format!(
+                    "{} ({})",
+                    ancestor.image_file_name(),
+                    ancestor.process_id().0
+                ));
+                curr_key = ancestor.parent_key().or_else(|| {
+                    let ppid = ancestor.parent_pid();
+                    if ppid.0 != 0 && ppid != ancestor.process_id() {
+                        tree.get_active(ppid).map(|p| p.key())
+                    } else {
+                        None
+                    }
+                });
+            } else {
+                break;
+            }
+        }
+
+        lineage_reverse.reverse();
+        Some((node, parent_name, lineage_reverse))
     }
 
     /// Reads a process node within a scoped closure under a read lock.
@@ -147,7 +218,7 @@ impl SystemState {
         let tree = self
             .process_tree
             .read()
-            .expect("SystemState process_tree lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         tree.get(key).map(f)
     }
 
@@ -169,7 +240,7 @@ impl SystemState {
         let mut tree = self
             .process_tree
             .write()
-            .expect("SystemState process_tree lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         tree.mutate(key, f)
     }
 
@@ -189,7 +260,7 @@ impl SystemState {
         let tree = self
             .process_tree
             .read()
-            .expect("SystemState process_tree lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         tree.get(key).cloned()
     }
 
@@ -203,7 +274,7 @@ impl SystemState {
         let tree = self
             .process_tree
             .read()
-            .expect("SystemState process_tree lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(parent) = tree.get(parent_key) {
             for child_key in &parent.children {
@@ -216,7 +287,8 @@ impl SystemState {
 
     /// Traverses upward through the process ancestry starting from `start_key`.
     ///
-    /// Invokes `f` on each ancestor node until reaching the root or when `f` returns `false`.
+    /// Invokes `f` on each ancestor node until reaching the root, encountering a cycle,
+    /// reaching `MAX_ANCESTRY_DEPTH`, or when `f` returns `false`.
     ///
     /// # Arguments
     ///
@@ -226,15 +298,28 @@ impl SystemState {
         let tree = self
             .process_tree
             .read()
-            .expect("SystemState process_tree lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+        let mut visited = HashSet::new();
+        let mut depth = 0usize;
         let mut curr_key = Some(*start_key);
         while let Some(key) = curr_key {
+            if depth >= MAX_ANCESTRY_DEPTH || !visited.insert(key) {
+                break;
+            }
+            depth += 1;
             if let Some(node) = tree.get(&key) {
                 if !f(node) {
                     break;
                 }
-                curr_key = node.parent_key();
+                curr_key = node.parent_key().or_else(|| {
+                    let ppid = node.parent_pid();
+                    if ppid.0 != 0 && ppid != node.process_id() {
+                        tree.get_active(ppid).map(|p| p.key())
+                    } else {
+                        None
+                    }
+                });
             } else {
                 break;
             }
@@ -375,7 +460,8 @@ mod tests {
         assert_eq!(name_gen2, "proc2.exe");
     }
 
-    /// Verifies automatic parent key resolution, child node linking, and upward ancestor tree traversal.
+    /// Verifies automatic parent key resolution, child node linking, upward ancestor tree traversal,
+    /// and ordered `root -> parent -> actor` snapshot resolution.
     #[test]
     fn test_parent_child_hierarchy_and_walking() {
         let state = SystemState::new();
@@ -388,16 +474,16 @@ mod tests {
         let child1 = create_test_process(200, 100, 1_200, "cmd.exe");
         let child1_key = state.on_process_start(child1).expect("Child 1 start");
 
-        // Spawn Child 2 (PID 300)
-        let child2 = create_test_process(300, 100, 1_300, "powershell.exe");
-        let child2_key = state.on_process_start(child2).expect("Child 2 start");
+        // Spawn Grandchild (PID 300) under Child 1 (PID 200)
+        let grandchild = create_test_process(300, 200, 1_300, "powershell.exe");
+        let grandchild_key = state.on_process_start(grandchild).expect("Grandchild start");
 
-        // Verify parent has both children linked
+        // Verify parent has child1 linked
         let mut children_found = Vec::new();
         state.for_each_child(&parent_key, |child| {
             children_found.push(child.process_id());
         });
-        assert_eq!(children_found, vec![ProcessId(200), ProcessId(300)]);
+        assert_eq!(children_found, vec![ProcessId(200)]);
 
         // Verify child1's parent_key is resolved
         let resolved_parent = state
@@ -406,28 +492,51 @@ mod tests {
             .expect("Parent key should be resolved");
         assert_eq!(resolved_parent, parent_key);
 
-        // Walk ancestors from child2
+        // Walk ancestors from grandchild (upward: grandchild -> child1 -> parent)
         let mut ancestors = Vec::new();
-        state.walk_ancestors(&child2_key, |node| {
+        state.walk_ancestors(&grandchild_key, |node| {
             ancestors.push(node.process_id());
             true
         });
-        assert_eq!(ancestors, vec![ProcessId(300), ProcessId(100)]);
+        assert_eq!(ancestors, vec![ProcessId(300), ProcessId(200), ProcessId(100)]);
+
+        // Verify resolve_actor_snapshot orders ancestry as root -> parent -> actor
+        let (_node, parent_name, ordered_ancestry) = state
+            .resolve_actor_snapshot(ProcessId(300), 1_500)
+            .expect("Snapshot should resolve");
+        assert_eq!(parent_name, "cmd.exe");
+        assert_eq!(
+            ordered_ancestry,
+            vec![
+                "explorer.exe (100)".to_string(),
+                "cmd.exe (200)".to_string(),
+                "powershell.exe (300)".to_string(),
+            ]
+        );
     }
 
-    /// Verifies that registering a new active process on a PID that has not yet terminated returns an ActiveProcessConflict error.
+    /// Verifies that registering a new active process on a PID whose prior Exit event was missed
+    /// automatically retires the prior instance into history rather than rejecting the new process.
     #[test]
-    fn test_active_process_conflict_error() {
+    fn test_pid_reuse_without_exit_auto_retires_previous_generation() {
         let state = SystemState::new();
-        let proc1 = create_test_process(8888, 4, 1_000, "app.exe");
-        state.on_process_start(proc1).expect("First start succeeds");
+        let proc1 = create_test_process(8888, 4, 1_000, "app1.exe");
+        let key1 = state.on_process_start(proc1).expect("First start succeeds");
 
-        // Starting another process on the same PID without exiting the first returns error
+        // Starting another process on the same PID without an intervening exit event
+        // automatically retires proc1 at proc2's creation timestamp (2_000).
         let proc2 = create_test_process(8888, 4, 2_000, "app2.exe");
-        let err = state.on_process_start(proc2).unwrap_err();
-        assert_eq!(
-            err,
-            ProcessTreeError::ActiveProcessConflict(ProcessId(8888))
-        );
+        let key2 = state.on_process_start(proc2).expect("Second start succeeds by retiring prior generation");
+
+        let (gen1_alive, gen1_exit) = state
+            .read_process(&key1, |p| (p.is_alive(), p.exit_timestamp()))
+            .expect("Gen 1 must remain in history");
+        assert!(!gen1_alive);
+        assert_eq!(gen1_exit, Some(2_000));
+
+        let gen2_alive = state
+            .read_process(&key2, |p| p.is_alive())
+            .expect("Gen 2 must be active");
+        assert!(gen2_alive);
     }
 }

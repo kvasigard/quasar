@@ -14,9 +14,10 @@ pub const EVENT_MAGIC: u16 = 0x5153;
 /// Sentinel event type indicating circular buffer wrap-around.
 ///
 /// When the producer cannot fit an event at the tail of the buffer and wraps to offset 0,
-/// this header is written into the remaining slack bytes so the consumer knows to reset its
-/// read cursor to 0 without attempting to parse trailing padding.
-// Sentinel event type indicating circular buffer wrap-around.
+/// this header is written into the remaining slack bytes (when `>= 24` bytes remain) so the
+/// consumer knows to reset its read cursor to 0 without attempting to parse trailing padding.
+/// If fewer than `size_of::<EventHeader>()` (24) bytes remain at the end of the partition,
+/// both producer and consumer wrap to offset 0 automatically without a sentinel header.
 pub const EVENT_TYPE_WRAP: u16 = 0xFFFF;
 
 /// Status header for an individual core's SPSC ring buffer.
@@ -35,6 +36,27 @@ pub struct PerCpuRingHeader {
     /// Counter of events dropped due to buffer capacity exhaustion on this core.
     pub dropped_events: AtomicU32,
     _pad3: [u8; 60],
+}
+
+impl PerCpuRingHeader {
+    /// Creates a new zero-initialized `PerCpuRingHeader`.
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            write_cursor: AtomicU32::new(0),
+            _pad1: [0; 60],
+            read_cursor: AtomicU32::new(0),
+            _pad2: [0; 60],
+            dropped_events: AtomicU32::new(0),
+            _pad3: [0; 60],
+        }
+    }
+}
+
+impl Default for PerCpuRingHeader {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // Compile-time layout guarantees

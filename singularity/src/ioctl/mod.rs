@@ -16,8 +16,11 @@ pub enum IoctlError {
     /// The incoming IOCTL control code was not recognized.
     InvalidDeviceRequest(u32),
 
-    /// WDF failed to retrieve the input buffer.
+    /// WDF failed to retrieve the input or output buffer.
     BufferRetrievalFailed(NTSTATUS),
+
+    /// Failed to reference or bind the user-mode notification event handle.
+    EventRegistrationFailed(NTSTATUS),
 }
 
 impl IoctlError {
@@ -28,7 +31,7 @@ impl IoctlError {
     pub const fn to_ntstatus(&self) -> NTSTATUS {
         match self {
             Self::InvalidDeviceRequest(_) => STATUS_INVALID_DEVICE_REQUEST,
-            Self::BufferRetrievalFailed(status) => *status,
+            Self::BufferRetrievalFailed(status) | Self::EventRegistrationFailed(status) => *status,
         }
     }
 }
@@ -43,7 +46,13 @@ impl core::fmt::Display for IoctlError {
                 )
             }
             Self::BufferRetrievalFailed(status) => {
-                write!(f, "Failed to retrieve IOCTL input buffer ({status:#010X})")
+                write!(f, "Failed to retrieve IOCTL buffer ({status:#010X})")
+            }
+            Self::EventRegistrationFailed(status) => {
+                write!(
+                    f,
+                    "Failed to register kernel notification event handle ({status:#010X})"
+                )
             }
         }
     }

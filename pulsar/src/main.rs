@@ -78,10 +78,12 @@ fn handle_uninstall() -> Result<(), AppError> {
 }
 
 /// Orchestrates pre-flight driver installation, SCM service start, and PPL-Antimalware elevation.
-fn init_driver_and_ppl(skip_driver: bool) -> Result<Option<pulsar::drivers::kmdf::Singularity>, AppError> {
+fn init_driver_and_ppl(
+    skip_driver: bool,
+) -> Result<Option<Arc<pulsar::drivers::kmdf::Singularity>>, AppError> {
     if !skip_driver {
         let client = pulsar::bootstrap::initialize()?;
-        Ok(Some(client))
+        Ok(Some(Arc::new(client)))
     } else {
         log::warn!("Running in standalone mode: driver initialization and PPL elevation skipped.");
         Ok(None)
@@ -186,8 +188,14 @@ fn teardown_session(
         log::error!("Failed to stop ETW kernel session: {}", e);
     }
 
-    if let Err(e) = consumer_handle.join() {
-        log::error!("Consumer thread panicked during execution: {:?}", e);
+    match consumer_handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(etw_err)) => {
+            log::error!("ETW consumer thread exited with error: {etw_err}");
+        }
+        Err(e) => {
+            log::error!("Consumer thread panicked during execution: {:?}", e);
+        }
     }
 
     if let Some(sensor_handle) = driver_sensor_handle
@@ -255,11 +263,20 @@ fn run(cli: Cli) -> Result<(), AppError> {
     // Initialize driver telemetry sensor if driver is present
     let (driver_rx, driver_sensor_handle) = if let Some(ref driver) = driver_client {
         log::info!("Initializing Singularity driver telemetry sensor (Per-CPU ring buffer)...");
-        let sensor = DriverSensor::initialize(driver)?;
-        let (dtx, drx) = mpsc::channel();
+        let sensor = match DriverSensor::initialize_shared(Arc::clone(driver)) {
+            Ok(s) => s,
+            Err(e) => {
+                shutdown_flag.store(true, Ordering::SeqCst);
+                if let Some(watcher_handle) = rule_watcher_handle {
+                    let _ = watcher_handle.join();
+                }
+                return Err(e.into());
+            }
+        };
+        let (dtx, drx) = mpsc::sync_channel::<Event>(4_096);
         let flag = Arc::clone(&shutdown_flag);
         let handle = sensor.start(flag, move |event| {
-            let _ = dtx.send(event);
+            let _ = dtx.try_send(event);
         });
         (Some(drx), Some(handle))
     } else {
@@ -278,9 +295,23 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Arc::clone(&shutdown_flag),
     );
 
-    // Launch NT Kernel Logger ETW trace session
+    // Launch NT Kernel Logger ETW trace session; if it fails, signal shutdown and join background threads
+    // before dropping `driver_client` so the sensor never reads unmapped MDL pages.
     let (kernel_session, consumer_handle) =
-        start_kernel_session(enable_syscalls, enable_context, tx)?;
+        match start_kernel_session(enable_syscalls, enable_context, tx) {
+            Ok(pair) => pair,
+            Err(err) => {
+                shutdown_flag.store(true, Ordering::SeqCst);
+                if let Some(sensor_handle) = driver_sensor_handle {
+                    let _ = sensor_handle.join();
+                }
+                let _ = dispatcher_handle.join();
+                if let Some(watcher_handle) = rule_watcher_handle {
+                    let _ = watcher_handle.join();
+                }
+                return Err(err);
+            }
+        };
 
     log::info!(
         "Quasar EDR Engine is active and capturing telemetry. Press Ctrl+C to safely stop..."
@@ -298,7 +329,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
         rule_watcher_handle,
     );
 
-    // Dropping driver_client triggers EvtFileCleanup in driver
+    // Dropping driver_client triggers EvtFileCleanup in driver after all threads have joined
     drop(driver_client);
 
     Ok(())

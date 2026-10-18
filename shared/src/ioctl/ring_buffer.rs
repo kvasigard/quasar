@@ -5,7 +5,7 @@
 //! 2. Register a user-mode Win32 notification event with the kernel.
 
 use crate::ctl_code;
-use super::{IoctlMessage, FILE_ANY_ACCESS, METHOD_BUFFERED, SINGULARITY_DEVICE_TYPE};
+use super::{IoctlMessage, FILE_READ_WRITE_ACCESS, METHOD_BUFFERED, SINGULARITY_DEVICE_TYPE};
 
 /// Custom Function Code for per-CPU ring buffer memory mapping (>= 2048 / 0x800).
 pub const FUNCTION_MAP_PER_CPU_BUFFER: u32 = 0x802;
@@ -18,7 +18,7 @@ pub const IOCTL_MAP_PER_CPU_BUFFER: u32 = ctl_code!(
     SINGULARITY_DEVICE_TYPE,
     FUNCTION_MAP_PER_CPU_BUFFER,
     METHOD_BUFFERED,
-    FILE_ANY_ACCESS
+    FILE_READ_WRITE_ACCESS
 );
 
 /// IOCTL control code instructing the driver to register a Win32 event for kernel notification.
@@ -26,7 +26,7 @@ pub const IOCTL_REGISTER_EVENT: u32 = ctl_code!(
     SINGULARITY_DEVICE_TYPE,
     FUNCTION_REGISTER_EVENT,
     METHOD_BUFFERED,
-    FILE_ANY_ACCESS
+    FILE_READ_WRITE_ACCESS
 );
 
 /// Request payload to map the per-CPU shared ring buffers.

@@ -12,7 +12,7 @@ pub(crate) use manager::RingBufferManager;
 
 use shared::ioctl::PerCpuMapResponse;
 use shared::ring_buffer::DriverEvent;
-use wdk_sys::NTSTATUS;
+use wdk_sys::{NTSTATUS, WDFFILEOBJECT};
 
 /// Global singleton manager for the shared memory ring buffer.
 pub(crate) static RING_BUFFER_MANAGER: RingBufferManager = RingBufferManager::new();
@@ -26,6 +26,7 @@ pub(crate) static RING_BUFFER_MANAGER: RingBufferManager = RingBufferManager::ne
 /// * `true` - Ring buffer backing memory is allocated and ready.
 /// * `false` - Ring buffer is uninitialized or torn down.
 #[inline(always)]
+#[allow(dead_code)]
 pub(crate) fn is_active() -> bool {
     RING_BUFFER_MANAGER.is_active()
 }
@@ -54,7 +55,12 @@ pub(crate) fn cleanup() {
 
 /// Projects the contiguous per-CPU shared memory pools into the calling process address space.
 ///
-/// Maps data (read-only) and status (read-write) partitions into the calling user process.
+/// Maps data (read-only) and status (read-write) partitions into the calling user process
+/// and binds ownership to `file_object`.
+///
+/// # Arguments
+///
+/// * `file_object` - Originating `WDFFILEOBJECT` associated with the IOCTL request.
 ///
 /// # Return values
 ///
@@ -63,16 +69,24 @@ pub(crate) fn cleanup() {
 /// * `Err(RingBufferError::DeviceStateInvalid)` - Ring buffer backing memory is uninitialized.
 /// * `Err(RingBufferError)` - Mapping or MDL allocation failure.
 #[inline(always)]
-pub(crate) fn create_user_mapping() -> Result<PerCpuMapResponse, RingBufferError> {
-    RING_BUFFER_MANAGER.create_user_mapping()
+pub(crate) fn create_user_mapping(
+    file_object: WDFFILEOBJECT,
+) -> Result<PerCpuMapResponse, RingBufferError> {
+    RING_BUFFER_MANAGER.create_user_mapping(file_object)
 }
 
-/// Tears down the active user-mode memory projection and releases the notification event.
+/// Tears down the active user-mode memory projection and releases the notification event
+/// if `file_object` owns the active mapping session.
 ///
-/// Safely unmaps locked user-mode pages and releases referenced event synchronization objects.
+/// Safely unmaps locked user-mode pages and releases referenced event synchronization objects
+/// at `PASSIVE_LEVEL`.
+///
+/// # Arguments
+///
+/// * `file_object` - The `WDFFILEOBJECT` undergoing `EvtFileCleanup`.
 #[inline(always)]
-pub(crate) fn teardown_user_mapping() {
-    RING_BUFFER_MANAGER.teardown_user_mapping();
+pub(crate) fn teardown_user_mapping_for_file(file_object: WDFFILEOBJECT) {
+    RING_BUFFER_MANAGER.teardown_user_mapping_for_file(file_object);
 }
 
 /// Registers a user-mode Win32 event handle for kernel event notifications.
@@ -85,15 +99,19 @@ pub(crate) fn teardown_user_mapping() {
 ///
 /// # Arguments
 ///
+/// * `file_object` - Originating `WDFFILEOBJECT` from the IOCTL request.
 /// * `handle` - Win32 event handle to be referenced and signaled.
 ///
 /// # Return values
 ///
 /// * `Ok(())` - Event object referenced and registered successfully.
-/// * `Err(NTSTATUS)` - Object Manager lookup failure or invalid handle status.
+/// * `Err(NTSTATUS)` - Object Manager lookup failure, invalid state, or ownership mismatch.
 #[inline(always)]
-pub(crate) unsafe fn register_notification_event(handle: wdk_sys::HANDLE) -> Result<(), NTSTATUS> {
-    unsafe { RING_BUFFER_MANAGER.register_notification_event(handle) }
+pub(crate) unsafe fn register_notification_event(
+    file_object: WDFFILEOBJECT,
+    handle: wdk_sys::HANDLE,
+) -> Result<(), NTSTATUS> {
+    unsafe { RING_BUFFER_MANAGER.register_notification_event(file_object, handle) }
 }
 
 /// Signals the active user-mode reader thread.

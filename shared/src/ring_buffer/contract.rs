@@ -75,7 +75,7 @@ pub trait DriverEvent {
     /// Returns the discriminator identifying this event type in the transport record header.
     fn event_type(&self) -> DriverEventType;
 
-    /// Returns the size in bytes of the event payload (excluding the 32-byte [`RecordHeader`]).
+    /// Returns the size in bytes of the event payload (excluding the 24-byte [`EventHeader`](super::types::EventHeader)).
     fn payload_len(&self) -> usize;
 
     /// Serializes the event payload directly into the reserved ring buffer destination pointer.
@@ -93,10 +93,17 @@ pub trait DriverEvent {
 
 /// Marker trait for fixed-size, C-compatible telemetry event templates.
 ///
-/// Types implementing this trait must be `Copy` and follow a fixed memory layout.
 /// Implementing this trait automatically provides a zero-copy blanket implementation of
 /// [`DriverEvent`].
-pub trait TemplateEvent: Copy {
+///
+/// # Safety
+///
+/// Implementors must guarantee that:
+/// 1. The type is annotated with `#[repr(C)]` and is `Copy`.
+/// 2. All fields are plain-old-data primitives or fixed-size arrays with **zero implicit compiler padding bytes**
+///    (use explicit zeroed `_reserved` fields for alignment so uninitialized kernel stack bytes are never copied to user space).
+/// 3. The type contains no pointers, references, or non-POD handles.
+pub unsafe trait TemplateEvent: Copy {
     /// The discriminator identifying this specific event type in the transport record header.
     const EVENT_TYPE: DriverEventType;
 }
@@ -117,9 +124,9 @@ impl<T: TemplateEvent> DriverEvent for T {
     unsafe fn write_payload(&self, dest: *mut u8) {
         // SAFETY:
         // The caller guarantees that `dest` points to at least `payload_len()` writable bytes.
-        // Because `T` implements `TemplateEvent` (which requires `Copy`), copying `size_of::<T>()`
-        // contiguous bytes from `self` into `dest` produces a valid bitwise representation with
-        // zero intermediate heap allocations.
+        // Because `T` implements the `unsafe trait TemplateEvent` (which requires `#[repr(C)]`, `Copy`,
+        // and zero uninitialized padding), copying `size_of::<T>()` contiguous bytes from `self` into `dest`
+        // produces a valid bitwise representation with zero intermediate heap allocations.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 self as *const T as *const u8,
@@ -138,10 +145,12 @@ mod tests {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct MockFixedEvent {
         value_a: u32,
+        _reserved: u32,
         value_b: u64,
     }
 
-    impl TemplateEvent for MockFixedEvent {
+    // SAFETY: `MockFixedEvent` is `#[repr(C)]`, `Copy`, and has explicit `_reserved` padding.
+    unsafe impl TemplateEvent for MockFixedEvent {
         const EVENT_TYPE: DriverEventType = DriverEventType::LsassAccess;
     }
 
@@ -149,6 +158,7 @@ mod tests {
     fn test_template_event_blanket_implementation() {
         let event = MockFixedEvent {
             value_a: 0x1234_5678,
+            _reserved: 0,
             value_b: 0x9ABC_DEF0_1234_5678,
         };
 

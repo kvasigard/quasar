@@ -2,16 +2,16 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use shared::ioctl::PerCpuMapResponse;
 use shared::ring_buffer::{DriverEvent, PER_CPU_DATA_SIZE, PerCpuRingHeader};
 
 use wdk_sys::{
     _MM_PAGE_PRIORITY::NormalPagePriority,
-    ALL_PROCESSOR_GROUPS, DISPATCH_LEVEL, MdlMappingNoExecute, MdlMappingNoWrite, NTSTATUS, SIZE_T,
-    ULONG,
-    ntddk::{ExAllocatePool2, ExFreePoolWithTag},
+    ALL_PROCESSOR_GROUPS, DISPATCH_LEVEL, MdlMappingNoExecute, MdlMappingNoWrite, NTSTATUS,
+    PASSIVE_LEVEL, SIZE_T, STATUS_ACCESS_DENIED, ULONG, WDFFILEOBJECT,
+    ntddk::{ExAllocatePool2, ExFreePoolWithTag, IoGetCurrentProcess},
 };
 
 use super::error::RingBufferError;
@@ -34,12 +34,27 @@ const POOL_TAG: ULONG = u32::from_ne_bytes(*b"QSAR");
 /// `PerCpuRingHeader` cache-line alignment and eliminates user-mode pool sharing vulnerabilities.
 const PAGE_SIZE: usize = 4096;
 
+/// Lifecycle state machine for user-mode MDL mappings.
+pub(crate) enum MappingState {
+    /// No active user-mode session is mapped.
+    Unmapped,
+    /// A thread is currently building and mapping MDLs at `PASSIVE_LEVEL`.
+    MappingInProgress {
+        file_object: usize,
+        #[allow(dead_code)]
+        owner_process: usize,
+        cancel_requested: bool,
+    },
+    /// User-mode MDL pages are actively mapped into `owner_process`.
+    Mapped(UserModeMemory),
+}
+
 impl PerCpuRingBuffer {
     /// Detects active logical processor count and allocates contiguous NonPaged pool for all cores.
     ///
     /// Determines the number of active logical processors in the host system and allocates
-    /// dedicated, page-aligned NonPaged pool regions for the telemetry data buffer and status
-    /// headers. Backing pool memory is fully zero-initialized before returning.
+    /// dedicated, page-aligned NonPaged pool regions for the telemetry data buffer, status
+    /// headers, and kernel-private producer cursors. Backing pool memory is fully zero-initialized.
     ///
     /// # Return values
     ///
@@ -54,6 +69,8 @@ impl PerCpuRingBuffer {
         let total_data_size = (cpu_count as usize) * PER_CPU_DATA_SIZE;
         let required_status_size = (cpu_count as usize) * core::mem::size_of::<PerCpuRingHeader>();
         let total_status_size = required_status_size.next_multiple_of(PAGE_SIZE);
+        let producer_cursors_size =
+            (cpu_count as usize) * core::mem::size_of::<AtomicU32>();
 
         crate::driver_debug!(
             "[ring_buffer::new] Detected {cpu_count} CPU cores (Data: {total_data_size} bytes, Status: {total_status_size} bytes [required: {required_status_size} bytes])"
@@ -105,8 +122,6 @@ impl PerCpuRingBuffer {
                 crate::driver_error!(
                     "[ring_buffer::new] Failed to allocate status pool ({total_status_size} bytes)"
                 );
-                // Roll back data_section allocation immediately. PerCpuRingBuffer is not
-                // yet constructed, so its Drop destructor will not execute. No double-free hazard.
                 unsafe {
                     ExFreePoolWithTag(data_section.as_ptr().cast(), POOL_TAG);
                 }
@@ -114,9 +129,26 @@ impl PerCpuRingBuffer {
             }
         };
 
-        // Explicitly zero-initialize the entire allocated status page(s) and headers
+        let cursors_raw =
+            unsafe { ExAllocatePool2(pool_flag, producer_cursors_size as SIZE_T, POOL_TAG) };
+        let producer_cursors = match NonNull::new(cursors_raw as *mut AtomicU32) {
+            Some(ptr) => ptr,
+            None => {
+                crate::driver_error!(
+                    "[ring_buffer::new] Failed to allocate kernel producer cursors ({producer_cursors_size} bytes)"
+                );
+                unsafe {
+                    ExFreePoolWithTag(status_section.as_ptr().cast(), POOL_TAG);
+                    ExFreePoolWithTag(data_section.as_ptr().cast(), POOL_TAG);
+                }
+                return Err(RingBufferError::StatusMemoryAllocationFailed);
+            }
+        };
+
+        // Explicitly zero-initialize the allocated status page(s) and kernel producer cursors
         unsafe {
             core::ptr::write_bytes(status_raw as *mut u8, 0, total_status_size);
+            core::ptr::write_bytes(cursors_raw as *mut u8, 0, producer_cursors_size);
         }
 
         crate::driver_debug!(
@@ -128,6 +160,7 @@ impl PerCpuRingBuffer {
             total_status_size,
             data_section,
             status_section,
+            producer_cursors,
         })
     }
 
@@ -136,12 +169,21 @@ impl PerCpuRingBuffer {
     /// Configures the data section as read-only (`MdlMappingNoWrite`) and the status section as read-write.
     /// Executes at `PASSIVE_LEVEL` in the context of the calling user-mode process.
     ///
+    /// # Arguments
+    ///
+    /// * `file_object` - Originating `WDFFILEOBJECT` pointer value.
+    /// * `owner_process` - Originating `PEPROCESS` pointer value.
+    ///
     /// # Return values
     ///
     /// * `Ok(UserModeMemory)` - Mappings created and packaged into an active user session.
     /// * `Err(RingBufferError::MdlAllocationFailed)` - MDL allocation failed.
     /// * `Err(RingBufferError::MdlMappingFailed)` - MDL virtual memory mapping into process failed.
-    pub(crate) fn create_user_mapping(&self) -> Result<UserModeMemory, RingBufferError> {
+    pub(crate) fn create_user_mapping(
+        &self,
+        file_object: usize,
+        owner_process: usize,
+    ) -> Result<UserModeMemory, RingBufferError> {
         let data_priority = (NormalPagePriority as u32) | MdlMappingNoExecute | MdlMappingNoWrite;
         let status_priority = (NormalPagePriority as u32) | MdlMappingNoExecute;
 
@@ -164,6 +206,8 @@ impl PerCpuRingBuffer {
             data_section,
             status_section,
             self.cpu_count,
+            file_object,
+            owner_process,
         ))
     }
 }
@@ -171,6 +215,7 @@ impl PerCpuRingBuffer {
 impl Drop for PerCpuRingBuffer {
     fn drop(&mut self) {
         unsafe {
+            ExFreePoolWithTag(self.producer_cursors.as_ptr().cast(), POOL_TAG);
             ExFreePoolWithTag(self.status_section.as_ptr().cast(), POOL_TAG);
             ExFreePoolWithTag(self.data_section.as_ptr().cast(), POOL_TAG);
         }
@@ -185,7 +230,7 @@ pub struct RingBufferManager {
 
     /// Serializes user-mode mapping transitions and guards against race conditions where
     /// an asynchronous producer core calls `signal_reader()` while the session is being torn down.
-    active_mapping: KernelSpinLock<Option<UserModeMemory>>,
+    active_mapping: KernelSpinLock<MappingState>,
 }
 
 impl Default for RingBufferManager {
@@ -197,7 +242,7 @@ impl Default for RingBufferManager {
 impl RingBufferManager {
     /// Constructs a new uninitialized `RingBufferManager`.
     ///
-    /// Initializes internal atomic references to null and the active mapping lock to `None`.
+    /// Initializes internal atomic references to null and the active mapping lock to `MappingState::Unmapped`.
     ///
     /// # Return values
     ///
@@ -205,7 +250,7 @@ impl RingBufferManager {
     pub const fn new() -> Self {
         Self {
             ring_buffer: AtomicPtr::new(core::ptr::null_mut()),
-            active_mapping: KernelSpinLock::new(None),
+            active_mapping: KernelSpinLock::new(MappingState::Unmapped),
         }
     }
 
@@ -286,10 +331,31 @@ impl RingBufferManager {
 
     /// Releases all ring buffer memory and active user mappings.
     ///
-    /// Tears down any outstanding user mapping sessions and reclaims backing NonPaged
-    /// pool allocations using atomic exchange to guard against double-free hazards.
+    /// Tears down any outstanding user mapping sessions if running in the owning process context,
+    /// and reclaims backing NonPaged pool allocations using atomic exchange.
     pub(crate) fn cleanup(&self) {
-        self.teardown_user_mapping();
+        let current_process = unsafe { IoGetCurrentProcess() } as usize;
+        let extracted = {
+            let mut guard = self.active_mapping.lock();
+            match *guard {
+                MappingState::Mapped(ref mem) if mem.owner_process() == current_process => {
+                    match core::mem::replace(&mut *guard, MappingState::Unmapped) {
+                        MappingState::Mapped(m) => Some(m),
+                        _ => None,
+                    }
+                }
+                MappingState::MappingInProgress {
+                    ref mut cancel_requested,
+                    ..
+                } => {
+                    *cancel_requested = true;
+                    None
+                }
+                _ => None,
+            }
+        };
+        // Drop UserModeMemory outside the spinlock at PASSIVE_LEVEL
+        drop(extracted);
 
         let raw = self
             .ring_buffer
@@ -309,20 +375,25 @@ impl RingBufferManager {
     /// Builds MDLs for data (read-only) and status (read-write) sections and maps them
     /// into the calling user-mode process address space at `PASSIVE_LEVEL`.
     ///
+    /// # Arguments
+    ///
+    /// * `file_object` - Originating `WDFFILEOBJECT` associated with the IOCTL request.
+    ///
     /// # Return values
     ///
     /// * `Ok(PerCpuMapResponse)` - Response structure containing mapped user-mode base addresses and geometry.
     /// * `Err(RingBufferError::AlreadyMapped)` - An active user-mode mapping session is already established.
-    /// * `Err(RingBufferError::DeviceStateInvalid)` - Ring buffer backing memory is uninitialized.
+    /// * `Err(RingBufferError::DeviceStateInvalid)` - Ring buffer backing memory is uninitialized or cancelled.
     /// * `Err(RingBufferError)` - Mapping or MDL allocation failure.
-    pub(crate) fn create_user_mapping(&self) -> Result<PerCpuMapResponse, RingBufferError> {
-        let already_mapped = {
-            let guard = self.active_mapping.lock();
-            guard.is_some()
-        };
-
-        if already_mapped {
-            return Err(RingBufferError::AlreadyMapped);
+    pub(crate) fn create_user_mapping(
+        &self,
+        file_object: WDFFILEOBJECT,
+    ) -> Result<PerCpuMapResponse, RingBufferError> {
+        if let Err(current_irql) = ensure_max_irql(PASSIVE_LEVEL as u8) {
+            return Err(RingBufferError::InvalidIrql {
+                current: current_irql,
+                max: PASSIVE_LEVEL as u8,
+            });
         }
 
         let ptr = self.ring_buffer.load(Ordering::Acquire);
@@ -331,12 +402,56 @@ impl RingBufferManager {
         }
         let ring = unsafe { &*ptr };
 
-        let user_mem = ring.create_user_mapping()?;
-        let response_payload = user_mem.response();
+        let file_obj_id = file_object as usize;
+        let owner_process = unsafe { IoGetCurrentProcess() } as usize;
 
         {
             let mut guard = self.active_mapping.lock();
-            *guard = Some(user_mem);
+            if !matches!(*guard, MappingState::Unmapped) {
+                return Err(RingBufferError::AlreadyMapped);
+            }
+            *guard = MappingState::MappingInProgress {
+                file_object: file_obj_id,
+                owner_process,
+                cancel_requested: false,
+            };
+        }
+
+        ring.sync_read_cursors();
+        let map_result = ring.create_user_mapping(file_obj_id, owner_process);
+
+        let user_mem = match map_result {
+            Ok(mem) => mem,
+            Err(err) => {
+                let mut guard = self.active_mapping.lock();
+                *guard = MappingState::Unmapped;
+                return Err(err);
+            }
+        };
+
+        let response_payload = user_mem.response();
+
+        let cancelled_mem = {
+            let mut guard = self.active_mapping.lock();
+            match *guard {
+                MappingState::MappingInProgress {
+                    cancel_requested: true,
+                    ..
+                } => {
+                    *guard = MappingState::Unmapped;
+                    Some(user_mem)
+                }
+                _ => {
+                    *guard = MappingState::Mapped(user_mem);
+                    None
+                }
+            }
+        };
+
+        if let Some(mem_to_unmap) = cancelled_mem {
+            // Drop outside spinlock at PASSIVE_LEVEL
+            drop(mem_to_unmap);
+            return Err(RingBufferError::DeviceStateInvalid);
         }
 
         crate::driver_info!(
@@ -348,16 +463,49 @@ impl RingBufferManager {
         Ok(response_payload)
     }
 
-    /// Tears down the active user-mode memory projection and releases the notification event.
+    /// Tears down the active user-mode memory projection and releases the notification event
+    /// if and only if `file_object` owns the active mapping session.
     ///
-    /// Invoked during file cleanup while the target process page tables remain intact,
-    /// safely unmapping locked user pages and releasing referenced event objects.
-    pub(crate) fn teardown_user_mapping(&self) {
-        let mut guard = self.active_mapping.lock();
-        if guard.is_some() {
-            *guard = None;
+    /// Extracts the `UserModeMemory` under the spinlock and drops it **after** releasing the spinlock
+    /// so `MmUnmapLockedPages` and `ObfDereferenceObject` execute at `PASSIVE_LEVEL` in the owning
+    /// process's CR3 context.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_object` - The `WDFFILEOBJECT` undergoing `EvtFileCleanup`.
+    pub(crate) fn teardown_user_mapping_for_file(&self, file_object: WDFFILEOBJECT) {
+        let target_file = file_object as usize;
+        let current_process = unsafe { IoGetCurrentProcess() } as usize;
+
+        let extracted = {
+            let mut guard = self.active_mapping.lock();
+            match *guard {
+                MappingState::MappingInProgress {
+                    file_object: active_file,
+                    ref mut cancel_requested,
+                    ..
+                } if active_file == target_file => {
+                    *cancel_requested = true;
+                    None
+                }
+                MappingState::Mapped(ref mem)
+                    if mem.file_object() == target_file
+                        && mem.owner_process() == current_process =>
+                {
+                    match core::mem::replace(&mut *guard, MappingState::Unmapped) {
+                        MappingState::Mapped(m) => Some(m),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+
+        // Guard is dropped here, restoring IRQL to PASSIVE_LEVEL before unmapping MDLs!
+        if let Some(mem) = extracted {
+            drop(mem);
             crate::driver_info!(
-                "[ring_buffer::teardown] User memory mapping torn down successfully"
+                "[ring_buffer::teardown] User memory mapping torn down safely at PASSIVE_LEVEL"
             );
         }
     }
@@ -365,7 +513,8 @@ impl RingBufferManager {
     /// Registers a user-mode Win32 event handle for kernel event notifications.
     ///
     /// References the user-mode event handle in the calling process context and attaches
-    /// it to the active mapping session.
+    /// it to the active mapping session owned by `file_object`. Any previously registered event
+    /// is extracted and dropped outside the spinlock at `PASSIVE_LEVEL`.
     ///
     /// # Safety
     /// Caller must ensure `handle` is a valid Win32 synchronization event handle belonging
@@ -373,28 +522,49 @@ impl RingBufferManager {
     ///
     /// # Arguments
     ///
+    /// * `file_object` - Originating `WDFFILEOBJECT` from the IOCTL request.
     /// * `handle` - Win32 event handle to be referenced and signaled.
     ///
     /// # Return values
     ///
     /// * `Ok(())` - Event object referenced and registered successfully.
-    /// * `Err(NTSTATUS)` - Object Manager lookup failure or invalid handle status.
+    /// * `Err(NTSTATUS)` - Object Manager lookup failure, invalid state, or ownership mismatch.
     pub(crate) unsafe fn register_notification_event(
         &self,
+        file_object: WDFFILEOBJECT,
         handle: wdk_sys::HANDLE,
     ) -> Result<(), NTSTATUS> {
         let event = unsafe { KernelNotificationEvent::from_handle(handle)? };
+        let caller_file = file_object as usize;
 
-        let mut guard = self.active_mapping.lock();
-        let session = guard
-            .as_mut()
-            .ok_or(RingBufferError::DeviceStateInvalid.to_ntstatus())?;
-        session.set_notification_event(event);
+        let result = {
+            let mut guard = self.active_mapping.lock();
+            match *guard {
+                MappingState::Mapped(ref mut session) => {
+                    if session.file_object() != caller_file {
+                        Err((event, STATUS_ACCESS_DENIED))
+                    } else {
+                        Ok(session.set_notification_event(event))
+                    }
+                }
+                _ => Err((event, RingBufferError::DeviceStateInvalid.to_ntstatus())),
+            }
+        };
 
-        crate::driver_info!(
-            "[ring_buffer::event] Kernel notification event registered successfully"
-        );
-        Ok(())
+        // Any old or rejected KernelNotificationEvent is dropped here at PASSIVE_LEVEL
+        match result {
+            Ok(old_event) => {
+                drop(old_event);
+                crate::driver_info!(
+                    "[ring_buffer::event] Kernel notification event registered successfully"
+                );
+                Ok(())
+            }
+            Err((rejected_event, status)) => {
+                drop(rejected_event);
+                Err(status)
+            }
+        }
     }
 
     /// Signals the active user-mode reader thread.
@@ -403,7 +573,7 @@ impl RingBufferManager {
     #[inline(always)]
     pub(crate) fn signal_reader(&self) {
         let guard = self.active_mapping.lock();
-        if let Some(ref session) = *guard {
+        if let MappingState::Mapped(ref session) = *guard {
             session.signal_reader();
         }
     }

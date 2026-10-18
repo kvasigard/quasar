@@ -14,7 +14,7 @@ use super::session::EventTraceProperties;
 /// to reside in a single contiguous, aligned block of memory. This struct encapsulates the byte allocation,
 /// string copies, and offset calculations safely without exposing raw pointer manipulation to callers.
 pub struct TracePropertiesBuffer {
-    buffer: Vec<u8>,
+    buffer: Vec<u64>,
 }
 
 impl TracePropertiesBuffer {
@@ -48,13 +48,15 @@ impl TracePropertiesBuffer {
         let file_len_bytes = file_wide.len() * size_of::<u16>();
 
         let total_size = struct_size + name_len_bytes + file_len_bytes;
-        let mut buffer = vec![0u8; total_size];
-        let props_ptr = buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
+        let u64_len = total_size.div_ceil(size_of::<u64>());
+        let mut buffer = vec![0u64; u64_len];
+        let base_byte_ptr = buffer.as_mut_ptr() as *mut u8;
+        let props_ptr = base_byte_ptr as *mut EVENT_TRACE_PROPERTIES;
 
-        // SAFETY: The buffer is allocated with `total_size` bytes, which strictly covers
-        // `EVENT_TRACE_PROPERTIES` plus both null-terminated wide strings without overlapping.
+        // SAFETY: The buffer is 8-byte aligned via `Vec<u64>` and allocated with at least `total_size` bytes,
+        // which strictly covers `EVENT_TRACE_PROPERTIES` plus both null-terminated wide strings without overlapping.
         unsafe {
-            (*props_ptr).Wnode.BufferSize = total_size as u32;
+            (*props_ptr).Wnode.BufferSize = (u64_len * size_of::<u64>()) as u32;
             (*props_ptr).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
             (*props_ptr).Wnode.ClientContext = 1; // QPC timestamp
             (*props_ptr).Wnode.Guid = session_guid;
@@ -78,14 +80,14 @@ impl TracePropertiesBuffer {
 
             std::ptr::copy_nonoverlapping(
                 name_wide.as_ptr(),
-                buffer.as_mut_ptr().add(struct_size) as *mut u16,
+                base_byte_ptr.add(struct_size) as *mut u16,
                 name_wide.len(),
             );
 
             if !file_wide.is_empty() {
                 std::ptr::copy_nonoverlapping(
                     file_wide.as_ptr(),
-                    buffer.as_mut_ptr().add(struct_size + name_len_bytes) as *mut u16,
+                    base_byte_ptr.add(struct_size + name_len_bytes) as *mut u16,
                     file_wide.len(),
                 );
             }

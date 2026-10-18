@@ -150,6 +150,7 @@ pub(crate) struct PoolGuard<T = core::ffi::c_void> {
     ptr: NonNull<T>,
 }
 
+#[allow(dead_code)]
 impl<T> PoolGuard<T> {
     /// Constructs a `PoolGuard` from a raw kernel pool allocation pointer.
     ///
@@ -242,6 +243,10 @@ impl<T> PoolGuard<T> {
     /// Useful when receiving untyped `PVOID` pool buffers from APIs like `SeQueryInformationToken`
     /// and casting them into typed structures (e.g. `TOKEN_MANDATORY_LABEL`).
     ///
+    /// # Safety
+    /// Caller must ensure the underlying pool allocation satisfies the size, alignment, and
+    /// validity invariants of target type `U`.
+    ///
     /// # Arguments
     ///
     /// * `self` - The current pool guard.
@@ -250,7 +255,7 @@ impl<T> PoolGuard<T> {
     ///
     /// * `PoolGuard<U>` - Pool guard reinterpreted as type `U`.
     #[inline]
-    pub(crate) fn cast<U>(self) -> PoolGuard<U> {
+    pub(crate) unsafe fn cast<U>(self) -> PoolGuard<U> {
         let ptr = self.ptr.cast::<U>();
         core::mem::forget(self);
         PoolGuard { ptr }

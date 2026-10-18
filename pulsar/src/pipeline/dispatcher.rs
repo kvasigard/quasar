@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use shared::ring_buffer::LsassAccessEvent;
 
@@ -125,36 +125,51 @@ impl EventDispatcher {
     fn run(self, shutdown_flag: Arc<AtomicBool>) {
         log::debug!(target: "dispatcher", "EventDispatcher background thread started.");
         let mut pipeline = Pipeline::new();
+        let mut last_flush = Instant::now();
 
         while !shutdown_flag.load(Ordering::Relaxed) {
-            // Drain any pending driver events
+            // Drain up to 512 pending driver events per iteration to prevent starving ETW
             if let Some(ref driver_rx) = self.driver_rx {
-                while let Ok(event) = driver_rx.try_recv() {
-                    self.dispatch(&event);
+                for _ in 0..512 {
+                    match driver_rx.try_recv() {
+                        Ok(event) => self.dispatch(&event),
+                        Err(_) => break,
+                    }
                 }
             }
 
-            match self.etw_rx.recv_timeout(Duration::from_millis(50)) {
+            // Periodically flush expired stack correlations even under continuous ETW load
+            if last_flush.elapsed() >= Duration::from_millis(25) {
+                for expired_event in pipeline.flush_expired() {
+                    self.dispatch(&expired_event);
+                }
+                last_flush = Instant::now();
+            }
+
+            match self.etw_rx.recv_timeout(Duration::from_millis(5)) {
                 Ok(record) => {
                     if let Some(event) = pipeline.feed(&record) {
                         self.dispatch(&event);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    // Flush any pending events whose stack correlation timed out
                     for expired_event in pipeline.flush_expired() {
                         self.dispatch(&expired_event);
                     }
+                    last_flush = Instant::now();
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
 
-        // Final sweep of driver events upon termination
+        // Final sweep of driver events and buffered triggers upon termination
         if let Some(ref driver_rx) = self.driver_rx {
             while let Ok(event) = driver_rx.try_recv() {
                 self.dispatch(&event);
             }
+        }
+        for expired_event in pipeline.flush_expired() {
+            self.dispatch(&expired_event);
         }
 
         log::debug!(target: "dispatcher", "Event bus stopped by signal or disconnection. Dispatcher terminating.");

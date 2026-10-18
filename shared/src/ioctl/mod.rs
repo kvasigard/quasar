@@ -10,6 +10,12 @@ pub use ring_buffer::*;
 pub const METHOD_BUFFERED: u32 = 0;
 /// Standard WDK definition for unrestricted device access.
 pub const FILE_ANY_ACCESS: u32 = 0;
+/// Standard WDK definition for read access requirement on the device handle.
+pub const FILE_READ_ACCESS: u32 = 0x0001;
+/// Standard WDK definition for write access requirement on the device handle.
+pub const FILE_WRITE_ACCESS: u32 = 0x0002;
+/// Combined read and write access requirement on the device handle.
+pub const FILE_READ_WRITE_ACCESS: u32 = FILE_READ_ACCESS | FILE_WRITE_ACCESS;
 
 /// Custom Device Type for OEM/Custom drivers (>= 32768 / 0x8000).
 pub const SINGULARITY_DEVICE_TYPE: u32 = 0x8000;
@@ -41,12 +47,12 @@ mod tests {
     /// Prevents invalid IOCTL calculations that would cause the I/O Manager to reject dispatch requests or misroute control packets.
     #[test]
     fn test_ctl_code_macro_calculation() {
-        let code = ctl_code!(0x8000u32, 0x801u32, 0u32, 0u32);
-        assert_eq!(code, 0x80002004u32);
-        assert_eq!(IOCTL_CHANGE_PPL_LEVEL, 0x80002004u32);
-        let ring_code = ctl_code!(0x8000u32, 0x802u32, 0u32, 0u32);
-        assert_eq!(ring_code, 0x80002008u32);
-        assert_eq!(IOCTL_MAP_PER_CPU_BUFFER, 0x80002008u32);
+        let code = ctl_code!(0x8000u32, 0x801u32, 0u32, FILE_READ_WRITE_ACCESS);
+        assert_eq!(code, 0x8000_E004u32);
+        assert_eq!(IOCTL_CHANGE_PPL_LEVEL, 0x8000_E004u32);
+        let ring_code = ctl_code!(0x8000u32, 0x802u32, 0u32, FILE_READ_WRITE_ACCESS);
+        assert_eq!(ring_code, 0x8000_E008u32);
+        assert_eq!(IOCTL_MAP_PER_CPU_BUFFER, 0x8000_E008u32);
     }
 }
 

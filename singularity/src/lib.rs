@@ -7,12 +7,15 @@ use wdk_alloc::WdkAllocator;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
-/// Custom kernel panic handler that logs the panic details to DbgView before spinning
+/// Custom kernel panic handler that logs the panic details to DbgView before triggering a bugcheck.
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     driver_error!("[PANIC] {info}");
-    loop {}
+    // SAFETY: Invoking KeBugCheckEx terminates the system safely rather than spinning at elevated IRQL.
+    unsafe {
+        wdk_sys::ntddk::KeBugCheckEx(0x0000_001E, 0, 0, 0, 0);
+    }
 }
 
 pub(crate) mod comm;
@@ -84,20 +87,21 @@ unsafe fn initialize_driver(
         return Err(DriverError::WdfDriverCreate(nt_status));
     }
 
-    // Create the Non-PnP Control Device and Sequential Queue
-    driver_debug!("[initialize_driver] Creating Non-PnP Control Device...");
-    unsafe { device::create_control_device(driver_handle)? };
-    DRIVER_STATE.mark_device_created();
-
-    // Create the Shared Memory ring
+    // Create the Shared Memory ring BEFORE exposing the control device symlink
     driver_debug!("[initialize_driver] Initializing shared memory ring buffer...");
     comm::ring_buffer::initialize()?;
     DRIVER_STATE.mark_ring_created();
 
-    // Register Object Manager callbacks
+    // Register Object Manager callbacks BEFORE exposing the control device symlink
     driver_info!("[initialize_driver] Registering Object Manager callbacks...");
     domains::callbacks::initialize()?;
     DRIVER_STATE.mark_callbacks_registered();
+
+    // Create the Non-PnP Control Device and Sequential Queue last so user-mode clients
+    // can only open \DosDevices\SingularityDevice after all subsystems are ready.
+    driver_debug!("[initialize_driver] Creating Non-PnP Control Device...");
+    unsafe { device::create_control_device(driver_handle)? };
+    DRIVER_STATE.mark_device_created();
 
     // Mark driver as fully initialized and ready
     driver_debug!("[initialize_driver] Subsystems initialized, marking driver ready.");

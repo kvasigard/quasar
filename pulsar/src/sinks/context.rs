@@ -112,8 +112,12 @@ mod tests {
         assert!(key.is_some(), "Process 9999 should exist in SystemState");
 
         // Populate suppression cache for PID 9999
-        engine.cache().insert(9999, 0x1410, 0);
-        assert!(engine.cache().is_suppressed(9999, 0x1410));
+        engine
+            .cache()
+            .insert(crate::rules::EventType::ObProcessHandle, 9999, 0x1410, 0);
+        assert!(engine
+            .cache()
+            .is_suppressed(crate::rules::EventType::ObProcessHandle, 9999, 0x1410));
 
         // Terminate process
         let end_event = ProcessEvent {
@@ -135,6 +139,8 @@ mod tests {
         sink.on_process(&end_event);
 
         // Cache should be pruned
-        assert!(!engine.cache().is_suppressed(9999, 0x1410));
+        assert!(!engine
+            .cache()
+            .is_suppressed(crate::rules::EventType::ObProcessHandle, 9999, 0x1410));
     }
 }

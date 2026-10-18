@@ -18,7 +18,7 @@
 /// identifiers in the event data (in addition to those in the event header).
 ///
 /// Reference: https://learn.microsoft.com/en-us/windows/win32/etw/process-v2
-use crate::helpers::strings::{StringError, parse_ansi_string, parse_utf16_slice};
+use crate::helpers::strings::{StringError, parse_ansi_string, parse_utf16_bytes};
 use thiserror::Error;
 
 const PTR_SIZE: usize = std::mem::size_of::<usize>();
@@ -182,7 +182,7 @@ pub struct Process_V2_TypeGroup1<'a> {
     pub DirectoryTableBase: usize,
     pub UserSID: &'a [u8],
     pub ImageFileName: &'a str,
-    pub CommandLine: &'a [u16],
+    pub CommandLine: &'a [u8],
 }
 
 impl<'a> TryFrom<&'a [u8]> for Process_V2_TypeGroup1<'a> {
@@ -219,7 +219,7 @@ impl<'a> TryFrom<&'a [u8]> for Process_V2_TypeGroup1<'a> {
             .map_err(|source| DtoProcessError::String("ImageFileName", source))?;
         offset += name_len;
 
-        let (command_line, _) = parse_utf16_slice(&bytes[offset..])
+        let (command_line, _) = parse_utf16_bytes(&bytes[offset..])
             .map_err(|source| DtoProcessError::String("CommandLine", source))?;
 
         Ok(Self {
@@ -422,7 +422,7 @@ mod tests {
         assert_eq!(dto.ExitStatus, 0);
         assert_eq!(dto.ImageFileName, "svchost.exe");
         assert_eq!(
-            String::from_utf16_lossy(dto.CommandLine),
+            crate::helpers::strings::decode_utf16le_bytes(dto.CommandLine),
             "svchost.exe -k netsvcs"
         );
     }

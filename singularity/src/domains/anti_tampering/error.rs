@@ -8,6 +8,7 @@ use wdk_sys::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AntiTamperingError {
     /// Anti-tampering features are intentionally disabled in this build.
+    #[allow(dead_code)]
     FeatureNotImplemented,
 
     /// Windows kernel version retrieval failed via `RtlGetVersion`.

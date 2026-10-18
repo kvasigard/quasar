@@ -4,9 +4,8 @@
 //! against historical process lifetimes, extracting executable image paths, launch command lines,
 //! token security identifiers (SIDs), and walking parentage back to system root.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::alerts::ActorContext;
+use crate::helpers::time::current_qpc_ticks;
 use crate::model::types::ProcessId;
 use crate::state::system_state;
 
@@ -70,29 +69,12 @@ fn query_process_image_path(_pid: u32) -> Option<String> {
 ///
 /// An enriched [`ActorContext`] containing process metadata and lineage hierarchy.
 pub fn resolve_actor_context(pid: u32, fallback_name: &str) -> ActorContext {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-
+    let now_qpc = current_qpc_ticks();
     let full_image_path = query_process_image_path(pid);
 
-    if let Some(key) = system_state().resolve_process_key(ProcessId(pid), now_ms)
-        && let Some(node) = system_state().get_process_snapshot(&key)
+    if let Some((node, parent_name, ancestry)) =
+        system_state().resolve_actor_snapshot(ProcessId(pid), now_qpc)
     {
-        let mut ancestry = Vec::new();
-        system_state().walk_ancestors(&key, |ancestor| {
-            ancestry.push(format!("{} ({})", ancestor.image_file_name, ancestor.key.pid.0));
-            true
-        });
-
-        let parent_name = node
-            .parent
-            .key()
-            .and_then(|pk| system_state().get_process_snapshot(&pk))
-            .map(|pn| pn.image_file_name)
-            .unwrap_or_default();
-
         let image_path = full_image_path.unwrap_or_else(|| node.image_file_name.clone());
 
         return ActorContext {
