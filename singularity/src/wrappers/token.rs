@@ -1,14 +1,6 @@
 //! Process security token inspection and RAII lifecycle wrappers.
 
-use wdk_sys::{
-    TOKEN_MANDATORY_LABEL,
-    ntddk::{
-        ObfDereferenceObject, PsReferencePrimaryToken, RtlSubAuthorityCountSid, RtlSubAuthoritySid,
-        SeQueryInformationToken,
-    },
-};
-
-use super::pool::PoolGuard;
+use wdk_sys::ntddk::{ObfDereferenceObject, PsReferencePrimaryToken, SeQueryInformationToken};
 
 /// Strongly-typed Windows Mandatory Integrity Control (MIC) privilege tier.
 ///
@@ -107,45 +99,30 @@ impl TokenGuard {
 
     /// Queries the Mandatory Integrity Level of this token.
     ///
-    /// Invokes `SeQueryInformationToken` with `TokenIntegrityLevel`, parses the returned
-    /// mandatory label SID, and safely deallocates the paged pool buffer using `PoolGuard`.
+    /// Invokes `SeQueryInformationToken` with `TokenIntegrityLevel`.
+    ///
+    /// Note: Unlike user-mode `GetTokenInformation`, the kernel routine `SeQueryInformationToken`
+    /// for `TokenIntegrityLevel` directly resolves the mandatory label sub-authority RID
+    /// (e.g. `0x4000` for SYSTEM, `0x3000` for HIGH, `0x2000` for MEDIUM) and writes the `ULONG`
+    /// directly to the supplied buffer address, without allocating pool memory.
     ///
     /// # Return values
     ///
     /// * `IntegrityLevel` - Mandatory integrity tier classification (e.g. Low, Medium, High, System).
     pub(crate) fn integrity_level(&self) -> IntegrityLevel {
-        let mut info_ptr: wdk_sys::PVOID = core::ptr::null_mut();
+        let mut rid: u32 = 0;
         let status = unsafe {
             SeQueryInformationToken(
                 self.as_ptr(),
                 wdk_sys::_TOKEN_INFORMATION_CLASS::TokenIntegrityLevel,
-                &mut info_ptr,
+                &mut rid as *mut u32 as *mut wdk_sys::PVOID,
             )
         };
 
-        if status < 0 || info_ptr.is_null() {
+        if status < 0 {
             return IntegrityLevel::UNTRUSTED;
         }
 
-        // SAFETY: SeQueryInformationToken allocates memory from paged pool on success.
-        // PoolGuard guarantees that ExFreePool is invoked upon drop.
-        let pool_guard =
-            match unsafe { PoolGuard::<TOKEN_MANDATORY_LABEL>::from_raw(info_ptr as *mut _) } {
-                Some(guard) => guard,
-                None => return IntegrityLevel::UNTRUSTED,
-            };
-
-        let sid = pool_guard.Label.Sid;
-        if sid.is_null() {
-            return IntegrityLevel::UNTRUSTED;
-        }
-
-        let sub_authority_count = unsafe { *RtlSubAuthorityCountSid(sid) };
-        if sub_authority_count == 0 {
-            return IntegrityLevel::UNTRUSTED;
-        }
-
-        let rid = unsafe { *RtlSubAuthoritySid(sid, (sub_authority_count - 1) as u32) };
         IntegrityLevel(rid)
     }
 }

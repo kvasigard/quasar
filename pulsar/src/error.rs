@@ -3,6 +3,7 @@
 use thiserror::Error;
 use crate::bootstrap::BootstrapError;
 use crate::drivers::error::DriverError;
+use crate::rules::RuleError;
 use crate::sensors::etw::error::EtwError;
 use crate::state::ProcessTreeError;
 
@@ -51,6 +52,10 @@ pub enum AppError {
     /// Process state tree and lineage tracking errors.
     #[error(transparent)]
     ProcessTree(#[from] ProcessTreeError),
+
+    /// Rhai rule evaluation and script loading errors.
+    #[error(transparent)]
+    Rule(#[from] RuleError),
 
     /// Direct Windows API errors.
     #[error("Windows API Error {code}: {message}")]

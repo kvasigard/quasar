@@ -213,7 +213,7 @@ impl<T> PoolGuard<T> {
     #[inline]
     pub(crate) unsafe fn from_raw_unchecked(ptr: *mut T) -> Self {
         Self {
-            ptr: NonNull::new_unchecked(ptr),
+            ptr: unsafe { NonNull::new_unchecked(ptr) },
         }
     }
 

@@ -53,6 +53,7 @@ impl LsassAccessEvent {
     /// # Return values
     ///
     /// * `LsassAccessEvent` - The newly constructed event payload.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         source_pid: u32,
         target_pid: u32,

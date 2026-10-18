@@ -15,7 +15,6 @@ use pulsar::sensors::etw::director::SessionDirector;
 use pulsar::sensors::etw::{
     EtwError, EtwSession, EventRecord, KernelSession, KernelSessionBuilder,
 };
-use pulsar::sinks::LsassAccessSink;
 
 /// Pulsar Endpoint Detection and Response (EDR) Telemetry Agent.
 #[derive(Parser, Debug)]
@@ -53,6 +52,21 @@ pub struct Cli {
         help = "Skip driver service loading and PPL elevation (standalone ETW mode)"
     )]
     pub skip_driver: bool,
+
+    /// Custom directory containing Rhai detection and suppression rules (defaults to './rules').
+    #[arg(
+        long,
+        default_value = "./rules",
+        help = "Path to Rhai rules directory"
+    )]
+    pub rules_dir: std::path::PathBuf,
+
+    /// Disable Rhai rule evaluation and use raw fallback heuristics.
+    #[arg(
+        long,
+        help = "Disable Rhai dynamic rule evaluation engine"
+    )]
+    pub disable_rules: bool,
 }
 
 /// Handles the `--uninstall` CLI flag by requesting SCM to stop and delete the driver service.
@@ -79,6 +93,7 @@ fn setup_event_pipeline(
     enable_syscalls: bool,
     enable_context: bool,
     driver_rx: Option<mpsc::Receiver<Event>>,
+    rule_engine: Option<Arc<pulsar::rules::RuleEngine>>,
     shutdown_flag: Arc<AtomicBool>,
 ) -> (mpsc::SyncSender<EventRecord>, JoinHandle<()>) {
     // Bound the channel queue to 50,000 items to prevent unbounded memory allocation under heavy telemetry bursts.
@@ -90,7 +105,11 @@ fn setup_event_pipeline(
     }
 
     // Register analytical sinks
-    dispatcher.add_listener(Box::new(LsassAccessSink::new()));
+    dispatcher.add_listener(Box::new(pulsar::sinks::ProcessContextSink::new(rule_engine.clone())));
+    dispatcher.add_listener(Box::new(pulsar::sinks::DetectionSink::new(
+        rule_engine,
+        Arc::new(pulsar::alerts::ConsoleEmitter::new()),
+    )));
 
     if enable_syscalls {
         log::info!("Feature enabled: Syscall Tracing.");
@@ -159,6 +178,7 @@ fn teardown_session(
     consumer_handle: JoinHandle<Result<(), EtwError>>,
     dispatcher_handle: JoinHandle<()>,
     driver_sensor_handle: Option<JoinHandle<()>>,
+    rule_watcher_handle: Option<JoinHandle<()>>,
 ) {
     log::info!("Initiating graceful shutdown sequence...");
 
@@ -180,6 +200,12 @@ fn teardown_session(
         log::error!("Dispatcher thread panicked during execution: {:?}", e);
     }
 
+    if let Some(watcher_handle) = rule_watcher_handle
+        && let Err(e) = watcher_handle.join()
+    {
+        log::error!("Rule watcher thread panicked during execution: {:?}", e);
+    }
+
     log::info!("Graceful shutdown complete. All resources freed successfully.");
 }
 
@@ -194,6 +220,37 @@ fn run(cli: Cli) -> Result<(), AppError> {
 
     // Initialize driver service and elevate to PPL
     let driver_client = init_driver_and_ppl(cli.skip_driver)?;
+
+    // Initialize Rhai Rule Engine
+    let rule_engine = if !cli.disable_rules {
+        log::info!("Initializing Rhai Scripting Rule Engine from '{}'...", cli.rules_dir.display());
+        match pulsar::rules::RuleEngine::load(&cli.rules_dir) {
+            Ok(engine) => {
+                log::info!("Rhai Rule Engine initialized with {} active rules.", engine.rule_count());
+                Some(Arc::new(engine))
+            }
+            Err(e) => {
+                log::error!("Failed to initialize Rhai Rule Engine from '{}': {e}", cli.rules_dir.display());
+                return Err(e.into());
+            }
+        }
+    } else {
+        log::warn!("Rhai Rule Engine disabled by CLI flag (--disable-rules).");
+        None
+    };
+
+    // Spawn background rule watcher for hot-reloading
+    let rule_watcher_handle = if let Some(ref engine) = rule_engine {
+        match engine.spawn_watcher(cli.rules_dir.clone(), Arc::clone(&shutdown_flag)) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                log::warn!("Failed to start dynamic rule watcher: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Initialize driver telemetry sensor if driver is present
     let (driver_rx, driver_sensor_handle) = if let Some(ref driver) = driver_client {
@@ -213,8 +270,13 @@ fn run(cli: Cli) -> Result<(), AppError> {
     let enable_syscalls = !cli.disable_syscalls;
     let enable_context = !cli.disable_context;
 
-    let (tx, dispatcher_handle) =
-        setup_event_pipeline(enable_syscalls, enable_context, driver_rx, Arc::clone(&shutdown_flag));
+    let (tx, dispatcher_handle) = setup_event_pipeline(
+        enable_syscalls,
+        enable_context,
+        driver_rx,
+        rule_engine,
+        Arc::clone(&shutdown_flag),
+    );
 
     // Launch NT Kernel Logger ETW trace session
     let (kernel_session, consumer_handle) =
@@ -233,6 +295,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
         consumer_handle,
         dispatcher_handle,
         driver_sensor_handle,
+        rule_watcher_handle,
     );
 
     // Dropping driver_client triggers EvtFileCleanup in driver

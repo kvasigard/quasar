@@ -62,7 +62,7 @@ impl SeSigningLevel {
     }
 }
 
-type FnPsGetProcessSignatureLevel = unsafe extern "system" fn(PEPROCESS) -> u8;
+type FnPsGetProcessSignatureLevel = unsafe extern "system" fn(PEPROCESS, *mut u8) -> u8;
 
 const SENTINEL_UNAVAILABLE: *mut () = 1 as *mut ();
 static PS_GET_PROCESS_SIGNATURE_LEVEL: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
@@ -315,6 +315,9 @@ impl Eprocess {
     /// Returns the Code Integrity signature level of this process.
     ///
     /// Dynamically resolves and invokes `PsGetProcessSignatureLevel` exported by `ntoskrnl.exe`.
+    /// The kernel API prototype is:
+    /// `UCHAR PsGetProcessSignatureLevel(PEPROCESS Process, PUCHAR SectionSignatureLevel)`.
+    /// Passing `null_mut()` for `SectionSignatureLevel` safely queries only the process signature level.
     /// If the export is unresolvable or the image is unsigned, returns `SeSigningLevel::UNSIGNED`.
     ///
     /// # Return values
@@ -324,11 +327,42 @@ impl Eprocess {
     #[allow(dead_code)]
     pub(crate) fn signature_level(&self) -> SeSigningLevel {
         if let Some(func) = resolve_ps_get_process_signature_level() {
-            let level = unsafe { func(self.as_raw()) };
+            let level = unsafe { func(self.as_raw(), core::ptr::null_mut()) };
             SeSigningLevel(level)
         } else {
             SeSigningLevel::UNSIGNED
         }
+    }
+
+    /// Returns both the process Code Integrity signature level and section signature level.
+    ///
+    /// Dynamically resolves and invokes `PsGetProcessSignatureLevel` exported by `ntoskrnl.exe`,
+    /// passing a pointer to capture the `SectionSignatureLevel` output argument.
+    ///
+    /// # Return values
+    ///
+    /// * `(SeSigningLevel, SeSigningLevel)` - (Process signature level, Section signature level).
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn signature_levels(&self) -> (SeSigningLevel, SeSigningLevel) {
+        if let Some(func) = resolve_ps_get_process_signature_level() {
+            let mut section_level = 0u8;
+            let level = unsafe { func(self.as_raw(), &mut section_level) };
+            (SeSigningLevel(level), SeSigningLevel(section_level))
+        } else {
+            (SeSigningLevel::UNSIGNED, SeSigningLevel::UNSIGNED)
+        }
+    }
+
+    /// Returns the section signature level of this process.
+    ///
+    /// # Return values
+    ///
+    /// * `SeSigningLevel` - Section signature level classification.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn section_signature_level(&self) -> SeSigningLevel {
+        self.signature_levels().1
     }
 
     /// Returns the Mandatory Integrity Level of this process's primary token.
