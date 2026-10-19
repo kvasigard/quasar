@@ -4,11 +4,12 @@
 
 ## Architecture
 
-Quasar is designed as a multi-component workspace, split between user-mode analysis, kernel-mode visibility, and shared definitions:
+Quasar is designed as a multi-component workspace, split between user-mode analysis, kernel-mode visibility, shared definitions, and dynamic detection rules:
 
-* **Pulsar (User-Mode):** This is the user-mode agent in charge of collecting system telemetry and routing it through an internal processing pipeline for real-time analysis. It manages data ingestion via "Sensors" (ETW NT Kernel Logger and Singularity Per-CPU Ring Buffer), dispatches the events across threads without blocking, and feeds them into analytical "Sinks" (DirectSyscallSink, LsassAccessSink) where the actual detection logic lives. It also orchestrates kernel-mode component lifecycles and self-elevation to PPL-Antimalware.
+* **Pulsar (User-Mode):** This is the user-mode agent in charge of collecting system telemetry and routing it through an internal processing pipeline for real-time analysis. It manages data ingestion via "Sensors" (ETW NT Kernel Logger and Singularity Per-CPU Ring Buffer), dispatches events without blocking, performs context/actor enrichment (lineage ancestry, token SIDs, Authenticode verification), and evaluates events against compiled Rhai rules. It also orchestrates kernel-mode component lifecycles and self-elevation to PPL-Antimalware.
 * **Singularity (Kernel-Mode):** A Windows Kernel-Mode Driver Framework (KMDF) driver written purely in Rust. It serves as the privileged component of the EDR, providing deep system visibility, Object Manager pre-operation handle interception (`ObRegisterCallbacks`), Process Protection Level (PPL) modification, in-flight credential dumping mitigation, and lock-free Per-CPU shared memory ring buffer telemetry streaming (<500 ns latency).
 * **Shared:** A common `no_std` Rust crate bridging the gap between `pulsar` and `singularity`. It houses binary record layouts (`EventHeader`), domain event contracts (`TemplateEvent`, `DriverEvent`), modular event payloads (`shared::ring_buffer::events`), and IOCTL command definitions ensuring strict C-ABI stability and zero-copy synchronization.
+* **Rules:** Dynamic Rhai detection and suppression scripts supporting hot-reloading from disk. Decouples behavioral tradecraft and benign poller whitelisting from the core compiled binary.
 
 ## Project Structure
 ```text
@@ -24,13 +25,19 @@ quasar/
 │       ├── lib.rs            # Library core
 │       ├── error.rs          # Custom AppError implementation
 │       ├── bootstrap.rs      # PPL elevation & driver orchestration
+│       ├── alerts/           # Structured alerts, MITRE taxonomy, and emitters
 │       ├── drivers/          # Driver lifecycle management and SCM control
+│       ├── enrichment/       # Actor context, lineage hierarchy, token SID, and signature checks
 │       ├── model/            # Normalized domain entities and events
-│       ├── pipeline/         # Event dispatcher, call stack correlator, engine, and Event enum
+│       ├── pipeline/         # Event dispatcher, call stack correlator, and ETW schemas
+│       ├── rules/            # Rhai engine, bindings, fast-path cache, and hot-reload watcher
 │       ├── sensors/          # Ingestion sensors: ETW (kernel/user) and Driver (per-CPU ring buffer)
-│       ├── sinks/            # Analytical detection modules 
+│       ├── sinks/            # Analytical detection modules (DetectionSink, DirectSyscallSink)
 │       ├── state/            # ProcessTree timeline and temporal context
 │       └── helpers/          # Safe handle wrappers, string utilities
+├── rules/                    # Dynamic Rhai rule repository (hot-reloaded)
+│   ├── detectors/            # Behavioral detection rules (e.g. credential dumping)
+│   └── suppressors/          # Benign diagnostic query suppressors (e.g. Taskmgr, WMI)
 └── singularity/              # KMDF Driver (Kernel-Mode)
     ├── .cargo/config.toml    # Compiler flags for kernel environment
     ├── Makefile.toml         # cargo-make configuration for driver packaging
@@ -40,7 +47,7 @@ quasar/
         ├── lib.rs            # DriverEntry and core kernel logic
         ├── device.rs         # Non-PnP WDF Control Device and sequential queue
         ├── comm/             # Lock-free Per-CPU shared memory ring buffer & double MDL mapping
-        ├── domains/          # Core security domains 
+        ├── domains/          # Core security domains (callbacks, anti-tampering, PPL)
         ├── foundation/       # Error handling, IRQL guards, spinlocks, logging, driver state
         ├── ioctl/            # IOCTL dispatching and handlers
         └── wrappers/         # Safe RAII wrappers
@@ -56,8 +63,9 @@ Quasar combines kernel-level hooks with user-mode analytics to detect modern pos
 
 ### Detections & Analytics
 * **Direct Syscall Detection:** Identifies processes attempting to bypass user-land API hooking by executing `syscall` instructions directly, verified via ETW kernel stack trace unwinding.
-* **Anti-Tampering & In-Flight Credential Guard:** Protects `lsass.exe` from credential dumping attacks (e.g. Mimikatz, MiniDumpWriteDump, ProcDump) using Object Manager callbacks (`ObRegisterCallbacks`). Evaluates caller trust across 4 kernel invariant gates (Session 0 verification, sensitive access bitmasks, PPL attributes, and SYSTEM/Authenticode signatures) and actively neutralizes unauthorized handle access in-flight by stripping sensitive rights down to `0x1000` (`PROCESS_QUERY_LIMITED_INFORMATION`). Emits cache-line aligned telemetry to Pulsar in real-time.
-* **Process & Context Tracking:** Maintains an in-memory graph (`ProcessTree`) mapping active process lifecycles, ancestry hierarchies, and temporal resolution for recycled PIDs.
+* **Anti-Tampering & In-Flight Credential Guard:** Protects `lsass.exe` from credential dumping attacks (e.g. Mimikatz, MiniDumpWriteDump, ProcDump) using Object Manager callbacks (`ObRegisterCallbacks`). Actively neutralizes unauthorized handle access in-flight by stripping sensitive rights down to `0x1000` (`PROCESS_QUERY_LIMITED_INFORMATION`).
+* **Dynamic Rhai Rule Engine:** Evaluates intercepted events against dynamic Rhai detection and suppression scripts with filesystem hot-reloading (`notify`) and sub-5ns suppression caching for routine pollers.
+* **Process & Context Tracking:** Tracks active process generations and ancestry trees in an in-memory graph (`ProcessTree`), enriched with user SIDs, command lines, and disk digital signature verification (`WTGetSignatureInfo`).
 
 ## Prerequisites
 
@@ -113,6 +121,8 @@ All detection and telemetry features are **enabled by default**. You can pass CL
 | `--disable-syscalls` | Disables direct syscall anomaly detection and ETW kernel stack tracing. |
 | `--disable-context` | Disables process tree and module mapping context tracking. |
 | `--skip-driver` | Skips Singularity kernel driver loading and PPL elevation (useful for standalone ETW inspection). |
+| `--rules-dir <PATH>` | Specifies a custom directory for Rhai detection and suppression rules (defaults to `./rules`). |
+| `--disable-rules` | Disables Rhai dynamic rule evaluation and falls back to baseline heuristics. |
 | `-u, --uninstall` | Stops and unregisters the Singularity driver service from the SCM and exits. |
 | `-h, --help` | Displays the help menu with all available options. |
 
@@ -120,6 +130,9 @@ All detection and telemetry features are **enabled by default**. You can pass CL
 ```powershell
 # Run with all features enabled (default)
 .\target\release\pulsar.exe
+
+# Specify a custom Rhai rules directory
+.\target\release\pulsar.exe --rules-dir ".\custom_rules"
 
 # Run in standalone ETW mode without driver/PPL elevation
 .\target\release\pulsar.exe --skip-driver

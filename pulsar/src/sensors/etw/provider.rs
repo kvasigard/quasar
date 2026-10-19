@@ -1,8 +1,8 @@
 //! Strongly-typed ETW provider configuration descriptors and severity levels.
 
 use std::fmt;
-use windows_sys::core::GUID;
 use windows_sys::Win32::System::Diagnostics::Etw::EVENT_ENABLE_PROPERTY_STACK_TRACE;
+use windows_sys::core::GUID;
 
 use crate::helpers::format_guid;
 
@@ -51,9 +51,18 @@ impl fmt::Debug for Provider {
             .field("name", &self.name)
             .field("guid", &format_guid(&self.guid))
             .field("level", &self.level)
-            .field("match_any_keyword", &format_args!("{:#x}", self.match_any_keyword))
-            .field("match_all_keyword", &format_args!("{:#x}", self.match_all_keyword))
-            .field("enable_property", &format_args!("{:#x}", self.enable_property))
+            .field(
+                "match_any_keyword",
+                &format_args!("{:#x}", self.match_any_keyword),
+            )
+            .field(
+                "match_all_keyword",
+                &format_args!("{:#x}", self.match_all_keyword),
+            )
+            .field(
+                "enable_property",
+                &format_args!("{:#x}", self.enable_property),
+            )
             .finish()
     }
 }

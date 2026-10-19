@@ -128,6 +128,19 @@ impl EventDispatcher {
         let mut last_flush = Instant::now();
 
         while !shutdown_flag.load(Ordering::Relaxed) {
+            // Drain pending ETW records first so any Process::Start/DCStart events update
+            // SystemState BEFORE driver events are dispatched to detection sinks
+            for _ in 0..2048 {
+                match self.etw_rx.try_recv() {
+                    Ok(record) => {
+                        if let Some(event) = pipeline.feed(&record) {
+                            self.dispatch(&event);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
             // Drain up to 512 pending driver events per iteration to prevent starving ETW
             if let Some(ref driver_rx) = self.driver_rx {
                 for _ in 0..512 {
@@ -150,6 +163,17 @@ impl EventDispatcher {
                 Ok(record) => {
                     if let Some(event) = pipeline.feed(&record) {
                         self.dispatch(&event);
+                    }
+                    // Batch-drain up to 2047 additional queued ETW records without timer overhead
+                    for _ in 0..2047 {
+                        match self.etw_rx.try_recv() {
+                            Ok(next_record) => {
+                                if let Some(event) = pipeline.feed(&next_record) {
+                                    self.dispatch(&event);
+                                }
+                            }
+                            Err(_) => break,
+                        }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -226,14 +250,17 @@ mod tests {
         // Send a mock process event through ETW
         let mut user_data = Vec::new();
         user_data.extend_from_slice(&(0xAAAA_BBBBusize).to_ne_bytes()); // UniqueProcessKey
-        user_data.extend_from_slice(&1234u32.to_ne_bytes());            // ProcessId
-        user_data.extend_from_slice(&4u32.to_ne_bytes());               // ParentId
-        user_data.extend_from_slice(&1u32.to_ne_bytes());               // SessionId
-        user_data.extend_from_slice(&0i32.to_ne_bytes());               // ExitStatus
-        user_data.extend_from_slice(&(0x200000usize).to_ne_bytes());    // DirectoryTableBase
+        user_data.extend_from_slice(&1234u32.to_ne_bytes()); // ProcessId
+        user_data.extend_from_slice(&4u32.to_ne_bytes()); // ParentId
+        user_data.extend_from_slice(&1u32.to_ne_bytes()); // SessionId
+        user_data.extend_from_slice(&0i32.to_ne_bytes()); // ExitStatus
+        user_data.extend_from_slice(&(0x200000usize).to_ne_bytes()); // DirectoryTableBase
         user_data.extend_from_slice(&[1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]); // SID S-1-5-18
         user_data.extend_from_slice(b"test.exe\0");
-        let cmd: Vec<u8> = "test.exe\0".encode_utf16().flat_map(|u| u.to_ne_bytes()).collect();
+        let cmd: Vec<u8> = "test.exe\0"
+            .encode_utf16()
+            .flat_map(|u| u.to_ne_bytes())
+            .collect();
         user_data.extend_from_slice(&cmd);
 
         let record = EventRecord {
@@ -257,7 +284,8 @@ mod tests {
         tx.send(record).unwrap();
 
         // Send a mock LSASS access event through driver channel
-        let lsass_event = LsassAccessEvent::new(5000, 816, 0x1FFFFF, 0x1000, 0x3000, 1, 0, 1, b"malware.exe");
+        let lsass_event =
+            LsassAccessEvent::new(5000, 816, 0x1FFFFF, 0x1000, 0x3000, 1, 0, 1, b"malware.exe");
         driver_tx.send(Event::LsassAccess(lsass_event)).unwrap();
 
         // Allow worker thread to drain

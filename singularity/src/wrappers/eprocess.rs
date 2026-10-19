@@ -314,20 +314,32 @@ impl Eprocess {
         unsafe { PsGetProcessSessionId(self.as_raw()) }
     }
 
-    /// Returns the Code Integrity signature level of this process.
+    /// Returns the effective Code Integrity signature level of this process.
     ///
-    /// Dynamically resolves and invokes `PsGetProcessSignatureLevel` exported by `ntoskrnl.exe`.
-    /// The kernel API prototype is:
-    /// `UCHAR PsGetProcessSignatureLevel(PEPROCESS Process, PUCHAR SectionSignatureLevel)`.
-    /// Passing `null_mut()` for `SectionSignatureLevel` safely queries only the process signature level.
-    /// If the export is unresolvable or the image is unsigned, returns `SeSigningLevel::UNSIGNED`.
+    /// Queries both the runtime process signature level (`EPROCESS.SignatureLevel`) and the
+    /// backing image section signature level (`EPROCESS.SectionSignatureLevel`) via
+    /// `PsGetProcessSignatureLevel`, returning the higher classification. For non-PPL user-mode
+    /// processes (such as `Taskmgr.exe` or `WmiPrvSE.exe`), Windows often leaves the runtime
+    /// process `SignatureLevel` at `0` (`UNCHECKED`) while recording the verified binary
+    /// signature in `SectionSignatureLevel` (`WINDOWS` / `MICROSOFT`).
     ///
     /// # Return values
     ///
-    /// * `SeSigningLevel` - Authenticode signing level classification.
+    /// * `SeSigningLevel` - Effective Authenticode/CI signing level classification.
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn signature_level(&self) -> SeSigningLevel {
+        let (proc_level, sec_level) = self.signature_levels();
+        if proc_level.0 >= sec_level.0 {
+            proc_level
+        } else {
+            sec_level
+        }
+    }
+
+    /// Returns only the strict runtime process signature level (`EPROCESS.SignatureLevel`),
+    /// ignoring `SectionSignatureLevel`.
+    #[inline]
+    pub(crate) fn process_signature_level(&self) -> SeSigningLevel {
         if let Some(func) = resolve_ps_get_process_signature_level() {
             let level = unsafe { func(self.as_raw(), core::ptr::null_mut()) };
             SeSigningLevel(level)

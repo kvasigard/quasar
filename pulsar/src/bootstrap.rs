@@ -33,11 +33,10 @@ pub enum BootstrapError {
     NotElevated,
 
     /// Could not locate the driver package files (`singularity.inf` / `singularity.sys`).
-    #[error("Could not locate driver package pairing '{inf}' and '{sys}' in executable directory or 'singularity_package\\'")]
-    PackageNotFound {
-        inf: String,
-        sys: String,
-    },
+    #[error(
+        "Could not locate driver package pairing '{inf}' and '{sys}' in executable directory or 'singularity_package\\'"
+    )]
+    PackageNotFound { inf: String, sys: String },
 
     /// Current executable directory path resolution failed.
     #[error("Failed to resolve current executable directory: {0}")]
@@ -57,10 +56,7 @@ pub enum BootstrapError {
 
     /// A Win32 setup API call (e.g. `DiInstallDriverW`) failed.
     #[error("Windows Setup API Error {code}: {message}")]
-    WindowsApi {
-        code: u32,
-        message: String,
-    },
+    WindowsApi { code: u32, message: String },
 }
 
 impl BootstrapError {
@@ -119,7 +115,10 @@ pub fn initialize() -> Result<kmdf::Singularity, BootstrapError> {
                 resolved_installed_path
             );
 
-            let files_match = match (std::fs::read(&sys_path), std::fs::read(&resolved_installed_path)) {
+            let files_match = match (
+                std::fs::read(&sys_path),
+                std::fs::read(&resolved_installed_path),
+            ) {
                 (Ok(local_bytes), Ok(installed_bytes)) => local_bytes == installed_bytes,
                 _ => false,
             };
@@ -176,7 +175,6 @@ pub fn initialize() -> Result<kmdf::Singularity, BootstrapError> {
     log::info!(target: "bootstrap", "Bootstrap successful. Running with PPL-Antimalware protection.");
     Ok(kmdf_client)
 }
-
 
 /// Normalizes and cleans service binary paths by expanding system root macros and stripping prefixes.
 ///
@@ -263,12 +261,13 @@ fn install_inf_driver(inf_path: &str) -> Result<(), BootstrapError> {
 ///
 /// Returns [`BootstrapError::ExecutablePath`] or [`BootstrapError::PackageNotFound`].
 fn resolve_package_paths() -> Result<(String, String), BootstrapError> {
-    let exe_path = env::current_exe()
-        .map_err(|e| BootstrapError::ExecutablePath(format!("Failed to get executable path: {}", e)))?;
+    let exe_path = env::current_exe().map_err(|e| {
+        BootstrapError::ExecutablePath(format!("Failed to get executable path: {}", e))
+    })?;
 
-    let exe_dir = exe_path
-        .parent()
-        .ok_or_else(|| BootstrapError::ExecutablePath("Executable path has no parent directory".into()))?;
+    let exe_dir = exe_path.parent().ok_or_else(|| {
+        BootstrapError::ExecutablePath("Executable path has no parent directory".into())
+    })?;
 
     let inf_name = "singularity.inf";
     let sys_name = "singularity.sys";
@@ -384,10 +383,16 @@ mod tests {
         let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
 
         let scm_raw = r#"\??\C:\Windows\System32\drivers\singularity.sys"#;
-        assert_eq!(clean_driver_path(scm_raw), r#"C:\Windows\System32\drivers\singularity.sys"#);
+        assert_eq!(
+            clean_driver_path(scm_raw),
+            r#"C:\Windows\System32\drivers\singularity.sys"#
+        );
 
         let quoted_raw = r#""C:\Program Files\Quasar\singularity.sys""#;
-        assert_eq!(clean_driver_path(quoted_raw), r#"C:\Program Files\Quasar\singularity.sys"#);
+        assert_eq!(
+            clean_driver_path(quoted_raw),
+            r#"C:\Program Files\Quasar\singularity.sys"#
+        );
 
         let macro_raw = r#"\SystemRoot\System32\drivers\singularity.sys"#;
         assert_eq!(

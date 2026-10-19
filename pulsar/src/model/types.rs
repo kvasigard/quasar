@@ -115,4 +115,3 @@ impl fmt::Display for StackTrace {
         write!(f, "StackTrace({} frames)", self.frames.len())
     }
 }
-

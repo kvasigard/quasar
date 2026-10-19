@@ -4,7 +4,6 @@ pub mod time;
 
 pub use handle::SafeHandle;
 
-
 use windows_sys::core::GUID;
 
 /// A helper to format GUIDs nicely for logging and debugging.
@@ -24,5 +23,3 @@ pub fn format_guid(guid: &GUID) -> String {
         guid.data4[7],
     )
 }
-
-

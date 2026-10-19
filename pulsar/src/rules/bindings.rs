@@ -194,12 +194,15 @@ pub fn register_bindings(engine: &mut Engine) {
     engine.register_type_with_name::<RuleVerdict>("Verdict");
 
     // 5. Register Verdict Constructors
-    engine.register_fn("suppress", |reason: &str, cooldown_seconds: i64| -> RuleVerdict {
-        RuleVerdict::Suppress {
-            reason: reason.to_string(),
-            cooldown_seconds: cooldown_seconds.max(0) as u32,
-        }
-    });
+    engine.register_fn(
+        "suppress",
+        |reason: &str, cooldown_seconds: i64| -> RuleVerdict {
+            RuleVerdict::Suppress {
+                reason: reason.to_string(),
+                cooldown_seconds: cooldown_seconds.max(0) as u32,
+            }
+        },
+    );
 
     // 2-argument `alert(title, description)` constructor that inherits severity, tactic, and
     // technique from the rule's `fn rule_info()` metadata during `evaluate_rule`.

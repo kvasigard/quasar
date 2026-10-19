@@ -4,8 +4,8 @@
 //! 1. Project the contiguous per-CPU shared data and status memory pools into user space.
 //! 2. Register a user-mode Win32 notification event with the kernel.
 
+use super::{FILE_READ_WRITE_ACCESS, IoctlMessage, METHOD_BUFFERED, SINGULARITY_DEVICE_TYPE};
 use crate::ctl_code;
-use super::{IoctlMessage, FILE_READ_WRITE_ACCESS, METHOD_BUFFERED, SINGULARITY_DEVICE_TYPE};
 
 /// Custom Function Code for per-CPU ring buffer memory mapping (>= 2048 / 0x800).
 pub const FUNCTION_MAP_PER_CPU_BUFFER: u32 = 0x802;

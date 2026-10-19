@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rhai::{Scope, AST};
+use rhai::{AST, Scope};
 use serde::{Deserialize, Serialize};
 
 use crate::alerts::AlertSeverity;

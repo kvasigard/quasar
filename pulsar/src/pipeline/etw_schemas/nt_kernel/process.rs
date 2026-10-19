@@ -60,23 +60,55 @@ pub enum DtoProcessError {
 /// A tuple containing:
 /// * `&[u8]` - Zero-copy subslice containing the exact binary SID bytes.
 /// * `usize` - Total number of bytes consumed by the SID.
+/// Fallback binary `S-1-0-0` (Null SID) returned when a kernel ETW record carries a `0u32`
+/// null-SID marker (e.g., `Idle` pseudo-process during `DCStart`).
+const NULL_SID_BYTES: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
 #[inline]
 fn parse_sid<'a>(
     bytes: &'a [u8],
     field: &'static str,
 ) -> Result<(&'a [u8], usize), DtoProcessError> {
+    if bytes.len() < 4 {
+        return Err(DtoProcessError::BufferTooShort(field));
+    }
+
+    // In Windows ETW MOF `[extension("Sid")]`, a leading 32-bit 0 indicates no SID is attached
+    // (unless it is the low 32 bits of a 64-bit canonical kernel pointer `0xFFFF...`).
+    let is_64bit_kernel_ptr = bytes.len() >= 8 && bytes[6] == 0xFF && bytes[7] == 0xFF;
+    if bytes[0..4] == [0, 0, 0, 0] && !is_64bit_kernel_ptr {
+        return Ok((&NULL_SID_BYTES, 4));
+    }
+
     if bytes.len() < 8 {
         return Err(DtoProcessError::BufferTooShort(field));
     }
 
-    let sub_auth_count = bytes[1] as usize;
-    let sid_len = 8 + (sub_auth_count * 4);
+    // Distinguish a direct raw SID (Revision == 1, SubAuthorityCount 1..=15, upper 4 bytes of
+    // big-endian IdentifierAuthority == 0) from a kernel ETW `TOKEN_USER` (`2 * PTR_SIZE` bytes)
+    // header preceding the SID.
+    let is_raw_sid = bytes[0] == 1 && (1..=15).contains(&bytes[1]) && bytes[2..6] == [0, 0, 0, 0];
+    let sid_offset = if is_raw_sid { 0 } else { 2 * PTR_SIZE };
 
-    if bytes.len() < sid_len {
+    if bytes.len() < sid_offset + 8 {
+        return Err(DtoProcessError::BufferTooShort(field));
+    }
+
+    if bytes[sid_offset] != 1 {
         return Err(DtoProcessError::InvalidSid(field));
     }
 
-    Ok((&bytes[..sid_len], sid_len))
+    let sub_auth_count = bytes[sid_offset + 1] as usize;
+    let sid_len = 8 + (sub_auth_count * 4);
+
+    if bytes.len() < sid_offset + sid_len {
+        return Err(DtoProcessError::InvalidSid(field));
+    }
+
+    Ok((
+        &bytes[sid_offset..sid_offset + sid_len],
+        sid_offset + sid_len,
+    ))
 }
 
 // V0 Process Schema (Windows XP / Server 2003)
@@ -170,7 +202,7 @@ impl<'a> TryFrom<&'a [u8]> for Process_V1_TypeGroup1<'a> {
     }
 }
 
-// V2 Process Schema (Windows 8 / 10 / 11 / Server 2012+)
+// V2 Process Schema (Windows 8 / Server 2012)
 #[allow(nonstandard_style)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Process_V2_TypeGroup1<'a> {
@@ -229,6 +261,78 @@ impl<'a> TryFrom<&'a [u8]> for Process_V2_TypeGroup1<'a> {
             SessionId: session_id,
             ExitStatus: exit_status,
             DirectoryTableBase: directory_table_base,
+            UserSID: user_sid,
+            ImageFileName: image_file_name,
+            CommandLine: command_line,
+        })
+    }
+}
+
+// V3 / V4 Process Schema (Windows 8.1 / 10 / 11 / Server 2012 R2+)
+// Adds `Flags: u32` after `DirectoryTableBase` (and V4 appends `PackageFullName` / `ApplicationId` after `CommandLine`).
+#[allow(nonstandard_style)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Process_V3_TypeGroup1<'a> {
+    pub UniqueProcessKey: usize,
+    pub ProcessId: u32,
+    pub ParentId: u32,
+    pub SessionId: u32,
+    pub ExitStatus: i32,
+    pub DirectoryTableBase: usize,
+    pub Flags: u32,
+    pub UserSID: &'a [u8],
+    pub ImageFileName: &'a str,
+    pub CommandLine: &'a [u8],
+}
+
+impl<'a> TryFrom<&'a [u8]> for Process_V3_TypeGroup1<'a> {
+    type Error = DtoProcessError;
+
+    fn try_from(bytes: &'a [u8]) -> Result<Self, Self::Error> {
+        let fixed_size = PTR_SIZE + 16 + PTR_SIZE + 4;
+        if bytes.len() < fixed_size {
+            return Err(DtoProcessError::BufferTooShort("FixedHeader"));
+        }
+
+        let mut offset = 0;
+        let unique_process_key =
+            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
+        offset += PTR_SIZE;
+
+        let process_id = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        let parent_id = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        let session_id = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        let exit_status = i32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+
+        let directory_table_base =
+            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
+        offset += PTR_SIZE;
+
+        let flags = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+
+        let (user_sid, sid_len) = parse_sid(&bytes[offset..], "UserSID")?;
+        offset += sid_len;
+
+        let (image_file_name, name_len) = parse_ansi_string(&bytes[offset..])
+            .map_err(|source| DtoProcessError::String("ImageFileName", source))?;
+        offset += name_len;
+
+        let (command_line, _) = parse_utf16_bytes(&bytes[offset..])
+            .map_err(|source| DtoProcessError::String("CommandLine", source))?;
+
+        Ok(Self {
+            UniqueProcessKey: unique_process_key,
+            ProcessId: process_id,
+            ParentId: parent_id,
+            SessionId: session_id,
+            ExitStatus: exit_status,
+            DirectoryTableBase: directory_table_base,
+            Flags: flags,
             UserSID: user_sid,
             ImageFileName: image_file_name,
             CommandLine: command_line,
@@ -399,13 +503,13 @@ mod tests {
     fn test_process_v2_dto_deserialization() {
         let mut buffer = Vec::new();
         buffer.extend_from_slice(&(0xFFFF800011223344usize).to_ne_bytes()); // UniqueProcessKey
-        buffer.extend_from_slice(&1000u32.to_ne_bytes());                    // ProcessId
-        buffer.extend_from_slice(&500u32.to_ne_bytes());                     // ParentId
-        buffer.extend_from_slice(&1u32.to_ne_bytes());                       // SessionId
-        buffer.extend_from_slice(&0i32.to_ne_bytes());                       // ExitStatus
-        buffer.extend_from_slice(&(0x100000usize).to_ne_bytes());            // DirectoryTableBase
-        buffer.extend_from_slice(&[1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]);  // UserSID (12 bytes)
-        buffer.extend_from_slice(b"svchost.exe\0");                          // ImageFileName (12 bytes)
+        buffer.extend_from_slice(&1000u32.to_ne_bytes()); // ProcessId
+        buffer.extend_from_slice(&500u32.to_ne_bytes()); // ParentId
+        buffer.extend_from_slice(&1u32.to_ne_bytes()); // SessionId
+        buffer.extend_from_slice(&0i32.to_ne_bytes()); // ExitStatus
+        buffer.extend_from_slice(&(0x100000usize).to_ne_bytes()); // DirectoryTableBase
+        buffer.extend_from_slice(&[1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]); // UserSID (12 bytes)
+        buffer.extend_from_slice(b"svchost.exe\0"); // ImageFileName (12 bytes)
 
         let cmdline: Vec<u8> = "svchost.exe -k netsvcs\0"
             .encode_utf16()
@@ -454,4 +558,3 @@ mod tests {
         assert_eq!(v0_dto.ImageFileName, "cmd.exe");
     }
 }
-

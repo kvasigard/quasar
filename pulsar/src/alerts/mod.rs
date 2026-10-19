@@ -3,9 +3,9 @@
 //! Provides a strongly-typed, Serde-serializable security alert model decoupled
 //! across Actor, Target, Operation, MITRE ATT&CK taxonomy, and Mitigation outcomes.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod context;
@@ -141,7 +141,8 @@ mod tests {
                 pid: 5120,
                 name: "rundll32.exe".to_string(),
                 image_path: "C:\\Windows\\System32\\rundll32.exe".to_string(),
-                command_line: "rundll32.exe comsvcs.dll, MiniDump 816 C:\\temp\\lsass.dmp full".to_string(),
+                command_line: "rundll32.exe comsvcs.dll, MiniDump 816 C:\\temp\\lsass.dmp full"
+                    .to_string(),
                 user_sid: "S-1-5-18".to_string(),
                 session_id: 1,
                 integrity_level: 0x4000,
@@ -149,7 +150,11 @@ mod tests {
                 protection: 0,
                 parent_pid: 4920,
                 parent_name: "cmd.exe".to_string(),
-                ancestry: vec!["explorer.exe".to_string(), "cmd.exe".to_string(), "rundll32.exe".to_string()],
+                ancestry: vec![
+                    "explorer.exe".to_string(),
+                    "cmd.exe".to_string(),
+                    "rundll32.exe".to_string(),
+                ],
             },
             target: TargetContext {
                 pid: 816,
@@ -160,7 +165,10 @@ mod tests {
                 operation_type: OperationType::ProcessHandleCreate,
                 desired_access: 0x001FFFFF,
                 granted_access: 0x00001000,
-                requested_rights: vec!["PROCESS_ALL_ACCESS".to_string(), "PROCESS_VM_READ".to_string()],
+                requested_rights: vec![
+                    "PROCESS_ALL_ACCESS".to_string(),
+                    "PROCESS_VM_READ".to_string(),
+                ],
                 details: HashMap::new(),
             },
             mitigation: MitigationStatus::Mitigated,
@@ -174,7 +182,8 @@ mod tests {
         assert!(json.contains("\"operationType\": \"processHandleCreate\""));
         assert!(json.contains("\"mitigation\": \"mitigated\""));
 
-        let deserialized: Alert = serde_json::from_str(&json).expect("deserialization should succeed");
+        let deserialized: Alert =
+            serde_json::from_str(&json).expect("deserialization should succeed");
         assert_eq!(alert, deserialized);
     }
 }

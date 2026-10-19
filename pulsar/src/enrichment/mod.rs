@@ -8,4 +8,4 @@ pub mod actor;
 pub mod lsass;
 
 pub use actor::resolve_actor_context;
-pub use lsass::{decode_handle_rights, enrich_lsass_access, EnrichedLsassAccessEvent};
+pub use lsass::{EnrichedLsassAccessEvent, decode_handle_rights, enrich_lsass_access};

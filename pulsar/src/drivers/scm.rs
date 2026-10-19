@@ -12,7 +12,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
-    OpenServiceW, QueryServiceConfigW, QueryServiceStatus, QUERY_SERVICE_CONFIGW,
+    OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfigW, QueryServiceStatus,
     SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SERVICE_ALL_ACCESS, SERVICE_CONTROL_STOP,
     SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, SERVICE_KERNEL_DRIVER, SERVICE_QUERY_CONFIG,
     SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_STATUS, SERVICE_STOP,
@@ -224,13 +224,7 @@ pub fn is_driver_service_registered() -> Result<bool, DriverError> {
 
     let service_name = windows_sys::w!("Singularity");
 
-    let service = unsafe {
-        OpenServiceW(
-            scm_handle.0,
-            service_name,
-            SERVICE_QUERY_STATUS,
-        )
-    };
+    let service = unsafe { OpenServiceW(scm_handle.0, service_name, SERVICE_QUERY_STATUS) };
 
     if service.is_null() {
         let err = unsafe { GetLastError() };
@@ -265,13 +259,7 @@ pub fn get_service_binary_path() -> Result<String, DriverError> {
 
     let service_name = windows_sys::w!("Singularity");
 
-    let service = unsafe {
-        OpenServiceW(
-            scm_handle.0,
-            service_name,
-            SERVICE_QUERY_CONFIG,
-        )
-    };
+    let service = unsafe { OpenServiceW(scm_handle.0, service_name, SERVICE_QUERY_CONFIG) };
 
     if service.is_null() {
         let err = unsafe { GetLastError() };
@@ -283,12 +271,7 @@ pub fn get_service_binary_path() -> Result<String, DriverError> {
 
     // Query required buffer size
     unsafe {
-        QueryServiceConfigW(
-            service_handle.0,
-            ptr::null_mut(),
-            0,
-            &mut bytes_needed,
-        );
+        QueryServiceConfigW(service_handle.0, ptr::null_mut(), 0, &mut bytes_needed);
     }
 
     let err = unsafe { GetLastError() };
@@ -355,13 +338,7 @@ pub fn is_service_running() -> Result<bool, DriverError> {
 
     let service_name = windows_sys::w!("Singularity");
 
-    let service = unsafe {
-        OpenServiceW(
-            scm_handle.0,
-            service_name,
-            SERVICE_QUERY_STATUS,
-        )
-    };
+    let service = unsafe { OpenServiceW(scm_handle.0, service_name, SERVICE_QUERY_STATUS) };
 
     if service.is_null() {
         return Ok(false);
@@ -369,9 +346,7 @@ pub fn is_service_running() -> Result<bool, DriverError> {
     let service_handle = ScmHandle(service);
 
     let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
-    let success = unsafe {
-        QueryServiceStatus(service_handle.0, &mut status)
-    };
+    let success = unsafe { QueryServiceStatus(service_handle.0, &mut status) };
 
     if success == 0 {
         let err = unsafe { GetLastError() };

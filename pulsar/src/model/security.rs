@@ -71,11 +71,13 @@ mod tests {
     #[test]
     fn test_sid_truncation_errors() {
         // Less than 8 bytes header
-        assert_eq!(Sid::try_from(&[1u8, 1, 0][..]), Err("SID buffer too short for header"));
+        assert_eq!(
+            Sid::try_from(&[1u8, 1, 0][..]),
+            Err("SID buffer too short for header")
+        );
 
         // Header claims 2 sub-authorities (16 bytes expected), but only 12 bytes given
         let truncated = [1u8, 2, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
         assert_eq!(Sid::try_from(&truncated[..]), Err("SID buffer truncated"));
     }
 }
-

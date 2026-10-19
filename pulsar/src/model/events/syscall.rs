@@ -90,7 +90,12 @@ mod tests {
     fn test_syscall_event_construction_and_opcode_filter() {
         let syscall_target: usize = 0x7FFF_1234_5678;
         let mut record = EventRecord {
-            provider_id: GUID { data1: 0xce1dbfb4, data2: 0x137e, data3: 0x4da6, data4: [0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc] },
+            provider_id: GUID {
+                data1: 0xce1dbfb4,
+                data2: 0x137e,
+                data3: 0x4da6,
+                data4: [0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc],
+            },
             event_id: 0,
             version: 2,
             opcode: 51, // SysCallEnter
@@ -105,7 +110,10 @@ mod tests {
         let event = SyscallEvent::try_from(&record).expect("Opcode 51 must produce SyscallEvent");
         assert_eq!(event.syscall_address, syscall_target);
         assert_eq!(event.process_id, ProcessId(8888));
-        assert_eq!(event.stack_trace.unwrap().frames(), &[0x7FFF_AAAA, 0x7FFF_BBBB]);
+        assert_eq!(
+            event.stack_trace.unwrap().frames(),
+            &[0x7FFF_AAAA, 0x7FFF_BBBB]
+        );
 
         // Wrong opcode (e.g. SysCallExit 52)
         record.opcode = 52;
@@ -115,5 +123,3 @@ mod tests {
         ));
     }
 }
-
-

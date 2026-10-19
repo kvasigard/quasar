@@ -110,7 +110,10 @@ impl RuleEngine {
             };
         }
 
-        let index_guard = self.rules.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let index_guard = self
+            .rules
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let mut scope = Scope::new();
         event.populate_scope(&mut scope);
@@ -121,7 +124,10 @@ impl RuleEngine {
             scope.rewind(base_len);
 
             match engine::evaluate_rule(&self.engine, rule, &mut scope) {
-                Ok(RuleVerdict::Suppress { reason, cooldown_seconds }) => {
+                Ok(RuleVerdict::Suppress {
+                    reason,
+                    cooldown_seconds,
+                }) => {
                     // Record suppression cooldown so subsequent events from this PID skip Rhai
                     if let Some((pid, access)) = event.suppression_key() {
                         self.cache.insert(event_type, pid, access, cooldown_seconds);
@@ -230,7 +236,10 @@ impl RuleEngine {
     ///
     /// Total number of active suppressor and detector rules in memory.
     pub fn rule_count(&self) -> usize {
-        self.rules.read().unwrap_or_else(|poisoned| poisoned.into_inner()).total_count()
+        self.rules
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .total_count()
     }
 
     /// Returns a reference to the internal suppression cache.
@@ -245,11 +254,11 @@ impl RuleEngine {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use shared::ring_buffer::LsassAccessEvent;
+    use super::*;
     use crate::alerts::AlertSeverity;
     use crate::enrichment::lsass::enrich_lsass_access;
-    use super::*;
+    use shared::ring_buffer::LsassAccessEvent;
+    use std::fs;
 
     fn compile_test_rule(script: &str) -> CompiledRule {
         let engine = engine::create_sandboxed_engine();
@@ -309,7 +318,10 @@ mod tests {
 
         // First evaluation: evaluated by Rhai suppressor and cached
         let verdict = engine.evaluate(&enriched);
-        assert!(matches!(verdict, RuleVerdict::Suppress { .. }), "Expected Suppress verdict");
+        assert!(
+            matches!(verdict, RuleVerdict::Suppress { .. }),
+            "Expected Suppress verdict"
+        );
 
         // Second evaluation: served from fast cache hit (< 5 ns)
         let second_verdict = engine.evaluate(&enriched);
@@ -320,7 +332,11 @@ mod tests {
 
         // Process termination prunes cache
         engine.prune_process(8800);
-        assert!(!engine.cache.is_suppressed(EventType::ObProcessHandle, 8800, 0x1410));
+        assert!(
+            !engine
+                .cache
+                .is_suppressed(EventType::ObProcessHandle, 8800, 0x1410)
+        );
     }
 
     #[test]
@@ -353,11 +369,18 @@ mod tests {
 
         let raw_event = create_mock_event(5120, 816, 0x001FFFFF, 0x1000, 14, "rundll32.exe");
         let mut enriched = enrich_lsass_access(&raw_event);
-        enriched.actor.command_line = "rundll32.exe comsvcs.dll, MiniDump 816 C:\\temp\\lsass.dmp full".to_string();
+        enriched.actor.command_line =
+            "rundll32.exe comsvcs.dll, MiniDump 816 C:\\temp\\lsass.dmp full".to_string();
 
         let verdict = engine.evaluate(&enriched);
         match verdict {
-            RuleVerdict::Alert { severity, title, mitre_tactic, mitre_technique, .. } => {
+            RuleVerdict::Alert {
+                severity,
+                title,
+                mitre_tactic,
+                mitre_technique,
+                ..
+            } => {
                 assert_eq!(severity, AlertSeverity::Critical);
                 assert!(title.contains("Comsvcs DLL"));
                 assert_eq!(mitre_tactic, "Credential Access");
@@ -400,7 +423,12 @@ mod tests {
 
         let verdict = engine.evaluate(&enriched);
         match verdict {
-            RuleVerdict::Alert { severity, title, mitre_technique, .. } => {
+            RuleVerdict::Alert {
+                severity,
+                title,
+                mitre_technique,
+                ..
+            } => {
                 assert_eq!(severity, AlertSeverity::High);
                 assert!(title.contains("Untrusted Process"));
                 assert_eq!(mitre_technique, "T1003.001");
@@ -417,8 +445,12 @@ mod tests {
             Path::new("rules/suppressors/lsass/benign_pollers.rhai"),
         ];
 
-        let rule_path = candidates.iter().find(|p| p.exists()).expect("benign_pollers.rhai must exist");
-        let rule = loader::compile_file(&engine, rule_path).expect("Must compile benign_pollers.rhai");
+        let rule_path = candidates
+            .iter()
+            .find(|p| p.exists())
+            .expect("benign_pollers.rhai must exist");
+        let rule =
+            loader::compile_file(&engine, rule_path).expect("Must compile benign_pollers.rhai");
 
         let mut index = RuleIndex::new();
         index.insert(rule);
@@ -432,7 +464,10 @@ mod tests {
         enriched_taskmgr.actor.image_path = "C:\\Windows\\System32\\Taskmgr.exe".to_string();
         enriched_taskmgr.actor.integrity_level = 0x3000;
         let verdict = rule_engine.evaluate(&enriched_taskmgr);
-        assert!(matches!(verdict, RuleVerdict::Suppress { .. }), "Authentic Taskmgr must be suppressed");
+        assert!(
+            matches!(verdict, RuleVerdict::Suppress { .. }),
+            "Authentic Taskmgr must be suppressed"
+        );
 
         // 2. Bypass attempt: Fake Taskmgr running from Desktop (path spoofing)
         let raw_fake = create_mock_event(8802, 816, 0x1410, 0x1000, 14, "Taskmgr.exe");
@@ -442,7 +477,10 @@ mod tests {
         fake_taskmgr.actor.image_path = "C:\\Users\\Attacker\\Desktop\\Taskmgr.exe".to_string();
         fake_taskmgr.actor.integrity_level = 0x3000;
         let fake_verdict = rule_engine.evaluate(&fake_taskmgr);
-        assert!(matches!(fake_verdict, RuleVerdict::Pass), "Fake Taskmgr outside System32 must NOT be suppressed");
+        assert!(
+            matches!(fake_verdict, RuleVerdict::Pass),
+            "Fake Taskmgr outside System32 must NOT be suppressed"
+        );
 
         // 3. Bypass attempt: Fake Taskmgr running at low/untrusted integrity (< 0x2000)
         let raw_low = create_mock_event(8803, 816, 0x1410, 0x1000, 14, "Taskmgr.exe");
@@ -452,7 +490,10 @@ mod tests {
         low_taskmgr.actor.image_path = "C:\\Windows\\System32\\Taskmgr.exe".to_string();
         low_taskmgr.actor.integrity_level = 0x1000;
         let low_verdict = rule_engine.evaluate(&low_taskmgr);
-        assert!(matches!(low_verdict, RuleVerdict::Pass), "Low integrity Taskmgr must NOT be suppressed");
+        assert!(
+            matches!(low_verdict, RuleVerdict::Pass),
+            "Low integrity Taskmgr must NOT be suppressed"
+        );
 
         // 4. Bypass attempt: Taskmgr carrying memory dumping arguments
         let raw_dump = create_mock_event(8804, 816, 0x1410, 0x1000, 14, "Taskmgr.exe");
@@ -463,7 +504,10 @@ mod tests {
         dump_taskmgr.actor.integrity_level = 0x3000;
         dump_taskmgr.actor.command_line = "Taskmgr.exe /dump lsass".to_string();
         let dump_verdict = rule_engine.evaluate(&dump_taskmgr);
-        assert!(matches!(dump_verdict, RuleVerdict::Pass), "Taskmgr with dump args must NOT be suppressed");
+        assert!(
+            matches!(dump_verdict, RuleVerdict::Pass),
+            "Taskmgr with dump args must NOT be suppressed"
+        );
 
         // 5. Bypass attempt: Taskmgr requesting dumping rights (0x001FFFFF instead of 0x1410)
         let raw_rights = create_mock_event(8805, 816, 0x001FFFFF, 0x1000, 14, "Taskmgr.exe");
@@ -473,17 +517,25 @@ mod tests {
         rights_taskmgr.actor.image_path = "C:\\Windows\\System32\\Taskmgr.exe".to_string();
         rights_taskmgr.actor.integrity_level = 0x3000;
         let rights_verdict = rule_engine.evaluate(&rights_taskmgr);
-        assert!(matches!(rights_verdict, RuleVerdict::Pass), "Taskmgr requesting non-0x1410 rights must NOT be suppressed");
+        assert!(
+            matches!(rights_verdict, RuleVerdict::Pass),
+            "Taskmgr requesting non-0x1410 rights must NOT be suppressed"
+        );
 
         // 5b. Bypass attempt: Unsigned Taskmgr (signature_level < 8)
         let raw_unsigned = create_mock_event(8806, 816, 0x1410, 0x1000, 0, "Taskmgr.exe");
         let mut unsigned_taskmgr = enrich_lsass_access(&raw_unsigned);
         unsigned_taskmgr.raw.integrity_level = 0x3000;
+        unsigned_taskmgr.raw.signature_level = 0;
         unsigned_taskmgr.actor.name = "Taskmgr.exe".to_string();
         unsigned_taskmgr.actor.image_path = "C:\\Windows\\System32\\Taskmgr.exe".to_string();
         unsigned_taskmgr.actor.integrity_level = 0x3000;
+        unsigned_taskmgr.actor.signature_level = 0;
         let unsigned_verdict = rule_engine.evaluate(&unsigned_taskmgr);
-        assert!(matches!(unsigned_verdict, RuleVerdict::Pass), "Unsigned Taskmgr must NOT be suppressed");
+        assert!(
+            matches!(unsigned_verdict, RuleVerdict::Pass),
+            "Unsigned Taskmgr must NOT be suppressed"
+        );
 
         // 6. Authentic WMI Provider Host
         let raw_wmi = create_mock_event(4524, 816, 0x1410, 0x1000, 14, "WmiPrvSE.exe");
@@ -493,16 +545,23 @@ mod tests {
         enriched_wmi.actor.image_path = "C:\\Windows\\System32\\wbem\\WmiPrvSE.exe".to_string();
         enriched_wmi.actor.integrity_level = 0x4000;
         let wmi_verdict = rule_engine.evaluate(&enriched_wmi);
-        assert!(matches!(wmi_verdict, RuleVerdict::Suppress { .. }), "Authentic WmiPrvSE must be suppressed");
+        assert!(
+            matches!(wmi_verdict, RuleVerdict::Suppress { .. }),
+            "Authentic WmiPrvSE must be suppressed"
+        );
 
         // 7. Authentic VMware Tools Guest Agent
         let raw_vmtools = create_mock_event(3340, 816, 0x1410, 0x1000, 8, "vmtoolsd.exe");
         let mut enriched_vmtools = enrich_lsass_access(&raw_vmtools);
         enriched_vmtools.raw.integrity_level = 0x4000;
         enriched_vmtools.actor.name = "vmtoolsd.exe".to_string();
-        enriched_vmtools.actor.image_path = "C:\\Program Files\\VMware\\VMware Tools\\vmtoolsd.exe".to_string();
+        enriched_vmtools.actor.image_path =
+            "C:\\Program Files\\VMware\\VMware Tools\\vmtoolsd.exe".to_string();
         enriched_vmtools.actor.integrity_level = 0x4000;
         let vmtools_verdict = rule_engine.evaluate(&enriched_vmtools);
-        assert!(matches!(vmtools_verdict, RuleVerdict::Suppress { .. }), "Authentic vmtoolsd must be suppressed");
+        assert!(
+            matches!(vmtools_verdict, RuleVerdict::Suppress { .. }),
+            "Authentic vmtoolsd must be suppressed"
+        );
     }
 }

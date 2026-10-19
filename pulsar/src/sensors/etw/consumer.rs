@@ -60,17 +60,49 @@ unsafe extern "system" fn etw_callback(record: *mut EVENT_RECORD) {
             return;
         }
 
-        // Discard System (4), Idle (0), and our own tracer PID only on high-volume PerfInfo
-        // syscall events to avoid feedback loops while preserving Process (Start/DCStart/End)
-        // and StackWalk events emitted in System or tracer thread context.
+        // Fast pre-filter at the C-ABI boundary before heap-allocating `EventRecord`:
+        // Only copy and enqueue records that the pipeline actually consumes (Process lifecycle,
+        // non-self SysCallEnter, and non-self StackWalk).
         let process_id = (*record).EventHeader.ProcessId;
         let current_pid = (*ctx_ptr).current_pid;
-        let is_perfinfo = crate::pipeline::constants::guid_eq(
-            &(*record).EventHeader.ProviderId,
-            &crate::pipeline::constants::NT_KERNEL_PERFINFO_GUID,
+        let opcode = (*record).EventHeader.EventDescriptor.Opcode;
+        let provider_id = &(*record).EventHeader.ProviderId;
+
+        let is_process = crate::pipeline::constants::guid_matches(
+            provider_id,
+            &crate::pipeline::constants::NT_KERNEL_PROCESS_GUID,
+        ) || crate::pipeline::constants::guid_matches(
+            provider_id,
+            &crate::pipeline::constants::MANIFEST_KERNEL_PROCESS_GUID,
         );
 
-        if is_perfinfo && (process_id == 0 || process_id == 4 || process_id == current_pid) {
+        let should_enqueue = if is_process {
+            matches!(
+                opcode,
+                crate::pipeline::constants::process_opcodes::START
+                    | crate::pipeline::constants::process_opcodes::END
+                    | crate::pipeline::constants::process_opcodes::DC_START
+                    | crate::pipeline::constants::process_opcodes::DC_END
+                    | crate::pipeline::constants::process_opcodes::DEFUNCT
+            )
+        } else if process_id == 0 || process_id == 4 || process_id == current_pid {
+            // Discard System (4), Idle (0), and our own tracer PID for high-volume syscall & stack walk events
+            false
+        } else if crate::pipeline::constants::guid_matches(
+            provider_id,
+            &crate::pipeline::constants::NT_KERNEL_PERFINFO_GUID,
+        ) {
+            opcode == crate::pipeline::constants::syscall_opcodes::SYSCALL_ENTER
+        } else if crate::pipeline::constants::guid_matches(
+            provider_id,
+            &crate::pipeline::constants::NT_KERNEL_STACK_WALK_GUID,
+        ) {
+            opcode == crate::pipeline::constants::stack_walk_opcodes::STACK_WALK
+        } else {
+            false
+        };
+
+        if !should_enqueue {
             return;
         }
 

@@ -55,4 +55,3 @@ mod tests {
         assert_eq!(IOCTL_MAP_PER_CPU_BUFFER, 0x8000_E008u32);
     }
 }
-

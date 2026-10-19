@@ -40,10 +40,7 @@ pub struct Cli {
     pub disable_syscalls: bool,
 
     /// Disable ETW kernel process and image load event tracing.
-    #[arg(
-        long,
-        help = "Disable ETW kernel process and image load event tracing"
-    )]
+    #[arg(long, help = "Disable ETW kernel process and image load event tracing")]
     pub disable_context: bool,
 
     /// Skip Singularity driver installation, loading, and PPL elevation (standalone ETW mode).
@@ -54,18 +51,11 @@ pub struct Cli {
     pub skip_driver: bool,
 
     /// Custom directory containing Rhai detection and suppression rules (defaults to './rules').
-    #[arg(
-        long,
-        default_value = "./rules",
-        help = "Path to Rhai rules directory"
-    )]
+    #[arg(long, default_value = "./rules", help = "Path to Rhai rules directory")]
     pub rules_dir: std::path::PathBuf,
 
     /// Disable Rhai rule evaluation and use raw fallback heuristics.
-    #[arg(
-        long,
-        help = "Disable Rhai dynamic rule evaluation engine"
-    )]
+    #[arg(long, help = "Disable Rhai dynamic rule evaluation engine")]
     pub disable_rules: bool,
 }
 
@@ -107,7 +97,9 @@ fn setup_event_pipeline(
     }
 
     // Register analytical sinks
-    dispatcher.add_listener(Box::new(pulsar::sinks::ProcessContextSink::new(rule_engine.clone())));
+    dispatcher.add_listener(Box::new(pulsar::sinks::ProcessContextSink::new(
+        rule_engine.clone(),
+    )));
     dispatcher.add_listener(Box::new(pulsar::sinks::DetectionSink::new(
         rule_engine,
         Arc::new(pulsar::alerts::ConsoleEmitter::new()),
@@ -231,14 +223,23 @@ fn run(cli: Cli) -> Result<(), AppError> {
 
     // Initialize Rhai Rule Engine
     let rule_engine = if !cli.disable_rules {
-        log::info!("Initializing Rhai Scripting Rule Engine from '{}'...", cli.rules_dir.display());
+        log::info!(
+            "Initializing Rhai Scripting Rule Engine from '{}'...",
+            cli.rules_dir.display()
+        );
         match pulsar::rules::RuleEngine::load(&cli.rules_dir) {
             Ok(engine) => {
-                log::info!("Rhai Rule Engine initialized with {} active rules.", engine.rule_count());
+                log::info!(
+                    "Rhai Rule Engine initialized with {} active rules.",
+                    engine.rule_count()
+                );
                 Some(Arc::new(engine))
             }
             Err(e) => {
-                log::error!("Failed to initialize Rhai Rule Engine from '{}': {e}", cli.rules_dir.display());
+                log::error!(
+                    "Failed to initialize Rhai Rule Engine from '{}': {e}",
+                    cli.rules_dir.display()
+                );
                 return Err(e.into());
             }
         }

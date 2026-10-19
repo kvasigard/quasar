@@ -110,6 +110,15 @@ impl CallStackCorrelator {
             return Some(event);
         }
 
+        if self.pending_triggers.len() >= self.max_pending {
+            let now = Instant::now();
+            self.pending_triggers
+                .retain(|_, item| now.duration_since(item.inserted_at) <= self.max_age);
+            if self.pending_triggers.len() >= self.max_pending {
+                self.pending_triggers.clear();
+            }
+        }
+
         self.pending_triggers.insert(
             key,
             PendingTrigger {
@@ -151,6 +160,9 @@ impl CallStackCorrelator {
             let now = Instant::now();
             self.pending_stacks
                 .retain(|_, item| now.duration_since(item.inserted_at) <= self.max_age);
+            if self.pending_stacks.len() > self.max_pending {
+                self.pending_stacks.clear();
+            }
         }
     }
 }

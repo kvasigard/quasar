@@ -1,7 +1,7 @@
 //! Process Protection Level (PPL) IOCTL definitions and payload structures.
 
+use super::{FILE_READ_WRITE_ACCESS, IoctlMessage, METHOD_BUFFERED, SINGULARITY_DEVICE_TYPE};
 use crate::ctl_code;
-use super::{IoctlMessage, FILE_READ_WRITE_ACCESS, METHOD_BUFFERED, SINGULARITY_DEVICE_TYPE};
 
 /// Custom Function Code for elevation control (>= 2048 / 0x800).
 pub const FUNCTION_ELEVATE: u32 = 0x801;

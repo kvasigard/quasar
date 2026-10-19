@@ -265,10 +265,24 @@ mod tests {
         let candidates = [Path::new("../rules"), Path::new("rules")];
         for dir in &candidates {
             if dir.exists() {
-                let rule_index = load_rules_from_dir(&engine, dir).expect("Rules directory should load");
-                assert!(rule_index.total_count() >= 3, "Must find at least 3 disk rules");
-                assert_eq!(rule_index.get(EventType::ObProcessHandle, RuleStage::Suppression).len(), 1);
-                assert_eq!(rule_index.get(EventType::ObProcessHandle, RuleStage::Detection).len(), 2);
+                let rule_index =
+                    load_rules_from_dir(&engine, dir).expect("Rules directory should load");
+                assert!(
+                    rule_index.total_count() >= 3,
+                    "Must find at least 3 disk rules"
+                );
+                assert_eq!(
+                    rule_index
+                        .get(EventType::ObProcessHandle, RuleStage::Suppression)
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    rule_index
+                        .get(EventType::ObProcessHandle, RuleStage::Detection)
+                        .len(),
+                    2
+                );
                 return;
             }
         }

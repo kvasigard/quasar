@@ -58,20 +58,48 @@ impl ScriptableEvent for EnrichedLsassAccessEvent {
 /// Vector of standard Win32 right names (e.g. `PROCESS_VM_READ`, `PROCESS_ALL_ACCESS`).
 pub fn decode_handle_rights(mask: u32) -> Vec<String> {
     let mut rights = Vec::new();
-    if mask & 0x0001 != 0 { rights.push("PROCESS_TERMINATE".to_string()); }
-    if mask & 0x0002 != 0 { rights.push("PROCESS_CREATE_THREAD".to_string()); }
-    if mask & 0x0008 != 0 { rights.push("PROCESS_VM_OPERATION".to_string()); }
-    if mask & 0x0010 != 0 { rights.push("PROCESS_VM_READ".to_string()); }
-    if mask & 0x0020 != 0 { rights.push("PROCESS_VM_WRITE".to_string()); }
-    if mask & 0x0040 != 0 { rights.push("PROCESS_DUP_HANDLE".to_string()); }
-    if mask & 0x0080 != 0 { rights.push("PROCESS_CREATE_PROCESS".to_string()); }
-    if mask & 0x0100 != 0 { rights.push("PROCESS_SET_QUOTA".to_string()); }
-    if mask & 0x0200 != 0 { rights.push("PROCESS_SET_INFORMATION".to_string()); }
-    if mask & 0x0400 != 0 { rights.push("PROCESS_QUERY_INFORMATION".to_string()); }
-    if mask & 0x0800 != 0 { rights.push("PROCESS_SUSPEND_RESUME".to_string()); }
-    if mask & 0x1000 != 0 { rights.push("PROCESS_QUERY_LIMITED_INFORMATION".to_string()); }
-    if mask & 0x00100000 != 0 { rights.push("SYNCHRONIZE".to_string()); }
-    if (mask & 0x001FFFFF) == 0x001FFFFF { rights.push("PROCESS_ALL_ACCESS".to_string()); }
+    if mask & 0x0001 != 0 {
+        rights.push("PROCESS_TERMINATE".to_string());
+    }
+    if mask & 0x0002 != 0 {
+        rights.push("PROCESS_CREATE_THREAD".to_string());
+    }
+    if mask & 0x0008 != 0 {
+        rights.push("PROCESS_VM_OPERATION".to_string());
+    }
+    if mask & 0x0010 != 0 {
+        rights.push("PROCESS_VM_READ".to_string());
+    }
+    if mask & 0x0020 != 0 {
+        rights.push("PROCESS_VM_WRITE".to_string());
+    }
+    if mask & 0x0040 != 0 {
+        rights.push("PROCESS_DUP_HANDLE".to_string());
+    }
+    if mask & 0x0080 != 0 {
+        rights.push("PROCESS_CREATE_PROCESS".to_string());
+    }
+    if mask & 0x0100 != 0 {
+        rights.push("PROCESS_SET_QUOTA".to_string());
+    }
+    if mask & 0x0200 != 0 {
+        rights.push("PROCESS_SET_INFORMATION".to_string());
+    }
+    if mask & 0x0400 != 0 {
+        rights.push("PROCESS_QUERY_INFORMATION".to_string());
+    }
+    if mask & 0x0800 != 0 {
+        rights.push("PROCESS_SUSPEND_RESUME".to_string());
+    }
+    if mask & 0x1000 != 0 {
+        rights.push("PROCESS_QUERY_LIMITED_INFORMATION".to_string());
+    }
+    if mask & 0x00100000 != 0 {
+        rights.push("SYNCHRONIZE".to_string());
+    }
+    if (mask & 0x001FFFFF) == 0x001FFFFF {
+        rights.push("PROCESS_ALL_ACCESS".to_string());
+    }
     rights
 }
 
@@ -98,9 +126,17 @@ pub fn enrich_lsass_access(event: &LsassAccessEvent) -> EnrichedLsassAccessEvent
     };
 
     let mut actor = resolve_actor_context(event.source_pid, cleaned_name);
+    let effective_sig_level = if event.signature_level > 0 {
+        event.signature_level
+    } else {
+        actor.signature_level
+    };
     actor.integrity_level = event.integrity_level;
-    actor.signature_level = event.signature_level;
+    actor.signature_level = effective_sig_level;
     actor.protection = event.protection;
+
+    let mut raw = *event;
+    raw.signature_level = effective_sig_level;
 
     let target = TargetContext {
         pid: event.target_pid,
@@ -124,7 +160,7 @@ pub fn enrich_lsass_access(event: &LsassAccessEvent) -> EnrichedLsassAccessEvent
     };
 
     EnrichedLsassAccessEvent {
-        raw: *event,
+        raw,
         actor,
         target,
         operation,

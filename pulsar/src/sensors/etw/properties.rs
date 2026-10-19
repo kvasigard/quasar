@@ -1,10 +1,10 @@
 //! Safe RAII memory management for Win32 `EVENT_TRACE_PROPERTIES` and trailing strings.
 
 use std::mem::size_of;
-use windows_sys::core::GUID;
 use windows_sys::Win32::System::Diagnostics::Etw::{
     EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, WNODE_FLAG_TRACED_GUID,
 };
+use windows_sys::core::GUID;
 
 use super::session::EventTraceProperties;
 
@@ -153,7 +153,10 @@ mod tests {
             assert_eq!((*ptr).LoggerNameOffset, struct_size);
 
             let name_len_bytes = (session_name.encode_utf16().count() + 1) * size_of::<u16>();
-            assert_eq!((*ptr).LogFileNameOffset, struct_size + name_len_bytes as u32);
+            assert_eq!(
+                (*ptr).LogFileNameOffset,
+                struct_size + name_len_bytes as u32
+            );
 
             let name_ptr = (ptr as *const u8).add((*ptr).LoggerNameOffset as usize) as *const u16;
             let mut name_u16 = Vec::new();

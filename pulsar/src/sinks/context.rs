@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
+use crate::model::ProcessNode;
 use crate::model::events::process::{ProcessEvent, ProcessEventKind};
 use crate::model::types::ExitStatus;
-use crate::model::ProcessNode;
 use crate::pipeline::EventListener;
 use crate::rules::RuleEngine;
 use crate::state::system_state;
@@ -59,7 +59,9 @@ impl EventListener for ProcessContextSink {
             }
             ProcessEventKind::End | ProcessEventKind::Defunct => {
                 let exit_status = event.exit_status.unwrap_or(ExitStatus::Success);
-                if let Err(err) = system_state().on_process_exit(event.process_id, event.timestamp, exit_status) {
+                if let Err(err) =
+                    system_state().on_process_exit(event.process_id, event.timestamp, exit_status)
+                {
                     log::trace!(
                         target: "context_sink",
                         "Process exit untracked for PID {:?}: {}",
@@ -115,9 +117,11 @@ mod tests {
         engine
             .cache()
             .insert(crate::rules::EventType::ObProcessHandle, 9999, 0x1410, 0);
-        assert!(engine
-            .cache()
-            .is_suppressed(crate::rules::EventType::ObProcessHandle, 9999, 0x1410));
+        assert!(engine.cache().is_suppressed(
+            crate::rules::EventType::ObProcessHandle,
+            9999,
+            0x1410
+        ));
 
         // Terminate process
         let end_event = ProcessEvent {
@@ -139,8 +143,10 @@ mod tests {
         sink.on_process(&end_event);
 
         // Cache should be pruned
-        assert!(!engine
-            .cache()
-            .is_suppressed(crate::rules::EventType::ObProcessHandle, 9999, 0x1410));
+        assert!(!engine.cache().is_suppressed(
+            crate::rules::EventType::ObProcessHandle,
+            9999,
+            0x1410
+        ));
     }
 }

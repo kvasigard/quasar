@@ -151,7 +151,10 @@ impl ProcessTree {
     /// # Returns
     ///
     /// The unique [`ProcessKey`] assigned to the inserted process.
-    pub fn handle_start(&mut self, mut process: ProcessNode) -> Result<ProcessKey, ProcessTreeError> {
+    pub fn handle_start(
+        &mut self,
+        mut process: ProcessNode,
+    ) -> Result<ProcessKey, ProcessTreeError> {
         let child_key = process.key();
         let pid = child_key.pid;
         let creation_ts = child_key.creation_timestamp;
@@ -187,7 +190,10 @@ impl ProcessTree {
             }
         }
 
-        let timeline = self.processes.get_mut(&pid).expect("Timeline entry was inserted");
+        let timeline = self
+            .processes
+            .get_mut(&pid)
+            .expect("Timeline entry was inserted");
         timeline.active = Some(process);
 
         Ok(child_key)
@@ -257,12 +263,16 @@ impl ProcessTree {
     ///
     /// The matching [`ProcessKey`] if a process generation covers the timestamp, or `None`.
     pub fn resolve_key(&self, pid: ProcessId, timestamp: i64) -> Option<ProcessKey> {
-        self.processes.get(&pid).and_then(|timeline| timeline.resolve_at_time(timestamp))
+        self.processes
+            .get(&pid)
+            .and_then(|timeline| timeline.resolve_at_time(timestamp))
     }
 
     /// Returns an immutable reference to the currently active [`ProcessNode`] for `pid`, if any.
     pub fn get_active(&self, pid: ProcessId) -> Option<&ProcessNode> {
-        self.processes.get(&pid).and_then(|timeline| timeline.active.as_ref())
+        self.processes
+            .get(&pid)
+            .and_then(|timeline| timeline.active.as_ref())
     }
 
     /// Retrieves an immutable reference to a [`ProcessNode`] using its composite key.
@@ -305,7 +315,11 @@ impl ProcessTree {
     /// # Returns
     ///
     /// `Some(R)` with the closure result if the process was found, or `None`.
-    pub fn mutate<R>(&mut self, key: &ProcessKey, f: impl FnOnce(&mut ProcessNode) -> R) -> Option<R> {
+    pub fn mutate<R>(
+        &mut self,
+        key: &ProcessKey,
+        f: impl FnOnce(&mut ProcessNode) -> R,
+    ) -> Option<R> {
         self.get_mut(key).map(f)
     }
 }

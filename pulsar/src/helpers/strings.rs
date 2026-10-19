@@ -21,7 +21,10 @@ pub enum StringError {
 /// # Returns
 /// A tuple of `(&str, usize)` containing the borrowed string slice and total bytes consumed (including null terminator).
 pub fn parse_ansi_string(bytes: &[u8]) -> Result<(&str, usize), StringError> {
-    let null_pos = bytes.iter().position(|&b| b == 0).ok_or(StringError::MissingNullTerminator)?;
+    let null_pos = bytes
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or(StringError::MissingNullTerminator)?;
     let s = str::from_utf8(&bytes[..null_pos]).map_err(|_| StringError::InvalidEncoding)?;
     Ok((s, null_pos + 1))
 }
@@ -211,8 +214,14 @@ mod tests {
         let bytes = unsafe {
             std::slice::from_raw_parts(unterminated.as_ptr() as *const u8, unterminated.len() * 2)
         };
-        assert_eq!(parse_utf16_slice(bytes), Err(StringError::MissingNullTerminator));
-        assert_eq!(parse_utf16_bytes(bytes), Err(StringError::MissingNullTerminator));
+        assert_eq!(
+            parse_utf16_slice(bytes),
+            Err(StringError::MissingNullTerminator)
+        );
+        assert_eq!(
+            parse_utf16_bytes(bytes),
+            Err(StringError::MissingNullTerminator)
+        );
     }
 
     /// Validates parser behavior when supplied with empty slices or single-byte padding remnants.
@@ -228,7 +237,10 @@ mod tests {
     /// Prevents index out-of-range panics when parsing truncated process command line payloads.
     #[test]
     fn test_extract_utf16_string_bounds() {
-        let mut wide: Vec<u8> = "notepad.exe\0".encode_utf16().flat_map(|c| c.to_ne_bytes()).collect();
+        let mut wide: Vec<u8> = "notepad.exe\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_ne_bytes())
+            .collect();
         wide.extend_from_slice(&[0x99, 0x99]);
 
         let (extracted, next_offset) = extract_utf16_string(&wide, 0);
@@ -240,6 +252,3 @@ mod tests {
         assert_eq!(ret_offset, 100);
     }
 }
-
-
-

@@ -33,10 +33,7 @@ impl DetectionSink {
     /// # Returns
     ///
     /// An initialized [`DetectionSink`] instance.
-    pub fn new(
-        rule_engine: Option<Arc<RuleEngine>>,
-        emitter: Arc<dyn AlertEmitter>,
-    ) -> Self {
+    pub fn new(rule_engine: Option<Arc<RuleEngine>>, emitter: Arc<dyn AlertEmitter>) -> Self {
         Self {
             rule_engine,
             emitter,
@@ -138,7 +135,7 @@ impl EventListener for DetectionSink {
         let requests_dump_rights = (raw_event.desired_access & DUMP_SENSITIVE_RIGHTS) != 0;
 
         if requests_dump_rights {
-            let severity = if raw_event.signature_level < 8 {
+            let severity = if enriched.raw.signature_level < 8 {
                 AlertSeverity::High
             } else {
                 AlertSeverity::Medium
@@ -148,10 +145,16 @@ impl EventListener for DetectionSink {
                 id: Uuid::new_v4(),
                 timestamp: now_ms,
                 severity,
-                title: format!("Suspicious LSASS Handle [{}]", enriched.operation.operation_type),
+                title: format!(
+                    "Suspicious LSASS Handle [{}]",
+                    enriched.operation.operation_type
+                ),
                 description: format!(
                     "Process {} (PID {}) requested sensitive rights ({:#010X}) targeting LSASS. Mitigation status: {}.",
-                    enriched.actor.name, raw_event.source_pid, raw_event.desired_access, enriched.mitigation
+                    enriched.actor.name,
+                    raw_event.source_pid,
+                    raw_event.desired_access,
+                    enriched.mitigation
                 ),
                 mitre: MitreAttack::default(),
                 actor: enriched.actor,
@@ -169,8 +172,8 @@ impl EventListener for DetectionSink {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockEmitter {
         emit_count: AtomicUsize,
@@ -191,17 +194,8 @@ mod tests {
         let sink = DetectionSink::new(None, emitter.clone());
 
         // Desired access with PROCESS_VM_READ (0x0010)
-        let event = LsassAccessEvent::new(
-            5000,
-            816,
-            0x0010,
-            0x1000,
-            0x3000,
-            0,
-            0,
-            1,
-            b"untrusted.exe",
-        );
+        let event =
+            LsassAccessEvent::new(5000, 816, 0x0010, 0x1000, 0x3000, 0, 0, 1, b"untrusted.exe");
 
         sink.on_lsass_access(&event);
         assert_eq!(emitter.emit_count.load(Ordering::SeqCst), 1);

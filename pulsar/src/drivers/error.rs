@@ -18,7 +18,9 @@ pub enum DriverError {
     },
 
     /// IOCTL response buffer returned by the driver was smaller than the expected data structure.
-    #[error("IOCTL {code:#X} response truncated: expected {expected} bytes, received {received} bytes")]
+    #[error(
+        "IOCTL {code:#X} response truncated: expected {expected} bytes, received {received} bytes"
+    )]
     IoctlResponseTruncated {
         code: u32,
         expected: usize,
@@ -31,10 +33,7 @@ pub enum DriverError {
 
     /// A Win32 SCM or DeviceIoControl API call failed.
     #[error("Windows Driver/SCM Error {code}: {message}")]
-    WindowsApi {
-        code: u32,
-        message: String,
-    },
+    WindowsApi { code: u32, message: String },
 }
 
 impl DriverError {

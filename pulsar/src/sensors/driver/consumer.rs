@@ -4,9 +4,7 @@
 //! handling wrap sentinels, 8-byte alignment strides, and atomic cursor progression.
 
 use core::sync::atomic::Ordering;
-use shared::ring_buffer::{
-    EVENT_MAGIC, EVENT_TYPE_WRAP, EventHeader, PerCpuRingHeader,
-};
+use shared::ring_buffer::{EVENT_MAGIC, EVENT_TYPE_WRAP, EventHeader, PerCpuRingHeader};
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 /// Consumer for an individual logical CPU core's ring buffer partition.
@@ -32,8 +30,8 @@ impl CpuRingConsumer {
         data_stride: usize,
         qpc_freq: u64,
     ) -> Self {
-        let header_ptr = (status_base + (cpu_id as u64 * status_stride as u64))
-            as *const PerCpuRingHeader;
+        let header_ptr =
+            (status_base + (cpu_id as u64 * status_stride as u64)) as *const PerCpuRingHeader;
         let data_ptr = (data_base + (cpu_id as u64 * data_stride as u64)) as *const u8;
 
         Self {
@@ -214,7 +212,8 @@ impl DriverRingManager {
             let header_ptr = (mapping.status_address
                 + (cpu_id as u64 * mapping.per_cpu_status_size as u64))
                 as *const PerCpuRingHeader;
-            let initial_read = unsafe { (*header_ptr).read_cursor.load(Ordering::Acquire) as usize };
+            let initial_read =
+                unsafe { (*header_ptr).read_cursor.load(Ordering::Acquire) as usize };
             let mut consumer = CpuRingConsumer::new(
                 cpu_id,
                 mapping.status_address,

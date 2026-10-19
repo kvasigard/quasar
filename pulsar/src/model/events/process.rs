@@ -10,8 +10,8 @@ use thiserror::Error;
 use crate::model::security::Sid;
 use crate::model::types::{ExitStatus, ProcessId, SessionId, StackTrace, UniqueProcessKey};
 use crate::pipeline::etw_schemas::nt_kernel::process::{
-
     DtoProcessError, Process_V0_TypeGroup1, Process_V1_TypeGroup1, Process_V2_TypeGroup1,
+    Process_V3_TypeGroup1,
 };
 use crate::sensors::etw::EventRecord;
 
@@ -117,14 +117,49 @@ pub struct ProcessEvent {
 }
 
 impl ProcessEvent {
-    /// Constructs a `ProcessEvent` from modern Windows 8+ (Version 2) schema payload.
+    /// Constructs a `ProcessEvent` from Windows 8.1 / 10 / 11 (Version 3 / Version 4+) schema payload.
+    fn from_v3(
+        record: &EventRecord,
+        kind: ProcessEventKind,
+        dto: &Process_V3_TypeGroup1,
+    ) -> Result<Self, ProcessModelError> {
+        let user_sid =
+            Sid::try_from(dto.UserSID).map_err(|e| ProcessModelError::InvalidSid(e.to_string()))?;
+
+        let exit_status = match kind {
+            ProcessEventKind::End | ProcessEventKind::Defunct => {
+                Some(ExitStatus::from(dto.ExitStatus))
+            }
+            _ => None,
+        };
+
+        Ok(Self {
+            timestamp: record.timestamp,
+            emitter_pid: ProcessId(record.process_id),
+            emitter_tid: record.thread_id,
+            stack_trace: record.stack_trace.clone().map(StackTrace::new),
+            kind,
+
+            unique_process_key: UniqueProcessKey(dto.UniqueProcessKey),
+            process_id: ProcessId(dto.ProcessId),
+            parent_id: ProcessId(dto.ParentId),
+            session_id: SessionId(dto.SessionId),
+
+            exit_status,
+            user_sid,
+            image_file_name: dto.ImageFileName.to_string(),
+            command_line: crate::helpers::strings::decode_utf16le_bytes(dto.CommandLine),
+        })
+    }
+
+    /// Constructs a `ProcessEvent` from Windows 8 (Version 2) schema payload.
     fn from_v2(
         record: &EventRecord,
         kind: ProcessEventKind,
         dto: &Process_V2_TypeGroup1,
     ) -> Result<Self, ProcessModelError> {
-        let user_sid = Sid::try_from(dto.UserSID)
-            .map_err(|e| ProcessModelError::InvalidSid(e.to_string()))?;
+        let user_sid =
+            Sid::try_from(dto.UserSID).map_err(|e| ProcessModelError::InvalidSid(e.to_string()))?;
 
         let exit_status = match kind {
             ProcessEventKind::End | ProcessEventKind::Defunct => {
@@ -158,8 +193,8 @@ impl ProcessEvent {
         kind: ProcessEventKind,
         dto: &Process_V1_TypeGroup1,
     ) -> Result<Self, ProcessModelError> {
-        let user_sid = Sid::try_from(dto.UserSID)
-            .map_err(|e| ProcessModelError::InvalidSid(e.to_string()))?;
+        let user_sid =
+            Sid::try_from(dto.UserSID).map_err(|e| ProcessModelError::InvalidSid(e.to_string()))?;
 
         let exit_status = match kind {
             ProcessEventKind::End | ProcessEventKind::Defunct => {
@@ -193,8 +228,8 @@ impl ProcessEvent {
         kind: ProcessEventKind,
         dto: &Process_V0_TypeGroup1,
     ) -> Result<Self, ProcessModelError> {
-        let user_sid = Sid::try_from(dto.UserSID)
-            .map_err(|e| ProcessModelError::InvalidSid(e.to_string()))?;
+        let user_sid =
+            Sid::try_from(dto.UserSID).map_err(|e| ProcessModelError::InvalidSid(e.to_string()))?;
 
         Ok(Self {
             timestamp: record.timestamp,
@@ -216,7 +251,6 @@ impl ProcessEvent {
     }
 }
 
-
 impl TryFrom<&EventRecord> for ProcessEvent {
     type Error = ProcessModelError;
 
@@ -225,6 +259,10 @@ impl TryFrom<&EventRecord> for ProcessEvent {
         let bytes = record.user_data.as_slice();
 
         match record.version {
+            3.. => {
+                let dto = Process_V3_TypeGroup1::try_from(bytes)?;
+                ProcessEvent::from_v3(record, kind, &dto)
+            }
             2 => {
                 let dto = Process_V2_TypeGroup1::try_from(bytes)?;
                 ProcessEvent::from_v2(record, kind, &dto)
@@ -237,7 +275,6 @@ impl TryFrom<&EventRecord> for ProcessEvent {
                 let dto = Process_V0_TypeGroup1::try_from(bytes)?;
                 ProcessEvent::from_v0(record, kind, &dto)
             }
-            v => Err(ProcessModelError::UnsupportedVersion(v)),
         }
     }
 }
@@ -253,18 +290,26 @@ mod tests {
     fn test_process_event_from_v2_record() {
         let mut user_data = Vec::new();
         user_data.extend_from_slice(&(0xAAAA_BBBBusize).to_ne_bytes()); // UniqueProcessKey
-        user_data.extend_from_slice(&4321u32.to_ne_bytes());             // PID
-        user_data.extend_from_slice(&1234u32.to_ne_bytes());             // Parent PID
-        user_data.extend_from_slice(&1u32.to_ne_bytes());                // Session ID
-        user_data.extend_from_slice(&0i32.to_ne_bytes());                // ExitStatus
-        user_data.extend_from_slice(&(0x200000usize).to_ne_bytes());     // DirectoryTableBase
+        user_data.extend_from_slice(&4321u32.to_ne_bytes()); // PID
+        user_data.extend_from_slice(&1234u32.to_ne_bytes()); // Parent PID
+        user_data.extend_from_slice(&1u32.to_ne_bytes()); // Session ID
+        user_data.extend_from_slice(&0i32.to_ne_bytes()); // ExitStatus
+        user_data.extend_from_slice(&(0x200000usize).to_ne_bytes()); // DirectoryTableBase
         user_data.extend_from_slice(&[1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]); // SID S-1-5-18
         user_data.extend_from_slice(b"consent.exe\0");
-        let cmd: Vec<u8> = "consent.exe 123\0".encode_utf16().flat_map(|u| u.to_ne_bytes()).collect();
+        let cmd: Vec<u8> = "consent.exe 123\0"
+            .encode_utf16()
+            .flat_map(|u| u.to_ne_bytes())
+            .collect();
         user_data.extend_from_slice(&cmd);
 
         let mut record = EventRecord {
-            provider_id: GUID { data1: 0x22fb2cd6, data2: 0x0e7b, data3: 0x4226, data4: [0xa0, 0x66, 0x61, 0x80, 0xf7, 0x71, 0x24, 0x65] },
+            provider_id: GUID {
+                data1: 0x22fb2cd6,
+                data2: 0x0e7b,
+                data3: 0x4226,
+                data4: [0xa0, 0x66, 0x61, 0x80, 0xf7, 0x71, 0x24, 0x65],
+            },
             event_id: 0,
             version: 2,
             opcode: 1, // Start
@@ -289,5 +334,3 @@ mod tests {
         assert_eq!(end_event.exit_status, Some(ExitStatus::Success));
     }
 }
-
-

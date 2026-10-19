@@ -184,8 +184,8 @@ mod tests {
     fn test_event_record_from_raw_with_extended_stack64() {
         let mut stack_payload = Vec::new();
         stack_payload.extend_from_slice(&0xDEAD_BEEF_CAFE_BABE_u64.to_ne_bytes()); // 8-byte MatchId
-        stack_payload.extend_from_slice(&0x7FFF_1111_2222_u64.to_ne_bytes());      // Frame 1
-        stack_payload.extend_from_slice(&0x7FFF_3333_4444_u64.to_ne_bytes());      // Frame 2
+        stack_payload.extend_from_slice(&0x7FFF_1111_2222_u64.to_ne_bytes()); // Frame 1
+        stack_payload.extend_from_slice(&0x7FFF_3333_4444_u64.to_ne_bytes()); // Frame 2
 
         let mut ext_item: EVENT_HEADER_EXTENDED_DATA_ITEM = unsafe { std::mem::zeroed() };
         ext_item.ExtType = EVENT_HEADER_EXT_TYPE_STACK_TRACE64 as u16;
@@ -197,8 +197,21 @@ mod tests {
         raw_record.EventHeader.ThreadId = 1234;
         raw_record.EventHeader.ProcessId = 5678;
         raw_record.EventHeader.TimeStamp = 99999;
-        raw_record.EventHeader.ProviderId = GUID { data1: 0x1234, data2: 0, data3: 0, data4: [0; 8] };
-        raw_record.EventHeader.EventDescriptor = EVENT_DESCRIPTOR { Id: 1, Version: 2, Channel: 0, Level: 0, Opcode: 1, Task: 0, Keyword: 0 };
+        raw_record.EventHeader.ProviderId = GUID {
+            data1: 0x1234,
+            data2: 0,
+            data3: 0,
+            data4: [0; 8],
+        };
+        raw_record.EventHeader.EventDescriptor = EVENT_DESCRIPTOR {
+            Id: 1,
+            Version: 2,
+            Channel: 0,
+            Level: 0,
+            Opcode: 1,
+            Task: 0,
+            Keyword: 0,
+        };
         raw_record.ExtendedDataCount = 1;
         raw_record.ExtendedData = &ext_item as *const _ as *mut _;
 
@@ -210,4 +223,3 @@ mod tests {
         );
     }
 }
-

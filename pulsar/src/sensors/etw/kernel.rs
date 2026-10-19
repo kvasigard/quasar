@@ -327,9 +327,8 @@ impl EtwSession for KernelSession {
         );
 
         let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
-        let mut status = unsafe {
-            StartTraceW(&mut handle, name_wide.as_ptr(), props_buf.as_mut_ptr())
-        };
+        let mut status =
+            unsafe { StartTraceW(&mut handle, name_wide.as_ptr(), props_buf.as_mut_ptr()) };
 
         if status == ERROR_ALREADY_EXISTS {
             log::warn!(target: "etw_kernel", "Kernel trace session already exists. Attempting to stop and recreate it...");
@@ -440,9 +439,7 @@ impl EtwSession for KernelSession {
     ) -> Result<JoinHandle<Result<(), EtwError>>, EtwError> {
         if self.handle.is_none() {
             log::warn!(target: "etw_kernel", "Attempted to consume events from an unstarted ETW session.");
-            return Err(EtwError::SessionNotStarted(
-                Self::SESSION_NAME.to_string(),
-            ));
+            return Err(EtwError::SessionNotStarted(Self::SESSION_NAME.to_string()));
         }
 
         spawn_trace_consumer(Self::SESSION_NAME.to_string(), sender)

@@ -3,9 +3,9 @@
 //! Separates the **Actor** (who executed the operation), the **Target** (entity operated on),
 //! and the **Operation** (technical parameters intercepted by kernel or user-mode hooks).
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
-use serde::{Deserialize, Serialize};
 
 /// Categorizes the intercepted operation across kernel and user-mode detection domains.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

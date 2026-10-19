@@ -31,7 +31,6 @@ pub enum DtoStackWalkError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(non_snake_case, non_camel_case_types)]
 pub struct StackWalk_TypeGroup1<'a> {
-
     /// Timestamp of the triggering event this stack trace is associated with.
     pub EventTimeStamp: u64,
 
@@ -110,15 +109,16 @@ mod tests {
     fn test_stack_walk_dto_parsing_and_frame_iteration() {
         let mut buffer = Vec::new();
         buffer.extend_from_slice(&123_456_789u64.to_ne_bytes()); // EventTimeStamp
-        buffer.extend_from_slice(&4321u32.to_ne_bytes());        // StackProcess
-        buffer.extend_from_slice(&8765u32.to_ne_bytes());        // StackThread
+        buffer.extend_from_slice(&4321u32.to_ne_bytes()); // StackProcess
+        buffer.extend_from_slice(&8765u32.to_ne_bytes()); // StackThread
 
         let frames: [usize; 3] = [0x7FFF_0001, 0x7FFF_0002, 0x7FFF_0003];
         for f in &frames {
             buffer.extend_from_slice(&f.to_ne_bytes());
         }
 
-        let dto = StackWalk_TypeGroup1::try_from(buffer.as_slice()).expect("Valid StackWalk must parse");
+        let dto =
+            StackWalk_TypeGroup1::try_from(buffer.as_slice()).expect("Valid StackWalk must parse");
         assert_eq!(dto.EventTimeStamp, 123_456_789);
         assert_eq!(dto.StackProcess, 4321);
         assert_eq!(dto.StackThread, 8765);
@@ -149,4 +149,3 @@ mod tests {
         ));
     }
 }
-

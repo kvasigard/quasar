@@ -107,10 +107,10 @@ pub fn evaluate_rule(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::Arc;
     use super::*;
     use crate::rules::types::{EventType, RuleMetadata, RuleStage};
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[test]
     fn test_sandboxed_infinite_loop_fuel_limit() {

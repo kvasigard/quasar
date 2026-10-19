@@ -19,10 +19,7 @@ pub enum EtwError {
 
     /// An underlying Windows ETW API returned a failure status code.
     #[error("Windows ETW API Error {code}: {message}")]
-    WindowsApi {
-        code: u32,
-        message: String,
-    },
+    WindowsApi { code: u32, message: String },
 }
 
 impl EtwError {

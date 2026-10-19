@@ -1,11 +1,11 @@
 //! Centralized application error aggregator and Windows API error decoding.
 
-use thiserror::Error;
 use crate::bootstrap::BootstrapError;
 use crate::drivers::error::DriverError;
 use crate::rules::RuleError;
 use crate::sensors::etw::error::EtwError;
 use crate::state::ProcessTreeError;
+use thiserror::Error;
 
 /// Formats a Win32 error code into a human-readable string using `FormatMessageW`.
 #[inline]
@@ -28,7 +28,9 @@ pub fn format_win32_error_message(code: u32) -> String {
     };
 
     if len > 0 {
-        String::from_utf16_lossy(&buffer[..len as usize]).trim().to_string()
+        String::from_utf16_lossy(&buffer[..len as usize])
+            .trim()
+            .to_string()
     } else {
         format!("Unknown Windows error code {}", code)
     }
@@ -114,7 +116,10 @@ mod tests {
     fn test_app_error_from_domain_errors() {
         let etw_err = EtwError::KernelLoggerAlreadyActive;
         let app_err: AppError = etw_err.into();
-        assert!(matches!(app_err, AppError::Etw(EtwError::KernelLoggerAlreadyActive)));
+        assert!(matches!(
+            app_err,
+            AppError::Etw(EtwError::KernelLoggerAlreadyActive)
+        ));
         assert_eq!(
             app_err.to_string(),
             "The NT Kernel Logger is already active or locked by another instance"
@@ -122,10 +127,16 @@ mod tests {
 
         let driver_err = DriverError::NullBinaryPath;
         let app_err: AppError = driver_err.into();
-        assert!(matches!(app_err, AppError::Driver(DriverError::NullBinaryPath)));
+        assert!(matches!(
+            app_err,
+            AppError::Driver(DriverError::NullBinaryPath)
+        ));
 
         let boot_err = BootstrapError::NotElevated;
         let app_err: AppError = boot_err.into();
-        assert!(matches!(app_err, AppError::Bootstrap(BootstrapError::NotElevated)));
+        assert!(matches!(
+            app_err,
+            AppError::Bootstrap(BootstrapError::NotElevated)
+        ));
     }
 }

@@ -67,7 +67,8 @@ mod tests {
         let target_addr: usize = 0x7FFF_8899_AABB_CCDD;
         let bytes = target_addr.to_ne_bytes();
 
-        let dto = SysCallEnter_TypeGroup1::try_from(&bytes[..]).expect("Should deserialize pointer");
+        let dto =
+            SysCallEnter_TypeGroup1::try_from(&bytes[..]).expect("Should deserialize pointer");
         assert_eq!(dto.SysCallAddress, target_addr);
 
         let truncated = &bytes[..size_of::<usize>() - 1];
@@ -77,5 +78,3 @@ mod tests {
         ));
     }
 }
-
-

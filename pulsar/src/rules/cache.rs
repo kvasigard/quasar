@@ -1,7 +1,6 @@
 //! In-memory suppression cache and rate limiter for rapid verdict lookup.
 //!
-//! Evaluated verdicts (such as benign Task Manager diagnostic polling) are cached
-//! to eliminate repeated Rhai script execution on high-frequency operations (< 5 ns lookup).
+//! Evaluated verdicts are cached to eliminate repeated Rhai script execution on high-frequency operations.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -60,7 +59,10 @@ impl SuppressionCache {
             pid,
             desired_access,
         };
-        let read_guard = self.entries.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let read_guard = self
+            .entries
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(entry) = read_guard.get(&key) {
             match entry {
@@ -99,7 +101,10 @@ impl SuppressionCache {
             CacheEntry::Timed(now + Duration::from_secs(cooldown_seconds as u64))
         };
 
-        let mut write_guard = self.entries.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut write_guard = self
+            .entries
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if write_guard.len() >= 4096 {
             write_guard.retain(|_, v| match v {
                 CacheEntry::ProcessLifetime(max_deadline) => now < *max_deadline,
@@ -117,13 +122,19 @@ impl SuppressionCache {
     ///
     /// * `pid` - Terminated process identifier.
     pub fn prune_process(&self, pid: u32) {
-        let mut write_guard = self.entries.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut write_guard = self
+            .entries
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         write_guard.retain(|key, _| key.pid != pid);
     }
 
     /// Clears all entries in the suppression cache.
     pub fn clear(&self) {
-        let mut write_guard = self.entries.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut write_guard = self
+            .entries
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         write_guard.clear();
     }
 }
@@ -136,8 +147,8 @@ impl Default for SuppressionCache {
 
 #[cfg(test)]
 mod tests {
-    use std::thread::sleep;
     use super::*;
+    use std::thread::sleep;
 
     #[test]
     fn test_process_lifetime_suppression() {

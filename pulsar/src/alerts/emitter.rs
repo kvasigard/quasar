@@ -58,21 +58,35 @@ impl ConsoleEmitter {
         };
 
         let mut lines = Vec::new();
-        lines.push(format!("┌── [ALERT] {tactic} : {title} {border_horizontal}"));
+        lines.push(format!(
+            "┌── [ALERT] {tactic} : {title} {border_horizontal}"
+        ));
         lines.push(format!("│ Time:        epoch {} ms", alert.timestamp));
         lines.push(format!("│ Severity:    {severity_str}"));
         lines.push(format!("│ MITRE ATT&CK: {sub_id} - {mitre_name}"));
         lines.push(format!("│ Rule:        {rule}"));
         lines.push(format!("├{border_horizontal}"));
-        lines.push(format!("│ Actor:       {} (PID: {})", actor.name, actor.pid));
+        lines.push(format!(
+            "│ Actor:       {} (PID: {})",
+            actor.name, actor.pid
+        ));
         lines.push(format!("│ Path:        {}", actor.image_path));
         lines.push(format!("│ Command:     {}", actor.command_line));
         lines.push(format!("│ User / SID:  {}", actor.user_sid));
         lines.push(format!("│ Lineage:     {ancestry_str}"));
         lines.push(format!("├{border_horizontal}"));
-        lines.push(format!("│ Target:      {} (PID: {}) [Entity: {}]", target.name, target.pid, target.entity_type));
-        lines.push(format!("│ Operation:   {} (Target PID: {})", op.operation_type, target.pid));
-        lines.push(format!("│ Requested:   {:#010X}{rights_str}", op.desired_access));
+        lines.push(format!(
+            "│ Target:      {} (PID: {}) [Entity: {}]",
+            target.name, target.pid, target.entity_type
+        ));
+        lines.push(format!(
+            "│ Operation:   {} (Target PID: {})",
+            op.operation_type, target.pid
+        ));
+        lines.push(format!(
+            "│ Requested:   {:#010X}{rights_str}",
+            op.desired_access
+        ));
         lines.push(format!("│ Granted:     {:#010X}", op.granted_access));
         lines.push(format!("│ Mitigation:  {}", alert.mitigation));
         lines.push(format!("└{border_horizontal}"));
@@ -98,13 +112,13 @@ impl AlertEmitter for ConsoleEmitter {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use uuid::Uuid;
+    use super::*;
     use crate::alerts::{
         ActorContext, Alert, AlertSeverity, MitigationStatus, MitreAttack, OperationContext,
         OperationType, TargetContext,
     };
-    use super::*;
+    use std::collections::HashMap;
+    use uuid::Uuid;
 
     #[test]
     fn test_console_emitter_formatting() {
@@ -124,7 +138,8 @@ mod tests {
                 pid: 5120,
                 name: "rundll32.exe".to_string(),
                 image_path: "C:\\Windows\\System32\\rundll32.exe".to_string(),
-                command_line: "rundll32.exe comsvcs.dll, MiniDump 816 C:\\temp\\lsass.dmp full".to_string(),
+                command_line: "rundll32.exe comsvcs.dll, MiniDump 816 C:\\temp\\lsass.dmp full"
+                    .to_string(),
                 user_sid: "S-1-5-18".to_string(),
                 session_id: 1,
                 integrity_level: 0x4000,
@@ -132,7 +147,11 @@ mod tests {
                 protection: 0,
                 parent_pid: 4920,
                 parent_name: "cmd.exe".to_string(),
-                ancestry: vec!["explorer.exe".to_string(), "cmd.exe".to_string(), "rundll32.exe".to_string()],
+                ancestry: vec![
+                    "explorer.exe".to_string(),
+                    "cmd.exe".to_string(),
+                    "rundll32.exe".to_string(),
+                ],
             },
             target: TargetContext {
                 pid: 816,
@@ -143,7 +162,10 @@ mod tests {
                 operation_type: OperationType::ProcessHandleCreate,
                 desired_access: 0x001FFFFF,
                 granted_access: 0x00001000,
-                requested_rights: vec!["PROCESS_ALL_ACCESS".to_string(), "PROCESS_VM_READ".to_string()],
+                requested_rights: vec![
+                    "PROCESS_ALL_ACCESS".to_string(),
+                    "PROCESS_VM_READ".to_string(),
+                ],
                 details: HashMap::new(),
             },
             mitigation: MitigationStatus::Mitigated,
@@ -152,7 +174,9 @@ mod tests {
         };
 
         let formatted = ConsoleEmitter::format_alert(&alert);
-        assert!(formatted.contains("[ALERT] CREDENTIAL ACCESS : LSASS Memory Access via Comsvcs DLL"));
+        assert!(
+            formatted.contains("[ALERT] CREDENTIAL ACCESS : LSASS Memory Access via Comsvcs DLL")
+        );
         assert!(formatted.contains("CRITICAL"));
         assert!(formatted.contains("T1003.001"));
         assert!(formatted.contains("rundll32.exe (PID: 5120)"));

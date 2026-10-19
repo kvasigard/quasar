@@ -5,7 +5,7 @@
 //! stack walk events.
 
 use crate::pipeline::call_stack_correlator::CallStackCorrelator;
-use crate::pipeline::constants::{guid_matches, stack_walk_opcodes, NT_KERNEL_STACK_WALK_GUID};
+use crate::pipeline::constants::{NT_KERNEL_STACK_WALK_GUID, guid_matches, stack_walk_opcodes};
 use crate::pipeline::event::Event;
 use crate::sensors::etw::EventRecord;
 
@@ -94,14 +94,17 @@ mod tests {
     fn create_process_record(pid: u32, timestamp: i64) -> EventRecord {
         let mut user_data = Vec::new();
         user_data.extend_from_slice(&(0xAAAA_BBBBusize).to_ne_bytes()); // UniqueProcessKey
-        user_data.extend_from_slice(&pid.to_ne_bytes());                // ProcessId
-        user_data.extend_from_slice(&4u32.to_ne_bytes());               // ParentId
-        user_data.extend_from_slice(&1u32.to_ne_bytes());               // SessionId
-        user_data.extend_from_slice(&0i32.to_ne_bytes());               // ExitStatus
-        user_data.extend_from_slice(&(0x200000usize).to_ne_bytes());    // DirectoryTableBase
+        user_data.extend_from_slice(&pid.to_ne_bytes()); // ProcessId
+        user_data.extend_from_slice(&4u32.to_ne_bytes()); // ParentId
+        user_data.extend_from_slice(&1u32.to_ne_bytes()); // SessionId
+        user_data.extend_from_slice(&0i32.to_ne_bytes()); // ExitStatus
+        user_data.extend_from_slice(&(0x200000usize).to_ne_bytes()); // DirectoryTableBase
         user_data.extend_from_slice(&[1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]); // SID S-1-5-18
         user_data.extend_from_slice(b"cmd.exe\0");
-        let cmd: Vec<u8> = "cmd.exe\0".encode_utf16().flat_map(|u| u.to_ne_bytes()).collect();
+        let cmd: Vec<u8> = "cmd.exe\0"
+            .encode_utf16()
+            .flat_map(|u| u.to_ne_bytes())
+            .collect();
         user_data.extend_from_slice(&cmd);
 
         EventRecord {
@@ -146,8 +149,8 @@ mod tests {
     fn create_stack_walk_record(pid: u32, tid: u32, event_ts: u64, frames: &[u64]) -> EventRecord {
         let mut user_data = Vec::new();
         user_data.extend_from_slice(&event_ts.to_ne_bytes()); // EventTimeStamp
-        user_data.extend_from_slice(&pid.to_ne_bytes());      // StackProcess
-        user_data.extend_from_slice(&tid.to_ne_bytes());      // StackThread
+        user_data.extend_from_slice(&pid.to_ne_bytes()); // StackProcess
+        user_data.extend_from_slice(&tid.to_ne_bytes()); // StackThread
         for frame in frames {
             user_data.extend_from_slice(&frame.to_ne_bytes());
         }
@@ -177,7 +180,9 @@ mod tests {
         let mut pipeline = Pipeline::new();
         let record = create_process_record(1234, 1_000);
 
-        let event = pipeline.feed(&record).expect("Process event should be emitted immediately");
+        let event = pipeline
+            .feed(&record)
+            .expect("Process event should be emitted immediately");
         match event {
             Event::Process(p) => {
                 assert_eq!(p.process_id.0, 1234);
@@ -195,7 +200,10 @@ mod tests {
 
         // Syscall record requires async stack, so feeding returns None initially
         let pending = pipeline.feed(&syscall_record);
-        assert!(pending.is_none(), "Syscall should be buffered awaiting StackWalk");
+        assert!(
+            pending.is_none(),
+            "Syscall should be buffered awaiting StackWalk"
+        );
 
         // Feed matching StackWalk record
         let stack_record = create_stack_walk_record(4321, 100, 5_000, &[0x7FFF_AAAA, 0x7FFF_BBBB]);
@@ -207,10 +215,7 @@ mod tests {
             Event::Syscall(s) => {
                 assert_eq!(s.process_id.0, 4321);
                 assert_eq!(s.syscall_address, 0x7FFF_1122_3344);
-                assert_eq!(
-                    s.stack_trace.unwrap().frames(),
-                    &[0x7FFF_AAAA, 0x7FFF_BBBB]
-                );
+                assert_eq!(s.stack_trace.unwrap().frames(), &[0x7FFF_AAAA, 0x7FFF_BBBB]);
             }
             _ => panic!("Expected Event::Syscall"),
         }

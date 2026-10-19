@@ -476,7 +476,9 @@ mod tests {
 
         // Spawn Grandchild (PID 300) under Child 1 (PID 200)
         let grandchild = create_test_process(300, 200, 1_300, "powershell.exe");
-        let grandchild_key = state.on_process_start(grandchild).expect("Grandchild start");
+        let grandchild_key = state
+            .on_process_start(grandchild)
+            .expect("Grandchild start");
 
         // Verify parent has child1 linked
         let mut children_found = Vec::new();
@@ -498,7 +500,10 @@ mod tests {
             ancestors.push(node.process_id());
             true
         });
-        assert_eq!(ancestors, vec![ProcessId(300), ProcessId(200), ProcessId(100)]);
+        assert_eq!(
+            ancestors,
+            vec![ProcessId(300), ProcessId(200), ProcessId(100)]
+        );
 
         // Verify resolve_actor_snapshot orders ancestry as root -> parent -> actor
         let (_node, parent_name, ordered_ancestry) = state
@@ -526,7 +531,9 @@ mod tests {
         // Starting another process on the same PID without an intervening exit event
         // automatically retires proc1 at proc2's creation timestamp (2_000).
         let proc2 = create_test_process(8888, 4, 2_000, "app2.exe");
-        let key2 = state.on_process_start(proc2).expect("Second start succeeds by retiring prior generation");
+        let key2 = state
+            .on_process_start(proc2)
+            .expect("Second start succeeds by retiring prior generation");
 
         let (gen1_alive, gen1_exit) = state
             .read_process(&key1, |p| (p.is_alive(), p.exit_timestamp()))

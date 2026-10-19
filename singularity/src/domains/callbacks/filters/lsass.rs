@@ -144,9 +144,11 @@ pub(crate) fn is_authorized_caller(process: &wrappers::Eprocess) -> bool {
         }
     }
 
-    // Secondary path: Core Windows SYSTEM services (e.g. services.exe, svchost.exe)
-    let integrity = process.integrity_level();
-    integrity.is_system_or_higher()
+    // Secondary path: Core Windows SYSTEM services in Session 0 whose strict runtime
+    // process signature level is also Microsoft-or-higher (excludes unprotected LOLBins like rundll32.exe).
+    process.session_id() == 0
+        && process.process_signature_level().is_microsoft_or_higher()
+        && process.integrity_level().is_system_or_higher()
 }
 
 /// Strips sensitive access rights from the caller's requested access mask in-flight.

@@ -171,7 +171,8 @@ mod tests {
             event.write_payload(buffer.as_mut_ptr());
         }
 
-        let reconstructed = unsafe { core::ptr::read_unaligned(buffer.as_ptr() as *const MockFixedEvent) };
+        let reconstructed =
+            unsafe { core::ptr::read_unaligned(buffer.as_ptr() as *const MockFixedEvent) };
         assert_eq!(event, reconstructed);
     }
 }
