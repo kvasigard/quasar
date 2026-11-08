@@ -11,7 +11,6 @@ use shared::ring_buffer::LsassAccessEvent;
 use crate::alerts::{
     ActorContext, MitigationStatus, OperationContext, OperationType, TargetContext,
 };
-use crate::enrichment::actor::resolve_actor_context;
 use crate::rules::bindings::{RhaiActor, RhaiEvent, RhaiTarget};
 use crate::rules::types::{EventType, ScriptableEvent};
 
@@ -125,7 +124,38 @@ pub fn enrich_lsass_access(event: &LsassAccessEvent) -> EnrichedLsassAccessEvent
         OperationType::ProcessHandleDuplicate
     };
 
-    let mut actor = resolve_actor_context(event.source_pid, cleaned_name);
+    let now_qpc = crate::helpers::time::current_qpc_ticks();
+    let mut actor = if let Some((node, parent_name, ancestry)) =
+        crate::state::system_state().resolve_actor_snapshot(
+            crate::model::types::ProcessId(event.source_pid),
+            now_qpc,
+        )
+    {
+        ActorContext {
+            pid: event.source_pid,
+            name: node.image_file_name().to_string(),
+            image_path: node.image_file_name().to_string(),
+            command_line: node.command_line().to_string(),
+            user_sid: node.user_sid().0.clone(),
+            session_id: node.session_id().0,
+            integrity_level: event.integrity_level,
+            signature_level: event.signature_level,
+            protection: event.protection,
+            parent_pid: node.parent_pid().0,
+            parent_name,
+            ancestry,
+        }
+    } else {
+        ActorContext {
+            pid: event.source_pid,
+            name: cleaned_name.to_string(),
+            image_path: cleaned_name.to_string(),
+            command_line: cleaned_name.to_string(),
+            user_sid: "Unknown".to_string(),
+            ancestry: vec![format!("{cleaned_name} ({})", event.source_pid)],
+            ..Default::default()
+        }
+    };
     let effective_sig_level = if event.signature_level > 0 {
         event.signature_level
     } else {
