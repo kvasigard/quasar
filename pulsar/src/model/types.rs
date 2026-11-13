@@ -16,6 +16,16 @@ impl fmt::Display for ProcessId {
     }
 }
 
+/// Strongly-typed Thread Identifier (TID).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ThreadId(pub u32);
+
+impl fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Strongly-typed Windows Session Identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u32);

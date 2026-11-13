@@ -38,7 +38,7 @@ impl EventListener for ProcessContextSink {
             ProcessEventKind::Start | ProcessEventKind::DCStart => {
                 match ProcessNode::try_from(event) {
                     Ok(node) => {
-                        let pid = node.key.pid;
+                        let pid = node.process_id();
                         if let Err(err) = system_state().on_process_start(node) {
                             log::trace!(
                                 target: "context_sink",

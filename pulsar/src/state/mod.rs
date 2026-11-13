@@ -277,7 +277,7 @@ impl SystemState {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(parent) = tree.get(parent_key) {
-            for child_key in &parent.children {
+            for child_key in parent.children() {
                 if let Some(child) = tree.get(child_key) {
                     f(child);
                 }

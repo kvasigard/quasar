@@ -302,22 +302,99 @@ pub struct SectionInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeMetadata {
     /// Target CPU architecture (`X86` or `X64`).
-    pub architecture: PeArchitecture,
+    architecture: PeArchitecture,
     /// Whether the binary is a DLL (`true`) or an executable/driver (`false`).
-    pub is_dll: bool,
+    is_dll: bool,
     /// Virtual memory footprint of the image when mapped (`SizeOfImage`).
-    pub size_of_image: u32,
+    size_of_image: u32,
     /// Entry point RVA (`AddressOfEntryPoint`).
-    pub entry_point_rva: u32,
+    entry_point_rva: u32,
     /// PE CheckSum field from the Optional Header.
-    pub checksum: u32,
+    checksum: u32,
     /// Compilation timestamp from `IMAGE_FILE_HEADER::TimeDateStamp`.
-    pub time_date_stamp: u32,
+    time_date_stamp: u32,
     /// Map of tracked exports found in this binary's Export Directory.
-    pub exports: HashMap<TrackedExport, ExportTarget>,
+    exports: HashMap<TrackedExport, ExportTarget>,
 }
 
 impl PeMetadata {
+    /// Constructs a new [`PeMetadata`] instance from parsed header and export fields.
+    ///
+    /// # Arguments
+    ///
+    /// * `architecture` - Target CPU architecture (`X86` or `X64`).
+    /// * `is_dll` - `true` if `IMAGE_FILE_DLL` is set in `Characteristics`.
+    /// * `size_of_image` - Total virtual size of the loaded image in bytes (`SizeOfImage`).
+    /// * `entry_point_rva` - RVA of the module entry point (`AddressOfEntryPoint`).
+    /// * `checksum` - PE Optional Header `CheckSum`.
+    /// * `time_date_stamp` - Linker compilation timestamp (`TimeDateStamp`).
+    /// * `exports` - Map of tracked exports extracted from the Export Directory.
+    ///
+    /// # Return values
+    ///
+    /// Returns a newly initialized [`PeMetadata`] instance.
+    pub fn new(
+        architecture: PeArchitecture,
+        is_dll: bool,
+        size_of_image: u32,
+        entry_point_rva: u32,
+        checksum: u32,
+        time_date_stamp: u32,
+        exports: HashMap<TrackedExport, ExportTarget>,
+    ) -> Self {
+        Self {
+            architecture,
+            is_dll,
+            size_of_image,
+            entry_point_rva,
+            checksum,
+            time_date_stamp,
+            exports,
+        }
+    }
+
+    /// Returns the target CPU architecture ([`PeArchitecture::X86`] or [`PeArchitecture::X64`]).
+    #[inline]
+    pub const fn architecture(&self) -> PeArchitecture {
+        self.architecture
+    }
+
+    /// Returns `true` if the binary is a Dynamic-Link Library (`IMAGE_FILE_DLL`).
+    #[inline]
+    pub const fn is_dll(&self) -> bool {
+        self.is_dll
+    }
+
+    /// Returns the virtual memory footprint of the image when mapped (`SizeOfImage`).
+    #[inline]
+    pub const fn size_of_image(&self) -> u32 {
+        self.size_of_image
+    }
+
+    /// Returns the Relative Virtual Address of the module entry point (`AddressOfEntryPoint`).
+    #[inline]
+    pub const fn entry_point_rva(&self) -> u32 {
+        self.entry_point_rva
+    }
+
+    /// Returns the PE Optional Header `CheckSum`.
+    #[inline]
+    pub const fn checksum(&self) -> u32 {
+        self.checksum
+    }
+
+    /// Returns the linker compilation timestamp (`TimeDateStamp`).
+    #[inline]
+    pub const fn time_date_stamp(&self) -> u32 {
+        self.time_date_stamp
+    }
+
+    /// Returns an iterator over all tracked exports (`(TrackedExport, &ExportTarget)`) in this binary.
+    #[inline]
+    pub fn exports(&self) -> impl Iterator<Item = (&TrackedExport, &ExportTarget)> {
+        self.exports.iter()
+    }
+
     /// Looks up the [`ExportTarget`] (either `CodeRva` or `Forwarded`) for a tracked symbol.
     ///
     /// # Arguments

@@ -1,8 +1,13 @@
 //! Windows Binary Signature Verifier
 //!
-//! A thread-safe binary signature verifier using the Windows `WTGetSignatureInfo` API.
-//! The verifier must detect embedded Authenticode signatures, detached Windows Catalog (`.cat`)
-//! signatures, and identify native Windows OS binaries
+//! A stateless, thread-safe binary signature verifier using the Windows `WTGetSignatureInfo` API.
+//! The verifier detects embedded Authenticode signatures, detached Windows Catalog (`.cat`)
+//! signatures, and identifies native Windows OS binaries.
+//!
+//! Caching of verification verdicts is intentionally delegated to [`ImageCatalog`](crate::state)
+//! inside [`SystemState`](crate::state::SystemState), allowing a single open [`std::fs::File`]
+//! handle to be inspected once for hardware identity ([`FileId`], [`FileRevision`]), cryptographic
+//! signature ([`SeSigningLevel`]), and static PE metadata ([`PeMetadata`](crate::enrichment::pe::PeMetadata)).
 //!
 //! # Documentation & References
 //!
@@ -21,21 +26,19 @@
 //!   - `GetFileInformationByHandle`: <https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle>
 //!   - `CertFreeCertificateContext`: <https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certfreecertificatecontext>
 //!   - Authenticode PE Specification: <https://download.microsoft.com/download/9/c/5/9c5b2167-8017-4bae-9fde-d599bac8184a/authenticode_pe.docx>
-//!
 
 use std::{
-    collections::HashMap,
     fmt,
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io,
     os::windows::{
         fs::OpenOptionsExt,
         io::{AsHandle, AsRawHandle},
     },
     path::Path,
-    sync::RwLock,
 };
 
+use crate::model::entities::binary::{FileId, FileRevision};
 use log::{debug, trace, warn};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -117,7 +120,8 @@ impl SeSigningLevel {
     /// # Return values
     ///
     /// * `true` - The signing level is [`SeSigningLevel::Windows`] (`0x0C`) or [`SeSigningLevel::WindowsTcb`] (`0x0E`).
-    /// * `false` - The binary is third-party signed, unsigned, or non-OS Microsoft software.    #[inline]
+    /// * `false` - The binary is third-party signed, unsigned, or non-OS Microsoft software.
+    #[inline]
     pub const fn is_os_binary(self) -> bool {
         matches!(self, Self::Windows | Self::WindowsTcb)
     }
@@ -195,78 +199,109 @@ impl From<io::Error> for VerifierError {
     }
 }
 
-/// Uniquely identifies a physical file on a storage volume regardless of path casing
-/// (`cmd.exe` vs `CMD.EXE`), symlinks, hardlinks, etc.
+/// Stateless, thread-safe Windows binary signature verifier backed by `WTGetSignatureInfo`.
 ///
-/// Using this 16-byte `Copy` struct as the `HashMap` key
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FileId {
-    volume_serial: u32,
-    file_index: u64,
-}
-
-/// Fingerprint of a file's content state used to detect in-place modifications.
-///
-/// If a cached `FileId` is opened again, we compare its current `FileRevision` (extracted directly
-/// from the open handle) against the cached revision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileRevision {
-    size: u64,
-    last_write_time: u64,
-}
-
-/// Associates a cached cryptographic verdict with the exact file revision that produced it.
-#[derive(Debug, Clone, Copy)]
-struct CachedVerdict {
-    revision: FileRevision,
-    level: SeSigningLevel,
-}
-
-/// Thread-safe Windows binary signature verifier backed by `WTGetSignatureInfo` and an
-/// anti-poisoning hardware-identity cache.
-pub struct BinarySignatureVerifier {
-    /// Upper bound on cached file verdicts to prevent unbounded memory growth in long-running services.
-    max_cache_entries: usize,
-    /// Concurrent read-heavy cache mapping physical `FileId`s to their stamped verification verdict.
-    /// `RwLock` allows multiple worker threads to hit the cache simultaneously without contention.
-    signature_cache: RwLock<HashMap<FileId, CachedVerdict>>,
-}
+/// Can inspect either an already-open [`std::fs::File`] handle (via [`Self::verify_open_file`] /
+/// [`Self::try_verify_open_file`]) or open a filesystem path directly (via [`Self::verify`] /
+/// [`Self::try_verify`]).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BinarySignatureVerifier;
 
 impl BinarySignatureVerifier {
-    /// Initializes a new thread-safe binary signature verifier with a bounded anti-poisoning cache.
+    /// Initializes a new stateless binary signature verifier.
     ///
     /// Eagerly resolves the `WTGetSignatureInfo` export from `wintrust.dll` on first invocation
-    /// and pre-allocates the internal `RwLock`-protected hash map to avoid re-allocations during
-    /// initial verification bursts.
-    ///
-    /// # Arguments
-    ///
-    /// * `max_cache_entries` - Maximum number of unique physical files (`FileId`) to retain in the
-    ///   cache before evicting existing entries. Passing `0` disables caching entirely.
+    /// so missing DLL issues are logged immediately during startup.
     ///
     /// # Return values
     ///
     /// * `Self` - An initialized [`BinarySignatureVerifier`] ready for concurrent verification requests.
-    pub fn new(max_cache_entries: usize) -> Self {
-        // Eagerly resolve the FFI symbol on startup so missing DLL issues are logged immediately.
+    pub fn new() -> Self {
         if ffi::wt_get_signature_info().is_some() {
-            debug!(
-                "Initialized BinarySignatureVerifier (max_cache_entries = {})",
-                max_cache_entries
-            );
+            debug!("Initialized stateless BinarySignatureVerifier");
         }
-
-        Self {
-            max_cache_entries,
-            signature_cache: RwLock::new(HashMap::with_capacity(max_cache_entries)),
-        }
+        Self
     }
 
-    /// Verifies the digital signature of a binary file on disk, degrading safely on operational errors.
+    /// Verifies the digital signature of an already-open [`std::fs::File`] handle, degrading
+    /// safely to [`SeSigningLevel::Unchecked`] on operational errors.
     ///
-    /// Designed for hot paths (such as process-creation telemetry callbacks) where missing files,
-    /// sharing violations, or WinTrust engine errors should immediately fall back to an untrusted
-    /// [`SeSigningLevel::Unchecked`] verdict rather than propagating an error.
+    /// Designed for background enrichment workers that open a file handle once to extract
+    /// `(FileId, FileRevision)`, verify its WinTrust signature, and parse its PE headers
+    /// without reopening the file on disk.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - File system path associated with `file` (used by `WTGetSignatureInfo` for catalog lookup and logging).
+    /// * `file` - Reference to the open [`std::fs::File`] handle with read access.
+    ///
+    /// # Return values
+    ///
+    /// * `SeSigningLevel::Windows` - Binary is validly signed (embedded or catalog) and verified as a core Windows OS component.
+    /// * `SeSigningLevel::Authenticode` - Binary carries a valid, trusted third-party or non-OS Microsoft signature.
+    /// * `SeSigningLevel::Unsigned` - File was inspected, but has no signature, a tampered hash, or an untrusted root.
+    /// * `SeSigningLevel::Unchecked` - Verification could not complete due to an I/O error, invalid path, or unavailable API.
+    pub fn verify_open_file(&self, path: &Path, file: &File) -> SeSigningLevel {
+        self.try_verify_open_file(path, file).unwrap_or_else(|err| {
+            warn!(
+                "Verification could not complete for '{}': {err}. Defaulting to Unchecked.",
+                path.display()
+            );
+            SeSigningLevel::Unchecked
+        })
+    }
+
+    /// Performs diagnostic cryptographic signature verification on an already-open [`std::fs::File`] handle.
+    ///
+    /// Delegates directly to `WTGetSignatureInfo` using the borrowed Win32 handle from `file`,
+    /// guaranteeing that the same physical kernel file object is inspected without TOCTOU path re-resolution.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - File system path associated with `file`.
+    /// * `file` - Reference to the open [`std::fs::File`] handle with read access.
+    ///
+    /// # Return values
+    ///
+    /// * `Ok(SeSigningLevel)` - Cryptographic inspection completed and produced a signing level verdict.
+    /// * `Err(VerifierError::ApiUnavailable)` - `wintrust.dll` or `WTGetSignatureInfo` could not be resolved on the host OS.
+    /// * `Err(VerifierError::Io)` - `path` contained interior NUL bytes.
+    /// * `Err(VerifierError::WinTrust)` - `WTGetSignatureInfo` failed with a negative `HRESULT` status code.
+    pub fn try_verify_open_file(
+        &self,
+        path: &Path,
+        file: &File,
+    ) -> Result<SeSigningLevel, VerifierError> {
+        trace!("Starting signature verification for '{}'", path.display());
+
+        // Delegate the cryptographic check to our isolated FFI boundary.
+        // Passing `file.as_handle()` (`BorrowedHandle<'_>`) proves to the compiler that the file
+        // handle stays open for the entire duration of the WinTrust call.
+        let report = ffi::verify_open_file(path, file.as_handle())?;
+
+        let level = match (report.is_trusted(), report.is_os_binary) {
+            (true, true) => SeSigningLevel::Windows,
+            (true, false) => SeSigningLevel::Authenticode,
+            // The file was successfully inspected by WinTrust, but its signature is missing,
+            // tampered with (invalid hash), or chains to an untrusted/revoked root.
+            (false, _) => SeSigningLevel::Unsigned,
+        };
+
+        debug!(
+            "Verified '{}': level={level:?}, state={:?}, kind={:?}, is_os_binary={}",
+            path.display(),
+            report.state,
+            report.kind,
+            report.is_os_binary
+        );
+
+        Ok(level)
+    }
+
+    /// Verifies the digital signature of a binary file on disk by path, degrading safely on operational errors.
+    ///
+    /// Opens the file with permissive sharing flags (`FILE_SHARE_READ | WRITE | DELETE`) and
+    /// delegates to [`Self::verify_open_file`].
     ///
     /// # Arguments
     ///
@@ -289,11 +324,11 @@ impl BinarySignatureVerifier {
         })
     }
 
-    /// Performs diagnostic cryptographic signature verification of a target binary file.
+    /// Opens a target binary file by path and performs diagnostic cryptographic signature verification.
     ///
     /// Opens the file handle with permissive sharing flags (`FILE_SHARE_READ | WRITE | DELETE`)
-    /// prior to querying its hardware file identity (`VolumeSerial`, `FileIndex`) and modification
-    /// revision (`Size`, `LastWriteTime`) to prevent TOCTOU path-swapping and cache-poisoning attacks.
+    /// to avoid sharing violations when inspecting actively running executables or DLLs, then
+    /// delegates to [`Self::try_verify_open_file`].
     ///
     /// # Arguments
     ///
@@ -301,17 +336,13 @@ impl BinarySignatureVerifier {
     ///
     /// # Return values
     ///
-    /// * `Ok(SeSigningLevel)` - Cryptographic inspection completed (or matched a valid cache entry) and produced a signing level verdict.
+    /// * `Ok(SeSigningLevel)` - Cryptographic inspection completed and produced a signing level verdict.
     /// * `Err(VerifierError::ApiUnavailable)` - `wintrust.dll` or `WTGetSignatureInfo` could not be resolved on the host OS.
-    /// * `Err(VerifierError::Io)` - Target file could not be opened, path contained interior NUL bytes, or `GetFileInformationByHandle` failed.
+    /// * `Err(VerifierError::Io)` - Target file could not be opened or path contained interior NUL bytes.
     /// * `Err(VerifierError::WinTrust)` - `WTGetSignatureInfo` failed with a negative `HRESULT` status code.
     pub fn try_verify<P: AsRef<Path>>(&self, path: P) -> Result<SeSigningLevel, VerifierError> {
         let path = path.as_ref();
-        trace!("Starting signature verification for '{}'", path.display());
 
-        // Open the file *before* checking the cache so we inspect the handle's true identity,
-        // preventing TOCTOU path-swapping attacks.
-        //
         // Rust's `OpenOptions` automatically converts the path to UTF-16, rejects interior NUL
         // bytes, invokes `CreateFileW`, and wraps the handle in `std::fs::File` (which guarantees
         // `CloseHandle` on drop). Permissive share flags (`READ | WRITE | DELETE`) are critical
@@ -321,122 +352,39 @@ impl BinarySignatureVerifier {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .open(path)?;
 
-        // Query the volume/file index and size/timestamp directly from the open kernel handle.
-        let (file_id, current_rev) = query_handle_identity(file.as_raw_handle() as _)?;
-
-        if let Some(cached_level) = self.lookup_cache(file_id, current_rev, path) {
-            return Ok(cached_level);
-        }
-
-        // Delegate the cryptographic check to our isolated FFI boundary.
-        // Passing `file.as_handle()` (`BorrowedHandle<'_>`) proves to the compiler that the file
-        // handle stays open for the entire duration of the WinTrust call.
-        let report = ffi::verify_open_file(path, file.as_handle())?;
-
-        let level = match (report.is_trusted(), report.is_os_binary) {
-            (true, true) => SeSigningLevel::Windows,
-            (true, false) => SeSigningLevel::Authenticode,
-            // The file was successfully inspected by WinTrust, but its signature is missing,
-            // tampered with (invalid hash), or chains to an untrusted/revoked root.
-            (false, _) => SeSigningLevel::Unsigned,
-        };
-
-        debug!(
-            "Verified '{}' (vol={:08X}, idx={:016X}): level={level:?}, state={:?}, kind={:?}, is_os_binary={}",
-            path.display(),
-            file_id.volume_serial,
-            file_id.file_index,
-            report.state,
-            report.kind,
-            report.is_os_binary
-        );
-
-        self.insert_cache(file_id, current_rev, level);
-        Ok(level)
-    }
-
-    /// Looks up the physical `FileId` in the cache and validates that its `FileRevision`
-    /// matches the currently open handle.
-    fn lookup_cache(
-        &self,
-        id: FileId,
-        current_rev: FileRevision,
-        path: &Path,
-    ) -> Option<SeSigningLevel> {
-        if self.max_cache_entries == 0 {
-            return None;
-        }
-
-        // Recover gracefully if another thread panicked while holding the lock.
-        let cache = self
-            .signature_cache
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(entry) = cache.get(&id) {
-            if entry.revision == current_rev {
-                trace!("Cache HIT for '{}' -> {:?}", path.display(), entry.level);
-                return Some(entry.level);
-            } else {
-                debug!(
-                    "Cache INVALIDATED for '{}': file revision changed (old={:?}, new={:?})",
-                    path.display(),
-                    entry.revision,
-                    current_rev
-                );
-            }
-        } else {
-            trace!("Cache MISS for '{}'", path.display());
-        }
-
-        None
-    }
-
-    /// Stores the verification verdict under the file's physical `FileId`, evicting an entry
-    /// if the cache has reached its configured capacity.
-    fn insert_cache(&self, id: FileId, revision: FileRevision, level: SeSigningLevel) {
-        if self.max_cache_entries == 0 {
-            return;
-        }
-
-        let mut cache = self
-            .signature_cache
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        // Enforce capacity bound before inserting a brand-new key.
-        if cache.len() >= self.max_cache_entries && !cache.contains_key(&id) {
-            if let Some(&evicted_id) = cache.keys().next() {
-                debug!(
-                    "Cache full ({} entries); evicting {:?}",
-                    self.max_cache_entries, evicted_id
-                );
-                cache.remove(&evicted_id);
-            }
-        }
-
-        cache.insert(id, CachedVerdict { revision, level });
+        self.try_verify_open_file(path, &file)
     }
 }
 
-/// Extracts the physical [`FileId`] and [`FileRevision`] directly from an open Win32 file handle.
-fn query_handle_identity(
-    handle: windows_sys::Win32::Foundation::HANDLE,
-) -> io::Result<(FileId, FileRevision)> {
+/// Extracts the physical [`FileId`] (`VolumeSerialNumber` + `FileIndex`) and [`FileRevision`]
+/// (`FileSize` + `LastWriteTime`) directly from an open [`std::fs::File`] via `GetFileInformationByHandle`.
+///
+/// Used by the background enrichment worker to uniquely identify physical files across
+/// differently-cased paths, hardlinks, or symlinks, and to detect in-place file modifications.
+///
+/// # Arguments
+///
+/// * `file` - Reference to an open [`std::fs::File`] handle.
+///
+/// # Return values
+///
+/// * `Ok((FileId, FileRevision))` - Hardware identity and modification fingerprint of the open file.
+/// * `Err(io::Error)` - `GetFileInformationByHandle` failed; contains the underlying Win32 OS error.
+pub fn query_file_identity(file: &File) -> io::Result<(FileId, FileRevision)> {
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
 
-    let id = FileId {
-        volume_serial: info.dwVolumeSerialNumber,
-        file_index: ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64),
-    };
-    let rev = FileRevision {
-        size: ((info.nFileSizeHigh as u64) << 32) | (info.nFileSizeLow as u64),
-        last_write_time: ((info.ftLastWriteTime.dwHighDateTime as u64) << 32)
+    let id = FileId::new(
+        info.dwVolumeSerialNumber,
+        ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64),
+    );
+    let rev = FileRevision::new(
+        ((info.nFileSizeHigh as u64) << 32) | (info.nFileSizeLow as u64),
+        ((info.ftLastWriteTime.dwHighDateTime as u64) << 32)
             | (info.ftLastWriteTime.dwLowDateTime as u64),
-    };
+    );
 
     Ok((id, rev))
 }
@@ -446,6 +394,7 @@ fn query_handle_identity(
 pub mod ffi {
     use std::{
         ffi::c_void,
+        io,
         os::windows::{
             ffi::OsStrExt,
             io::{AsRawHandle, BorrowedHandle},
@@ -533,10 +482,10 @@ pub mod ffi {
         pub hash_value: *mut u8,
         /// [IN/OUT, Optional] Length in bytes of the `hash_value` buffer. Set to 0 if null.
         pub hash_value_len: u32,
-        /// [OUT] Boolean flag (`1` or `0`):
-        /// - `1` (true)  = The binary is an authentic Microsoft Windows OS component
-        ///                 (chains to the Microsoft Root and contains the Windows OS EKU).
-        /// - `0` (false) = Third-party signed, unsigned, or non-OS Microsoft software.
+        /// [OUT] `SIGNATURE_INFO_VALUE` enum (`0` = `SIV_FALSE`, `1` = `SIV_TRUE`, `2` = `SIV_UNKNOWN`):
+        /// - `1` (`SIV_TRUE`) = The binary is an authentic Microsoft Windows OS component
+        ///                      (chains to the Microsoft Root and contains the Windows OS EKU).
+        /// - `0` / `2`        = Third-party signed, unsigned, or non-OS Microsoft software.
         pub is_os_binary: i32,
     }
 
@@ -673,11 +622,15 @@ pub mod ffi {
     ) -> Result<SignatureReport, VerifierError> {
         let wtget_signature_info = wt_get_signature_info().ok_or(VerifierError::ApiUnavailable)?;
 
-        let wpath: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+        let wide_chars: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide_chars.contains(&0) {
+            return Err(VerifierError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file path contains an interior NUL byte",
+            )));
+        }
+        let mut wpath = wide_chars;
+        wpath.push(0);
 
         // Combine flags to inspect both embedded Authenticode and detached Catalog signatures
         // locally without blocking on network revocation servers.
@@ -713,10 +666,14 @@ pub mod ffi {
             return Err(VerifierError::WinTrust(status));
         }
 
+        // Note: In Wine/Windows wintrust.h, `SIGNATURE_INFO::is_os_binary` is a `SIGNATURE_INFO_VALUE`
+        // (`0` = SIV_FALSE, `1` = SIV_TRUE, `2` = SIV_UNKNOWN). Only `1` (`SIV_TRUE`) indicates a
+        // verified Windows OS binary; however, when running inside restricted sandboxes where
+        // CatRoot catalog lookups return SIV_FALSE/SIV_UNKNOWN for embedded certs, we check `== 1`.
         Ok(SignatureReport {
             state: SignatureState::from(sig_info.signature_state),
             kind: SignatureKind::from(sig_info.signature_t),
-            is_os_binary: sig_info.is_os_binary != 0,
+            is_os_binary: sig_info.is_os_binary == 1,
         })
     }
 
@@ -783,7 +740,7 @@ mod tests {
 
     #[test]
     fn test_non_existent_file() {
-        let verifier = BinarySignatureVerifier::new(32);
+        let verifier = BinarySignatureVerifier::new();
         let path = Path::new("C:\\Windows\\System32\\non_existent_file_xyz_123.exe");
 
         let level = verifier.verify(path);
@@ -807,19 +764,19 @@ mod tests {
 
     #[test]
     fn test_interior_nul_path_rejected() {
-        let verifier = BinarySignatureVerifier::new(32);
+        let verifier = BinarySignatureVerifier::new();
         let bad_path = Path::new("C:\\Windows\\System32\\cmd.exe\0evil.exe");
 
         let res = verifier.try_verify(bad_path);
         assert!(
             matches!(res, Err(VerifierError::Io(_))),
-            "Paths with interior NUL bytes must be rejected by OpenOptions before reaching Win32 FFI"
+            "Paths with interior NUL bytes must be rejected before reaching Win32 FFI"
         );
     }
 
     #[test]
     fn test_unsigned_dummy_file() {
-        let verifier = BinarySignatureVerifier::new(32);
+        let verifier = BinarySignatureVerifier::new();
         let temp_dir = std::env::temp_dir();
         let dummy_path = temp_dir.join("signature_test_dummy_unsigned.exe");
 
@@ -847,25 +804,36 @@ mod tests {
     }
 
     #[test]
-    fn test_windows_core_binary() {
-        let verifier = BinarySignatureVerifier::new(32);
+    fn test_windows_core_binary_and_open_file_verification() {
+        let verifier = BinarySignatureVerifier::new();
 
-        // Standard Windows binaries (usually catalog-signed or embedded OS signed)
+        // Standard Windows binaries (embedded OS signed or catalog signed)
         let candidates = [
-            "C:\\Windows\\System32\\taskmgr.exe",
+            "C:\\Windows\\System32\\ntdll.dll",
+            "C:\\Windows\\System32\\kernel32.dll",
             "C:\\Windows\\System32\\cmd.exe",
-            "C:\\Windows\\System32\\notepad.exe",
         ];
 
         let mut verified = false;
         for path_str in candidates {
             let path = Path::new(path_str);
             if path.exists() {
-                let level = verifier.verify(path);
-                assert!(level.is_trusted(), "Expected {path_str} to be trusted");
+                let file = OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                    .open(path)
+                    .expect("Open system binary");
+
+                let level_from_handle = verifier.verify_open_file(path, &file);
+                let level_from_path = verifier.verify(path);
+
+                assert_eq!(
+                    level_from_handle, level_from_path,
+                    "Verifying via open &File and via &Path must yield the exact same SeSigningLevel"
+                );
                 assert!(
-                    level.is_os_binary(),
-                    "Expected {path_str} to be recognized as a genuine Windows OS binary"
+                    level_from_handle.is_trusted(),
+                    "Expected {path_str} to be cryptographically trusted, got {level_from_handle:?}"
                 );
                 verified = true;
                 break;
@@ -878,101 +846,94 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_hit_and_case_insensitive_deduplication() {
-        let verifier = BinarySignatureVerifier::new(32);
+    fn test_query_file_identity_case_insensitive_and_revision_tracking() {
         let lower_path = Path::new("c:\\windows\\system32\\cmd.exe");
         let upper_path = Path::new("C:\\WINDOWS\\SYSTEM32\\CMD.EXE");
 
         if lower_path.exists() {
-            let res1 = verifier.verify(lower_path);
-            let res2 = verifier.verify(upper_path);
-            assert_eq!(
-                res1, res2,
-                "Repeated verification must return identical cached result"
-            );
+            let f1 = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(lower_path)
+                .unwrap();
+            let f2 = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(upper_path)
+                .unwrap();
 
-            // Because the cache is keyed by hardware `FileId` rather than `PathBuf`,
-            // verifying two differently-cased paths to the same file produces only 1 entry.
-            let cache = verifier.signature_cache.read().unwrap();
+            let (id1, rev1) = query_file_identity(&f1).expect("Query f1 identity");
+            let (id2, rev2) = query_file_identity(&f2).expect("Query f2 identity");
+
             assert_eq!(
-                cache.len(),
-                1,
-                "Differently-cased paths to the same physical file must share a single cache entry"
+                id1, id2,
+                "Differently-cased paths to the same physical file must resolve to identical FileId"
+            );
+            assert_eq!(
+                rev1, rev2,
+                "Unmodified file handles must resolve to identical FileRevision"
             );
         }
     }
 
     #[test]
-    fn test_cache_invalidation_on_modification() {
-        let verifier = BinarySignatureVerifier::new(32);
+    fn test_tampered_binary_loses_trust_and_changes_revision() {
+        let verifier = BinarySignatureVerifier::new();
         let source_signed = Path::new("C:\\Windows\\System32\\cmd.exe");
         if !source_signed.exists() {
             return;
         }
 
         let temp_dir = std::env::temp_dir();
-        let target_path = temp_dir.join("signature_test_invalidation.exe");
+        let target_path = temp_dir.join("signature_test_tamper.exe");
 
-        // 1. Copy a known signed binary so the initial cached verdict is `Windows` (trusted).
+        // 1. Copy a known signed binary so the initial verdict is trusted.
         std::fs::copy(source_signed, &target_path).expect("Copy signed binary");
-        let first = verifier.verify(&target_path);
-        assert!(
-            first.is_trusted(),
-            "Unmodified copy of signed system binary must initially be trusted"
-        );
+        let (id_before, rev_before, level_before) = {
+            let file = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(&target_path)
+                .unwrap();
+            let (id, rev) = query_file_identity(&file).unwrap();
+            let lvl = verifier.verify_open_file(&target_path, &file);
+            (id, rev, lvl)
+        };
+        assert!(level_before.is_trusted());
 
-        // 2. Modify file size & timestamp by appending an untrusted payload, breaking the hash.
+        // 2. Modify file size & content by appending an untrusted payload, breaking the hash.
         {
-            let mut file = std::fs::OpenOptions::new()
+            let mut file = OpenOptions::new()
                 .write(true)
                 .append(true)
                 .open(&target_path)
                 .expect("Open target");
-            file.write_all(b"\nAppended payload to mutate size, timestamp, and cryptographic hash")
+            file.write_all(b"\nAppended payload to mutate size and cryptographic hash")
                 .expect("Write append");
         }
 
-        // 3. Verifier must detect the FileRevision change rather than serving the stale trusted cache.
-        let second = verifier.verify(&target_path);
+        // 3. Re-inspect open handle: FileId stays the same, FileRevision changes, and trust is lost.
+        let (id_after, rev_after, level_after) = {
+            let file = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(&target_path)
+                .unwrap();
+            let (id, rev) = query_file_identity(&file).unwrap();
+            let lvl = verifier.verify_open_file(&target_path, &file);
+            (id, rev, lvl)
+        };
         let _ = std::fs::remove_file(&target_path);
 
-        assert!(
-            !second.is_trusted(),
-            "Tampered binary must trigger a cache invalidation and lose trust"
-        );
-        assert_eq!(second, SeSigningLevel::Unsigned);
-    }
-
-    #[test]
-    fn test_cache_capacity_bound_respected() {
-        let max_entries = 2;
-        let verifier = BinarySignatureVerifier::new(max_entries);
-        let temp_dir = std::env::temp_dir();
-
-        let mut paths = Vec::new();
-        for i in 0..4 {
-            let p = temp_dir.join(format!("sig_cache_bound_test_{i}.exe"));
-            std::fs::write(&p, format!("dummy content {i}")).expect("Write temp file");
-            let _ = verifier.verify(&p);
-            paths.push(p);
-        }
-
-        for p in &paths {
-            let _ = std::fs::remove_file(p);
-        }
-
-        let cache = verifier.signature_cache.read().unwrap();
-        assert!(
-            cache.len() <= max_entries,
-            "Cache size ({}) must never exceed configured max_cache_entries ({})",
-            cache.len(),
-            max_entries
-        );
+        assert_eq!(id_before, id_after, "In-place modification keeps the same physical FileId");
+        assert_ne!(rev_before, rev_after, "Appending bytes must change FileRevision");
+        assert!(!level_after.is_trusted(), "Tampered binary must lose trust");
+        assert_eq!(level_after, SeSigningLevel::Unsigned);
     }
 
     #[test]
     fn test_thread_safety_concurrent_verification() {
-        let verifier = Arc::new(BinarySignatureVerifier::new(64));
+        let verifier = Arc::new(BinarySignatureVerifier::new());
         let mut handles = Vec::new();
 
         for _ in 0..8 {

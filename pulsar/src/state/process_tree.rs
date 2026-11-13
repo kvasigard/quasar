@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::model::types::{ExitStatus, ProcessId};
-use crate::model::{ParentProcess, ProcessKey, ProcessNode};
+use crate::model::{ProcessKey, ProcessNode};
 
 /// Maximum number of terminated process generations retained per OS PID.
 const MAX_HISTORY_PER_PID: usize = 16;
@@ -142,7 +142,8 @@ impl ProcessTree {
     ///
     /// Automatically attempts to resolve the parent [`ProcessKey`] at `process.creation_timestamp`.
     /// If resolved, establishes bidirectional parent-child links. If the parent was created before
-    /// monitoring started, `parent` remains [`ParentProcess::Unresolved`] preserving `parent_pid`.
+    /// monitoring started, `parent` remains [`ParentProcess::Unresolved`](crate::model::ParentProcess::Unresolved)
+    /// preserving `parent_pid`.
     ///
     /// # Arguments
     ///
@@ -162,9 +163,7 @@ impl ProcessTree {
         {
             let timeline = self.processes.entry(pid).or_default();
             if let Some(mut prev_active) = timeline.active.take() {
-                prev_active.exit_timestamp = Some(creation_ts);
-                prev_active.is_alive = false;
-                prev_active.exit_status = Some(ExitStatus::Success);
+                prev_active.mark_exited(creation_ts, ExitStatus::Success);
                 if timeline.history.len() >= MAX_HISTORY_PER_PID {
                     timeline.history.remove(0);
                 }
@@ -180,13 +179,11 @@ impl ProcessTree {
                 .resolve_key(parent_pid, creation_ts)
                 .or_else(|| self.get_active(parent_pid).map(|p| p.key()))
         {
-            process.parent = ParentProcess::Resolved(parent_key);
+            process.resolve_parent(parent_key);
 
             // Link child into parent's children collection for O(1) subtree traversal
-            if let Some(parent_node) = self.get_mut(&parent_key)
-                && !parent_node.children.contains(&child_key)
-            {
-                parent_node.children.push(child_key);
+            if let Some(parent_node) = self.get_mut(&parent_key) {
+                parent_node.add_child(child_key);
             }
         }
 
@@ -239,9 +236,7 @@ impl ProcessTree {
                 timestamp: exit_timestamp,
             })?;
 
-        active.exit_timestamp = Some(exit_timestamp);
-        active.is_alive = false;
-        active.exit_status = Some(exit_status);
+        active.mark_exited(exit_timestamp, exit_status);
 
         let key = active.key();
         if timeline.history.len() >= MAX_HISTORY_PER_PID {
