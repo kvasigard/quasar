@@ -1,13 +1,23 @@
-//! Domain entities representing long-lived process state (`_EPROCESS`).
+//! Domain entities representing long-lived OS process state (`_EPROCESS`).
 //!
-//! In the Windows Kernel, an Executive Process (`_EPROCESS`) object combines:
-//! - **Creation-time identity**: `UniqueProcessId`, `CreateTime`, `Session`, `Token` (`Sid`),
-//!   and the backing image section (`SectionObject` -> [`Arc<BinaryImage>`]).
-//! - **Runtime state**: Parent/child links (`InheritedFromUniqueProcessId`, `ActiveProcessLinks`),
-//!   the Virtual Address Space tree (`VadRoot` -> [`ProcessAddressSpace`]), the active thread
-//!   list (`ThreadListHead` -> `HashMap<ThreadId, ThreadNode>`), and termination status
+//! # Architectural Role & Data Flow
+//!
+//! In the Windows Kernel, an Executive Process (`_EPROCESS`) object combines static creation
+//! identity with dynamic runtime state:
+//! - **Creation-time identity**: `UniqueProcessId` ([`ProcessId`]), `CreateTime` (paired into
+//!   [`ProcessKey`] to defeat PID recycling), `SessionId` ([`SessionId`]), primary token [`Sid`],
+//!   and the backing executable section (`SectionObject` -> [`Arc<BinaryImage>`]).
+//! - **Runtime state**: Parent/child lineage links (`InheritedFromUniqueProcessId` -> [`ParentProcess`],
+//!   `ActiveProcessLinks` -> `children`), the per-process Virtual Address Space tree
+//!   (`VadRoot` -> [`ProcessAddressSpace`]), the active thread table
+//!   (`ThreadListHead` -> `HashMap<ThreadId, ThreadNode>`), and termination metadata
 //!   (`ExitTime`, `ExitStatus`).
 //!
+//! Within Quasar's pipeline, raw kernel process telemetry is decoded into a [`ProcessEvent`],
+//! converted into a [`ProcessNode`] via [`TryFrom`], and indexed inside `ProcessTree`. As
+//! subsequent `ImageLoad`, `ThreadStart`, and memory events arrive, listeners mutate the owning
+//! [`ProcessNode`] to correlate multi-stage process injection techniques (such as
+//! `CreateRemoteThread` into `LoadLibrary*` or unbacked `W -> X` shellcode regions).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,32 +30,44 @@ use crate::model::security::Sid;
 use crate::model::types::{ExitStatus, ProcessId, SessionId, ThreadId, UniqueProcessKey};
 
 /// Maximum number of local (`!is_remote`) threads retained per process when `ThreadExit`
-/// telemetry is not active. Remote threads (`is_remote == true`) are exempt from eviction.
+/// telemetry is not active or threads churn rapidly.
+///
+/// Remote threads (`is_remote == true`) are exempt from capacity-based eviction so high-signal
+/// cross-process injection attribution is never lost due to benign worker-thread churn.
 pub const MAX_LOCAL_THREADS_PER_PROCESS: usize = 256;
 
-/// Unique composite key identifying a process instance (`PID` + `Creation Time`).
+/// Unique composite key identifying a specific process instance (`PID` + `Creation Time`).
 ///
-/// Because Windows aggressively recycles Process IDs after a process exits, pairing `pid` with
-/// the kernel `creation_timestamp` uniquely identifies a single `_EPROCESS` generation.
+/// # Architectural Role & Invariants
+///
+/// Windows aggressively reuses 32-bit Process IDs (`UniqueProcessId`) as soon as a process exits
+/// and all handles to its `_EPROCESS` object are closed. Indexing state by [`ProcessId`] alone
+/// would cause new processes to collide with historical telemetry from exited processes.
+/// Pairing `pid` with the high-resolution `creation_timestamp` (`CreateTime` / QPC ticks) uniquely
+/// identifies a single `_EPROCESS` generation across the entire lifetime of a host session.
+///
+/// # Thread Safety
+///
+/// `ProcessKey` is a plain `Copy` value type (`Send + Sync`) safe to pass across pipeline stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcessKey {
-    /// OS process identifier (`UniqueProcessId`).
+    /// Operating system process identifier (`UniqueProcessId`).
     pub pid: ProcessId,
-    /// High-resolution creation timestamp (`CreateTime` / QPC).
+    /// High-resolution creation timestamp (`CreateTime` or QPC ticks at process creation).
     pub creation_timestamp: i64,
 }
 
 impl ProcessKey {
-    /// Creates a new [`ProcessKey`] from a process identifier and creation timestamp.
+    /// Creates a new composite [`ProcessKey`] from an OS process identifier and creation timestamp.
     ///
     /// # Arguments
     ///
-    /// * `pid` - The OS process identifier.
-    /// * `creation_timestamp` - The timestamp when the process was created.
+    /// * `pid` - The OS process identifier (`UniqueProcessId`).
+    /// * `creation_timestamp` - The high-resolution timestamp recorded when the process was created.
     ///
-    /// # Return values
+    /// # Returns
     ///
-    /// Returns a new [`ProcessKey`] instance.
+    /// A new [`ProcessKey`] uniquely identifying that process generation.
     #[inline]
     pub const fn new(pid: ProcessId, creation_timestamp: i64) -> Self {
         Self {
@@ -55,17 +77,36 @@ impl ProcessKey {
     }
 }
 
-/// Represents the parent of a process, which may either be resolved in the tree or unresolved.
+/// Lineage reference to a process's parent, which may be resolved in `ProcessTree`
+/// or remain an unresolved OS PID.
+///
+/// # Variant Semantics
+///
+/// When a [`ProcessNode`] is first instantiated from a [`ProcessEvent`], only the raw parent PID
+/// (`InheritedFromUniqueProcessId`) is known from the ETW payload, so every node starts with
+/// [`ParentProcess::Unresolved`]. When inserted into `ProcessTree`, the tree attempts to correlate
+/// that parent PID against the active generation at the child's creation timestamp and upgrades
+/// the link to [`ParentProcess::Resolved`] via [`ProcessNode::resolve_parent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParentProcess {
-    /// Fully resolved parent process in `ProcessTree`.
+    /// Fully correlated parent process generation in `ProcessTree`.
+    ///
+    /// Produced when the parent process was alive (or present in historical timeline) at the
+    /// child's creation timestamp, enabling exact `O(1)` ancestor walks immune to PID reuse.
     Resolved(ProcessKey),
-    /// Parent PID reported by the OS when the parent started before monitoring began or exited prior to resolution.
+    /// Unresolved parent [`ProcessId`] reported by the OS.
+    ///
+    /// Retained when the parent process both started and exited before Pulsar began monitoring,
+    /// or when kernel PID 0 / System parent links have no corresponding tracked generation.
     Unresolved(ProcessId),
 }
 
 impl ParentProcess {
-    /// Returns the OS [`ProcessId`] of the parent.
+    /// Returns the OS [`ProcessId`] of the parent regardless of whether its generation key is resolved.
+    ///
+    /// # Returns
+    ///
+    /// The parent's [`ProcessId`].
     #[inline]
     pub const fn pid(&self) -> ProcessId {
         match *self {
@@ -74,7 +115,11 @@ impl ParentProcess {
         }
     }
 
-    /// Returns the resolved composite [`ProcessKey`] if available.
+    /// Returns the resolved composite [`ProcessKey`] of the parent if lineage correlation succeeded.
+    ///
+    /// # Returns
+    ///
+    /// `Some(ProcessKey)` when [`ParentProcess::Resolved`], or `None` when [`ParentProcess::Unresolved`].
     #[inline]
     pub const fn key(&self) -> Option<ProcessKey> {
         match *self {
@@ -83,45 +128,75 @@ impl ParentProcess {
         }
     }
 
-    /// Returns `true` if the parent was resolved to a tracked node in `ProcessTree`.
+    /// Returns `true` if the parent was resolved to a tracked generation in `ProcessTree`.
+    ///
+    /// # Returns
+    ///
+    /// `true` if [`ParentProcess::Resolved`], `false` if [`ParentProcess::Unresolved`].
     #[inline]
     pub const fn is_resolved(&self) -> bool {
         matches!(self, Self::Resolved(_))
     }
 }
 
-/// Long-lived state representation of a running or terminated process (`_EPROCESS`).
+/// Long-lived state representation of a running or terminated OS process (`_EPROCESS`).
 ///
-/// Fields are private to enforce lifecycle, hierarchy, and thread-table invariants.
+/// # Architectural Role
+///
+/// `ProcessNode` is the central aggregate root for per-process telemetry in Quasar. Stored inside
+/// `ProcessTree`, it links:
+/// 1. **Process Identity & Lineage**: PID, creation timestamp, parent/child graph links, session, and [`Sid`].
+/// 2. **Backing Executable**: Shared reference to the deduplicated [`BinaryImage`] in `ImageCatalog`.
+/// 3. **Virtual Address Space ([`ProcessAddressSpace`])**: Mapped PE modules (`ImageLoad`) and
+///    virtual memory allocations/protections (`VadRegion`).
+/// 4. **Thread Table (`HashMap<ThreadId, ThreadNode>`)**: Active threads, distinguishing normal
+///    local threads (including the parent-created initial main thread) from cross-process remote
+///    threads (`CreateRemoteThread` / `NtCreateThreadEx`).
+///
+/// # State Invariants
+///
+/// - **Encapsulation**: All fields are private; state transitions occur exclusively through
+///   validated mutators (`resolve_parent`, `add_child`, `mark_exited`, `register_thread`).
+/// - **Monotonic `initial_thread_seen` Latch**: Starts `false` for newly spawned processes
+///   (`ProcessEventKind::Start`) and `true` for pre-existing rundown processes
+///   (`ProcessEventKind::DCStart`). Latches to `true` on the first observed thread creation.
+/// - **Remote Thread Retention**: Capacity eviction (`MAX_LOCAL_THREADS_PER_PROCESS`) only evicts
+///   local threads (`!t.is_remote()`). Remote threads (`t.is_remote()`) are never evicted by
+///   capacity limits so injection correlation state cannot be flushed by local thread churn.
+///
+/// # Thread Safety
+///
+/// `ProcessNode` implements `Send + Sync` (all owned fields and [`Arc<BinaryImage>`] are
+/// thread-safe), allowing safe access across synchronized `ProcessTree` locks.
 #[derive(Debug, Clone)]
 pub struct ProcessNode {
-    /// Composite identity (`pid` + `creation_timestamp`).
+    /// Composite identity (`pid` + `creation_timestamp`) uniquely identifying this generation.
     key: ProcessKey,
     /// Parent process reference (starts `Unresolved(parent_pid)`, upgraded via [`Self::resolve_parent`]).
     parent: ParentProcess,
-    /// Kernel pointer address of the `_EPROCESS` block.
+    /// Kernel pointer address of the `_EPROCESS` block (`UniqueProcessKey`).
     unique_process_key: UniqueProcessKey,
-    /// Windows Session ID (`SessionId`).
+    /// Windows terminal services Session ID (`SessionId`).
     session_id: SessionId,
     /// Security Identifier (`Sid`) of the primary process token.
     user_sid: Sid,
     /// Backing image path or filename reported at process creation.
     image_file_name: String,
-    /// Command line invocation string.
+    /// Full command-line invocation string passed to the process.
     command_line: String,
-    /// Optional shared reference to the backing executable [`BinaryImage`] in `ImageCatalog`.
+    /// Shared reference to the backing executable [`BinaryImage`] in `ImageCatalog`.
     executable_image: Option<Arc<BinaryImage>>,
-    /// Direct child processes spawned by this process (`O(1)` subtree traversal).
+    /// Direct child process generations spawned by this process (`O(1)` downward subtree traversal).
     children: Vec<ProcessKey>,
-    /// Whether the process is currently active (`true`) or terminated (`false`).
+    /// Whether the process is currently active (`true`) or has terminated (`false`).
     is_alive: bool,
-    /// QPC timestamp when the process exited, if terminated.
+    /// High-resolution QPC timestamp when the process exited, if terminated.
     exit_timestamp: Option<i64>,
-    /// OS termination status code, if terminated.
+    /// OS termination status code (`ExitStatus`), if terminated.
     exit_status: Option<ExitStatus>,
-    /// Latched to `true` once the process's initial main thread (`ThreadStart` / `DCStart`)
-    /// has been observed, allowing subsequent cross-process thread creations to be classified
-    /// accurately as remote threads.
+    /// Monotonic latch set to `true` once the process's initial main thread (`ThreadStart` or
+    /// `DCStart` rundown) has been observed, allowing subsequent cross-process thread creations
+    /// from the parent PID to be accurately classified as remote threads.
     initial_thread_seen: bool,
     /// Per-process Virtual Address Space (`_EPROCESS.VadRoot`) tracking mapped DLLs and VAD regions.
     address_space: ProcessAddressSpace,
@@ -130,23 +205,24 @@ pub struct ProcessNode {
 }
 
 impl ProcessNode {
-    /// Creates a new active [`ProcessNode`] from initial telemetry data.
+    /// Creates a new active [`ProcessNode`] from initial process creation telemetry.
     ///
     /// # Arguments
     ///
-    /// * `process_id` - The OS process ID.
-    /// * `creation_timestamp` - Timestamp when the process was spawned.
-    /// * `parent_pid` - Parent process ID reported by the OS.
-    /// * `unique_process_key` - Kernel address or unique key for the `_EPROCESS` block.
-    /// * `session_id` - Windows session ID.
-    /// * `user_sid` - Security identifier of the user account running the process.
-    /// * `image_file_name` - Binary or image file path of the process.
-    /// * `command_line` - Command line invocation arguments.
+    /// * `process_id` - The OS process ID (`UniqueProcessId`).
+    /// * `creation_timestamp` - High-resolution timestamp when the process was spawned.
+    /// * `parent_pid` - Parent process ID (`InheritedFromUniqueProcessId`) reported by the OS.
+    /// * `unique_process_key` - Kernel address or unique key for the `_EPROCESS` structure.
+    /// * `session_id` - Windows session ID under which the process runs.
+    /// * `user_sid` - Security identifier ([`Sid`]) of the user account owning the process token.
+    /// * `image_file_name` - Binary path or image file name of the process executable.
+    /// * `command_line` - Command-line invocation arguments.
     ///
-    /// # Return values
+    /// # Returns
     ///
-    /// Returns a new [`ProcessNode`] initialized in the active (`is_alive = true`) state with an
-    /// empty [`ProcessAddressSpace`] and thread table.
+    /// A new [`ProcessNode`] initialized in the active (`is_alive = true`) state with
+    /// `ParentProcess::Unresolved(parent_pid)`, `initial_thread_seen = false`, an empty
+    /// [`ProcessAddressSpace`], and an empty thread table.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         process_id: ProcessId,
@@ -181,19 +257,19 @@ impl ProcessNode {
     // Identity & Lineage Accessors
     // ========================================================================
 
-    /// Returns the composite [`ProcessKey`] (`pid` + `creation_timestamp`).
+    /// Returns the composite [`ProcessKey`] (`pid` + `creation_timestamp`) for this process generation.
     #[inline]
     pub const fn key(&self) -> ProcessKey {
         self.key
     }
 
-    /// Returns the OS [`ProcessId`].
+    /// Returns the OS [`ProcessId`] (`UniqueProcessId`).
     #[inline]
     pub const fn process_id(&self) -> ProcessId {
         self.key.pid
     }
 
-    /// Returns the process creation timestamp.
+    /// Returns the high-resolution process creation timestamp.
     #[inline]
     pub const fn creation_timestamp(&self) -> i64 {
         self.key.creation_timestamp
@@ -229,7 +305,7 @@ impl ProcessNode {
         self.session_id
     }
 
-    /// Returns a reference to the process owner's user [`Sid`].
+    /// Returns a reference to the process owner's primary token [`Sid`].
     #[inline]
     pub fn user_sid(&self) -> &Sid {
         &self.user_sid
@@ -247,7 +323,7 @@ impl ProcessNode {
         &self.command_line
     }
 
-    /// Returns a slice of composite keys for direct children spawned by this process.
+    /// Returns a slice of composite keys for direct child processes spawned by this process.
     #[inline]
     pub fn children(&self) -> &[ProcessKey] {
         &self.children
@@ -259,13 +335,13 @@ impl ProcessNode {
         self.is_alive
     }
 
-    /// Returns the exit timestamp if the process has terminated.
+    /// Returns the exit timestamp if the process has terminated, or `None` if still alive.
     #[inline]
     pub const fn exit_timestamp(&self) -> Option<i64> {
         self.exit_timestamp
     }
 
-    /// Returns the process [`ExitStatus`] if terminated.
+    /// Returns the OS [`ExitStatus`] if the process has terminated, or `None` if still alive.
     #[inline]
     pub const fn exit_status(&self) -> Option<ExitStatus> {
         self.exit_status
@@ -275,21 +351,34 @@ impl ProcessNode {
     // Controlled Lifecycle & Metadata Mutators
     // ========================================================================
 
-    /// Upgrades the parent reference to [`ParentProcess::Resolved(parent_key)`].
+    /// Upgrades the parent reference from [`ParentProcess::Unresolved`] to [`ParentProcess::Resolved`].
+    ///
+    /// # Arguments
+    ///
+    /// * `parent_key` - The correlated [`ProcessKey`] of the parent generation in `ProcessTree`.
     #[inline]
     pub fn resolve_parent(&mut self, parent_key: ProcessKey) {
         self.parent = ParentProcess::Resolved(parent_key);
     }
 
     /// Registers `child_key` as a direct child of this process if not already present.
+    ///
+    /// # Arguments
+    ///
+    /// * `child_key` - The [`ProcessKey`] of the newly spawned child process.
     pub fn add_child(&mut self, child_key: ProcessKey) {
         if !self.children.contains(&child_key) {
             self.children.push(child_key);
         }
     }
 
-    /// Transitions this process into the terminated state (`is_alive = false`) with the given
-    /// `exit_timestamp` and `exit_status`.
+    /// Transitions this process into the terminated state (`is_alive = false`) and records its
+    /// exit metadata.
+    ///
+    /// # Arguments
+    ///
+    /// * `exit_timestamp` - High-resolution timestamp when the `ProcessStop` event occurred.
+    /// * `exit_status` - OS termination code reported by the kernel.
     #[inline]
     pub fn mark_exited(&mut self, exit_timestamp: i64, exit_status: ExitStatus) {
         self.is_alive = false;
@@ -297,48 +386,79 @@ impl ProcessNode {
         self.exit_status = Some(exit_status);
     }
 
-    /// Updates the command line string for this process.
+    /// Updates the command-line string for this process (e.g., when enriched asynchronously).
+    ///
+    /// # Arguments
+    ///
+    /// * `command_line` - New command-line string.
     pub fn set_command_line(&mut self, command_line: impl Into<String>) {
         self.command_line = command_line.into();
     }
 
-    /// Updates the image file name for this process.
+    /// Updates the image file name or full path for this process.
+    ///
+    /// # Arguments
+    ///
+    /// * `image_file_name` - New image file name or normalized path.
     pub fn set_image_file_name(&mut self, image_file_name: impl Into<String>) {
         self.image_file_name = image_file_name.into();
     }
 
     // ========================================================================
-    // Milestone 4: Backing Binary, Address Space, and Thread State (TODOs)
+    // Backing Binary, Address Space, and Thread State
     // ========================================================================
 
     /// Returns a reference to the backing executable [`Arc<BinaryImage>`] if linked.
+    ///
+    /// # Returns
+    ///
+    /// `Some(&Arc<BinaryImage>)` if the primary executable image has been resolved in
+    /// `ImageCatalog`, or `None` prior to enrichment.
     #[inline]
     pub fn executable_image(&self) -> Option<&Arc<BinaryImage>> {
-        todo!("Implement ProcessNode::executable_image")
+        self.executable_image.as_ref()
     }
 
-    /// Links this process to its backing [`Arc<BinaryImage>`] from `ImageCatalog`.
+    /// Links this process to its backing executable [`Arc<BinaryImage>`] from `ImageCatalog`.
+    ///
+    /// # Arguments
+    ///
+    /// * `image` - Shared reference to the deduplicated [`BinaryImage`] for this process's main executable.
     #[inline]
     pub fn set_executable_image(&mut self, image: Arc<BinaryImage>) {
-        todo!("Implement ProcessNode::set_executable_image")
+        self.executable_image = Some(image);
     }
 
     /// Returns an immutable reference to this process's [`ProcessAddressSpace`].
+    ///
+    /// # Returns
+    ///
+    /// Shared view of mapped PE images (`MappedImage`) and virtual memory regions (`VadRegion`).
     #[inline]
     pub const fn address_space(&self) -> &ProcessAddressSpace {
-        todo!()
+        &self.address_space
     }
 
     /// Returns a mutable reference to this process's [`ProcessAddressSpace`].
+    ///
+    /// # Returns
+    ///
+    /// Mutable view of the process's address space for recording `ImageLoad`, `ImageUnload`,
+    /// `VirtualAlloc`, or `VirtualProtect` transitions.
     #[inline]
     pub fn address_space_mut(&mut self) -> &mut ProcessAddressSpace {
-        todo!("Implement ProcessNode::address_space_mut")
+        &mut self.address_space
     }
 
     /// Returns `true` if the process's initial main thread has already been observed.
+    ///
+    /// # Returns
+    ///
+    /// `true` after the first thread registration (or immediately for `DCStart` rundown processes),
+    /// `false` if the process has just been created and its main thread has not yet started.
     #[inline]
     pub const fn initial_thread_seen(&self) -> bool {
-        todo!()
+        self.initial_thread_seen
     }
 
     /// Registers a newly started thread inside this process and returns a reference to the
@@ -350,27 +470,39 @@ impl ProcessNode {
     /// creates the child process's very first thread (`creator_pid != self.process_id()`) before
     /// the child process has executed a single instruction.
     ///
-    /// However, what if an attacker spawns a process in `CREATE_SUSPENDED` mode (`initial_thread_seen == false`),
-    /// and a **third-party** injector process (`creator_pid != self.parent_pid()`) injects a remote thread?
-    /// Or what if the process was enumerated at startup via `DCStart` (already running) and later
-    /// receives a remote thread?
+    /// However, if an attacker spawns a process in `CREATE_SUSPENDED` mode (`initial_thread_seen == false`)
+    /// and a **third-party** process (`creator_pid != self.parent_pid()`) injects a remote thread,
+    /// or if the parent injects a *second* cross-process thread after the initial thread has
+    /// already started (`initial_thread_seen == true`), that thread must be flagged as remote:
     ///
-    /// Use these exact rules to determine `is_remote` and update `self.initial_thread_seen`:
-    /// 1. If `!self.initial_thread_seen`:
-    ///    - Set `self.initial_thread_seen = true`.
-    ///    - If `creator_pid == self.process_id()` OR `creator_pid == self.parent_pid()`, this is
-    ///      the legitimate initial main thread (`is_remote = false`).
-    ///    - Otherwise (`creator_pid != self.process_id() && creator_pid != self.parent_pid()`),
-    ///      a third-party process injected a thread before the main thread was seen (`is_remote = true`)!
-    /// 2. If `self.initial_thread_seen` is *already* `true`:
-    ///    - Any thread where `creator_pid != self.process_id()` is a remote thread (`is_remote = true`).
-    ///    - Any thread where `creator_pid == self.process_id()` is a local thread (`is_remote = false`).
+    /// 1. **When `!self.initial_thread_seen`**:
+    ///    - Latches `self.initial_thread_seen = true`.
+    ///    - If `creator_pid == self.process_id()` or `creator_pid == self.parent_pid()`, the thread
+    ///      is the legitimate initial main thread (`is_remote = false`).
+    ///    - Otherwise (`creator_pid != self.process_id() && creator_pid != self.parent_pid()`), a
+    ///      third-party process injected a thread prior to main-thread start (`is_remote = true`).
+    /// 2. **When `self.initial_thread_seen` is already `true`**:
+    ///    - Any thread with `creator_pid != self.process_id()` is a remote thread (`is_remote = true`).
+    ///    - Any thread with `creator_pid == self.process_id()` is a local worker thread (`is_remote = false`).
     ///
     /// # Bounded Local Thread Eviction
     ///
-    /// Before inserting a **local** thread (`!is_remote`), if `self.threads.len() >= MAX_LOCAL_THREADS_PER_PROCESS`:
-    /// - Find and remove the oldest **local** thread (`!t.is_remote()`) with the smallest `created_at_qpc`
-    ///   (never evict a remote thread `t.is_remote() == true`!).
+    /// Before inserting a new **local** thread (`!is_remote`), if
+    /// `self.threads.len() >= MAX_LOCAL_THREADS_PER_PROCESS`, the oldest local thread
+    /// (`!t.is_remote()`) with the minimum `created_at_qpc` is evicted. Remote threads
+    /// (`t.is_remote() == true`) are never evicted by capacity limits.
+    ///
+    /// # Arguments
+    ///
+    /// * `thread_id` - OS-assigned identifier (`TThreadId`) of the newly created thread.
+    /// * `creator_pid` - OS [`ProcessId`] of the actor process that issued the thread-creation syscall.
+    /// * `creator_key` - Resolved [`ProcessKey`] of the creator process in `ProcessTree`, if known.
+    /// * `start_address` - User-mode entry point (`Win32StartAddr`) where thread execution begins.
+    /// * `created_at_qpc` - High-resolution QPC timestamp of the `ThreadStart` event.
+    ///
+    /// # Returns
+    ///
+    /// An immutable reference to the newly inserted [`ThreadNode`] inside this process's thread table.
     pub fn register_thread(
         &mut self,
         thread_id: ThreadId,
@@ -379,42 +511,121 @@ impl ProcessNode {
         start_address: u64,
         created_at_qpc: i64,
     ) -> &ThreadNode {
-        todo!("Implement ProcessNode::register_thread")
+        // Determine whether this thread was created across a process boundary.
+        // During normal Win32 process creation (`NtCreateUserProcess`), the parent process
+        // creates the child's very first thread before the child executes any code. Once that
+        // initial thread is observed (`initial_thread_seen == true`), any subsequent thread
+        // created by the parent (or any other external PID) is a true remote thread injection.
+        let is_remote = if !self.initial_thread_seen {
+            self.initial_thread_seen = true;
+            creator_pid != self.process_id() && creator_pid != self.parent_pid()
+        } else {
+            creator_pid != self.process_id()
+        };
+
+        // Bound memory growth from high-churn local worker threads when `ThreadExit` events are
+        // disabled or missed. Remote threads are intentionally excluded from eviction candidates
+        // so pending injection indicators (`pending_loader_export`, `alerted_shellcode`) cannot
+        // be flushed by noisy local thread creation.
+        if !is_remote
+            && !self.threads.contains_key(&thread_id)
+            && self.threads.len() >= MAX_LOCAL_THREADS_PER_PROCESS
+            && let Some(oldest_local_tid) = self
+                .threads
+                .values()
+                .filter(|t| !t.is_remote())
+                .min_by_key(|t| t.created_at_qpc())
+                .map(|t| t.thread_id())
+        {
+            self.threads.remove(&oldest_local_tid);
+        }
+
+        let node = ThreadNode::new(
+            thread_id,
+            creator_pid,
+            creator_key,
+            is_remote,
+            start_address,
+            created_at_qpc,
+        );
+
+        // Use `entry(...).insert_entry(...)` to insert and return a reference to the stored
+        // `ThreadNode` in a single hash probe without a second lookup.
+        self.threads.entry(thread_id).insert_entry(node).into_mut()
     }
 
     /// Looks up an active [`ThreadNode`] by its [`ThreadId`].
+    ///
+    /// # Arguments
+    ///
+    /// * `thread_id` - The OS [`ThreadId`] to query.
+    ///
+    /// # Returns
+    ///
+    /// `Some(&ThreadNode)` if the thread is tracked in this process, or `None` otherwise.
     #[inline]
     pub fn thread(&self, thread_id: ThreadId) -> Option<&ThreadNode> {
-        todo!("Implement ProcessNode::thread")
+        self.threads.get(&thread_id)
     }
 
     /// Looks up a mutable [`ThreadNode`] by its [`ThreadId`].
+    ///
+    /// # Arguments
+    ///
+    /// * `thread_id` - The OS [`ThreadId`] to query.
+    ///
+    /// # Returns
+    ///
+    /// `Some(&mut ThreadNode)` if the thread is tracked in this process, or `None` otherwise.
     #[inline]
     pub fn thread_mut(&mut self, thread_id: ThreadId) -> Option<&mut ThreadNode> {
-        todo!("Implement ProcessNode::thread_mut")
+        self.threads.get_mut(&thread_id)
     }
 
     /// Removes and returns a [`ThreadNode`] upon thread termination (`ThreadExit`).
+    ///
+    /// # Arguments
+    ///
+    /// * `thread_id` - The OS [`ThreadId`] of the terminating thread.
+    ///
+    /// # Returns
+    ///
+    /// `Some(ThreadNode)` if the thread was present and removed, or `None` if it was not tracked.
     #[inline]
     pub fn remove_thread(&mut self, thread_id: ThreadId) -> Option<ThreadNode> {
-        todo!("Implement ProcessNode::remove_thread")
+        self.threads.remove(&thread_id)
     }
 
-    /// Returns the total number of tracked threads in this process.
+    /// Returns the total number of currently tracked threads (both local and remote) in this process.
+    ///
+    /// # Returns
+    ///
+    /// Count of [`ThreadNode`] entries in the process's thread table.
     #[inline]
     pub fn thread_count(&self) -> usize {
-        todo!("Implement ProcessNode::thread_count")
+        self.threads.len()
     }
 }
 
 impl TryFrom<&ProcessEvent> for ProcessNode {
     type Error = &'static str;
 
-    /// Attempts to convert a telemetry [`ProcessEvent`] into a [`ProcessNode`].
+    /// Attempts to convert a borrowed telemetry [`ProcessEvent`] into a [`ProcessNode`].
     ///
-    /// Only `Start` and `DCStart` events represent process creation.
-    /// Note: For `DCStart` (processes already running when Pulsar starts), the initial main
-    /// thread started in the past, so `initial_thread_seen` is immediately set to `true`.
+    /// # Arguments
+    ///
+    /// * `event` - Borrowed [`ProcessEvent`] decoded from kernel ETW telemetry.
+    ///
+    /// # Returns
+    ///
+    /// A newly initialized [`ProcessNode`]. For `DCStart` rundown events (processes that were
+    /// already running when Pulsar started), `initial_thread_seen` is immediately latched to
+    /// `true` because the process's main thread started prior to telemetry collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `event.kind` is neither [`ProcessEventKind::Start`] nor
+    /// [`ProcessEventKind::DCStart`] (e.g., `End`, `DCEnd`, or `Defunct`).
     fn try_from(event: &ProcessEvent) -> Result<Self, Self::Error> {
         match event.kind {
             ProcessEventKind::Start | ProcessEventKind::DCStart => {
@@ -428,6 +639,9 @@ impl TryFrom<&ProcessEvent> for ProcessNode {
                     event.image_file_name.clone(),
                     event.command_line.clone(),
                 );
+                // Rundown (`DCStart`) processes were already executing before the ETW session
+                // started, so their initial main thread has already run; any future cross-process
+                // thread creation targeting this process (even from its parent) is remote.
                 if event.kind == ProcessEventKind::DCStart {
                     node.initial_thread_seen = true;
                 }
@@ -441,7 +655,22 @@ impl TryFrom<&ProcessEvent> for ProcessNode {
 impl TryFrom<ProcessEvent> for ProcessNode {
     type Error = &'static str;
 
-    /// Attempts to convert an owned telemetry [`ProcessEvent`] into a [`ProcessNode`].
+    /// Attempts to convert an owned telemetry [`ProcessEvent`] into a [`ProcessNode`] without
+    /// cloning string or [`Sid`] allocations.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - Owned [`ProcessEvent`] decoded from kernel ETW telemetry.
+    ///
+    /// # Returns
+    ///
+    /// A newly initialized [`ProcessNode`], with `initial_thread_seen` latched to `true` when
+    /// `event.kind == ProcessEventKind::DCStart`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `event.kind` is neither [`ProcessEventKind::Start`] nor
+    /// [`ProcessEventKind::DCStart`].
     fn try_from(event: ProcessEvent) -> Result<Self, Self::Error> {
         match event.kind {
             ProcessEventKind::Start | ProcessEventKind::DCStart => {
