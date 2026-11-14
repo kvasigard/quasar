@@ -1,4 +1,8 @@
 //! Strongly-typed ETW provider configuration descriptors, severity levels, and kernel filters.
+//!
+//! [`Provider`] encapsulates all parameters passed to `EnableTraceEx2` when attaching a
+//! manifest-based, TraceLogging, or PPL (Protected Process Light) provider such as
+//! `Microsoft-Windows-Threat-Intelligence` to a [`UserSession`](super::UserSession).
 
 use std::fmt;
 use windows_sys::Win32::System::Diagnostics::Etw::EVENT_ENABLE_PROPERTY_STACK_TRACE;
@@ -7,22 +11,26 @@ use windows_sys::core::GUID;
 use crate::helpers::format_guid;
 use crate::sensors::etw::filter::ProviderFilter;
 
-/// Standard ETW trace logging severity levels.
+/// Standard ETW trace logging severity levels passed to `EnableTraceEx2`.
+///
+/// In ETW, enabling a provider at a given `TraceLevel` enables all events with a severity
+/// numerical value less than or equal to that level (e.g., `Information` (`4`) captures
+/// `Critical` (`1`), `Error` (`2`), `Warning` (`3`), and `Information` (`4`)).
 ///
 /// Reference: <https://learn.microsoft.com/en-us/windows/win32/etw/trace-level>
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TraceLevel {
-    /// Abnormal exit or termination events.
+    /// Abnormal exit or fatal termination events (`TRACE_LEVEL_CRITICAL = 1`).
     Critical = 1,
-    /// Severe errors that inhibit execution.
+    /// Severe error conditions (`TRACE_LEVEL_ERROR = 2`).
     Error = 2,
-    /// Warnings or abnormal conditions.
+    /// Warnings or non-fatal abnormal conditions (`TRACE_LEVEL_WARNING = 3`).
     Warning = 3,
-    /// Standard informational operational telemetry.
+    /// Standard informational operational telemetry (`TRACE_LEVEL_INFORMATION = 4`).
     #[default]
     Information = 4,
-    /// Highly verbose debugging telemetry.
+    /// Detailed diagnostic and debugging telemetry (`TRACE_LEVEL_VERBOSE = 5`).
     Verbose = 5,
 }
 
@@ -32,19 +40,26 @@ impl From<TraceLevel> for u8 {
     }
 }
 
-/// Strongly-typed configuration descriptor for an ETW provider.
+/// Strongly-typed configuration descriptor for an ETW provider enabled on a [`UserSession`](super::UserSession).
 ///
-/// Encapsulates the provider GUID, logging level, keyword bitmasks, extended enable
-/// properties (such as inline stack tracing), and kernel-level [`ProviderFilter`]s
-/// passed to `EnableTraceEx2`.
+/// Encapsulates the provider GUID, severity threshold ([`TraceLevel`]), 64-bit `MatchAnyKeyword`
+/// and `MatchAllKeyword` bitmasks, `ENABLE_TRACE_PARAMETERS.EnableProperty` flags (such as
+/// inline call stack capture), and kernel-side [`ProviderFilter`] rules.
 #[derive(Clone)]
 pub struct Provider {
+    /// Human-readable provider name used in structured logs and diagnostics.
     name: String,
+    /// Unique 128-bit ETW provider GUID.
     guid: GUID,
+    /// Maximum severity level threshold enabled for this provider.
     level: TraceLevel,
+    /// 64-bit keyword bitmask where an event matches if *any* bit overlaps (or `0` for all).
     match_any_keyword: u64,
+    /// 64-bit keyword bitmask where an event must contain *all* specified bits.
     match_all_keyword: u64,
+    /// Bitmask of `EVENT_ENABLE_PROPERTY_*` flags (e.g., `EVENT_ENABLE_PROPERTY_STACK_TRACE`).
     enable_property: u32,
+    /// Kernel-side `EVENT_FILTER_DESCRIPTOR` rules (Event IDs, StackWalk Event IDs, PIDs).
     filter: ProviderFilter,
 }
 
@@ -89,16 +104,16 @@ impl PartialEq for Provider {
 impl Eq for Provider {}
 
 impl Provider {
-    /// Creates a new `Provider` descriptor with default `Information` level and no keyword filters.
+    /// Creates a new [`Provider`] descriptor with [`TraceLevel::Information`] and no keyword or Event ID filters.
     ///
     /// # Arguments
     ///
     /// * `name` - Human-readable identifier for the provider (for diagnostics/logging).
-    /// * `guid` - The unique ETW Provider GUID.
+    /// * `guid` - The unique 128-bit ETW Provider GUID.
     ///
     /// # Returns
     ///
-    /// An initialized `Provider` builder ready for chaining.
+    /// An initialized [`Provider`] builder ready for method chaining.
     pub fn new(name: impl Into<String>, guid: GUID) -> Self {
         Self {
             name: name.into(),
@@ -117,53 +132,57 @@ impl Provider {
         self
     }
 
-    /// Sets the 64-bit keyword bitmasks used by ETW for category filtering.
+    /// Sets the 64-bit `MatchAnyKeyword` and `MatchAllKeyword` bitmasks used by ETW for category filtering.
     pub fn with_keywords(mut self, match_any: u64, match_all: u64) -> Self {
         self.match_any_keyword = match_any;
         self.match_all_keyword = match_all;
         self
     }
 
-    /// Requests that Windows capture call stack traces inline in `ExtendedData` for events emitted by this provider.
+    /// Requests that Windows capture call stack traces inline in `ExtendedData` (`STACK_TRACE64` / `STACK_TRACE32`)
+    /// for events emitted by this provider.
     ///
-    /// Sets the `EVENT_ENABLE_PROPERTY_STACK_TRACE` flag in `ENABLE_TRACE_PARAMETERS`.
+    /// Sets `EVENT_ENABLE_PROPERTY_STACK_TRACE` in `ENABLE_TRACE_PARAMETERS.EnableProperty`.
     pub fn with_stack_tracing(mut self) -> Self {
         self.enable_property |= EVENT_ENABLE_PROPERTY_STACK_TRACE;
         self
     }
 
-    /// Adds a raw Win32 `EVENT_ENABLE_PROPERTY_*` bitmask flag (e.g. `EVENT_ENABLE_PROPERTY_IGNORE_KEYWORD_0`).
+    /// Adds a raw Win32 `EVENT_ENABLE_PROPERTY_*` bitmask flag (e.g., `EVENT_ENABLE_PROPERTY_PROCESS_START_KEY`).
     pub fn with_property(mut self, property: u32) -> Self {
         self.enable_property |= property;
         self
     }
 
-    /// Attaches a kernel-level [`ProviderFilter`] (`EVENT_FILTER_DESCRIPTOR`) to this provider.
+    /// Replaces the kernel-level [`ProviderFilter`] (`EVENT_FILTER_DESCRIPTOR`) attached to this provider.
     pub fn with_filter(mut self, filter: ProviderFilter) -> Self {
         self.filter = filter;
         self
     }
 
-    /// Configures a kernel-level inclusive Event ID filter (`EVENT_FILTER_TYPE_EVENT_ID`) for this provider.
+    /// Configures a kernel-level inclusive Event ID filter (`EVENT_FILTER_TYPE_EVENT_ID`) so the kernel
+    /// only emits the specified Event IDs for this provider.
     pub fn include_event_ids(mut self, ids: impl IntoIterator<Item = u16>) -> Self {
         self.filter = self.filter.include_event_ids(ids);
         self
     }
 
-    /// Configures a kernel-level exclusive Event ID filter (`EVENT_FILTER_TYPE_EVENT_ID`) for this provider.
+    /// Configures a kernel-level exclusive Event ID filter (`EVENT_FILTER_TYPE_EVENT_ID`) so the kernel
+    /// suppresses the specified Event IDs for this provider.
     pub fn exclude_event_ids(mut self, ids: impl IntoIterator<Item = u16>) -> Self {
         self.filter = self.filter.exclude_event_ids(ids);
         self
     }
 
-    /// Configures the kernel to capture inline stack traces only for the specified Event IDs.
+    /// Enables inline stack tracing (`EVENT_ENABLE_PROPERTY_STACK_TRACE`) and restricts stack capture
+    /// in the kernel (`EVENT_FILTER_TYPE_STACKWALK`) to only the specified Event IDs.
     pub fn include_stackwalk_event_ids(mut self, ids: impl IntoIterator<Item = u16>) -> Self {
         self.enable_property |= EVENT_ENABLE_PROPERTY_STACK_TRACE;
         self.filter = self.filter.include_stackwalk_event_ids(ids);
         self
     }
 
-    /// Restricts this provider in the kernel to the specified Process IDs (up to 8 PIDs).
+    /// Restricts this provider in the kernel (`EVENT_FILTER_TYPE_PID`) to the specified Process IDs (up to 8 PIDs).
     pub fn with_pids(mut self, pids: impl IntoIterator<Item = u32>) -> Self {
         self.filter = self.filter.with_pids(pids);
         self
@@ -174,27 +193,27 @@ impl Provider {
         &self.name
     }
 
-    /// Returns the GUID of the provider.
+    /// Returns the 128-bit GUID of the provider.
     pub fn guid(&self) -> &GUID {
         &self.guid
     }
 
-    /// Returns the logging severity level.
+    /// Returns the configured [`TraceLevel`] severity threshold.
     pub fn level(&self) -> TraceLevel {
         self.level
     }
 
-    /// Returns the `MatchAnyKeyword` bitmask.
+    /// Returns the 64-bit `MatchAnyKeyword` bitmask.
     pub fn match_any_keyword(&self) -> u64 {
         self.match_any_keyword
     }
 
-    /// Returns the `MatchAllKeyword` bitmask.
+    /// Returns the 64-bit `MatchAllKeyword` bitmask.
     pub fn match_all_keyword(&self) -> u64 {
         self.match_all_keyword
     }
 
-    /// Returns the `EnableProperty` bitmask.
+    /// Returns the `ENABLE_TRACE_PARAMETERS.EnableProperty` bitmask.
     pub fn enable_property(&self) -> u32 {
         self.enable_property
     }

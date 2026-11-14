@@ -1,4 +1,17 @@
-//! Traditional and manifest-based ETW user trace session management with kernel-side provider filtering.
+//! Manifest, TraceLogging, and PPL ETW user trace session management (`UserSession`).
+//!
+//! # Role & Provider Filtering
+//!
+//! While [`KernelSession`](super::KernelSession) captures classic MOF kernel telemetry via the
+//! System Logger, [`UserSession`] manages sessions that subscribe to GUID-identified providers
+//! via `EnableTraceEx2`—such as `Microsoft-Windows-Threat-Intelligence` (when running as
+//! PPL-Antimalware), `Microsoft-Windows-Kernel-Process`, or `Microsoft-Windows-DotNETRuntime`.
+//!
+//! When starting a [`UserSession`], each registered [`Provider`] is enabled with `ENABLE_TRACE_PARAMETERS`
+//! Version 2, passing any configured [`ProviderFilter`](super::ProviderFilter) descriptors
+//! (`EVENT_FILTER_TYPE_EVENT_ID`, `EVENT_FILTER_TYPE_STACKWALK`, `EVENT_FILTER_TYPE_PID`) directly
+//! to the Windows kernel. When stopping the session, all providers are explicitly disabled prior
+//! to `ControlTraceW(..., EVENT_TRACE_CONTROL_STOP)`.
 
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::System::Diagnostics::Etw::{
@@ -18,6 +31,7 @@ use super::session::{
     stop_win32_trace_session,
 };
 
+/// Zeroed GUID passed to `StartTraceW` for user sessions so Windows assigns a dynamic session GUID.
 const NULL_GUID: GUID = GUID {
     data1: 0,
     data2: 0,
@@ -25,15 +39,18 @@ const NULL_GUID: GUID = GUID {
     data4: [0; 8],
 };
 
-/// Builder for configuring and starting a traditional or manifest-based ETW [`UserSession`].
+/// Builder for configuring and constructing a manifest or PPL [`UserSession`].
 pub struct UserSessionBuilder {
+    /// Name of the ETW trace session (e.g., `"Pulsar-User-Session"`).
     session_name: String,
+    /// Ring-buffer pool and logging mode parameters.
     properties: EventTraceProperties,
+    /// Ordered list of [`Provider`] descriptors to enable via `EnableTraceEx2` upon startup.
     providers: Vec<Provider>,
 }
 
 impl UserSessionBuilder {
-    /// Creates a new `UserSessionBuilder` with the specified session name.
+    /// Creates a new [`UserSessionBuilder`] with the specified session name and default buffer properties.
     pub fn new(session_name: impl Into<String>) -> Self {
         Self {
             session_name: session_name.into(),
@@ -43,13 +60,13 @@ impl UserSessionBuilder {
     }
 
     /// Registers an ETW [`Provider`] (including any kernel-side [`ProviderFilter`](super::filter::ProviderFilter)s)
-    /// to be enabled when the session starts.
+    /// to be enabled on the session when [`EtwSession::start`] is called.
     pub fn add_provider(&mut self, provider: Provider) -> &mut Self {
         self.providers.push(provider);
         self
     }
 
-    /// Consumes the builder to construct a configured [`UserSession`].
+    /// Consumes the builder configuration to produce an unstarted [`UserSession`].
     pub fn build(&self) -> Result<UserSession, EtwError> {
         Ok(UserSession {
             session_name: self.session_name.clone(),
@@ -98,17 +115,28 @@ impl EtwSessionBuilder for UserSessionBuilder {
     }
 }
 
-/// Active ETW session managing traditional, manifest, and PPL providers via `EnableTraceEx2`.
+/// Active or configured ETW session managing manifest, TraceLogging, and PPL providers via `EnableTraceEx2`.
+///
+/// # Ownership & RAII Lifecycle
+///
+/// * Holds the Win32 `CONTROLTRACE_HANDLE` while started (`handle: Some(...)`).
+/// * Automatically disables all registered providers and stops the kernel trace session on
+///   [`Self::stop`] or `Drop`.
 pub struct UserSession {
+    /// Name of the ETW session registered with Windows.
     session_name: String,
+    /// Ring-buffer sizing and mode configuration.
     properties: EventTraceProperties,
+    /// Providers enabled on this session.
     providers: Vec<Provider>,
+    /// Active Win32 session control handle returned by `StartTraceW`.
     handle: Option<CONTROLTRACE_HANDLE>,
+    /// Final or most recently queried ring-buffer [`TraceStatistics`].
     last_statistics: Option<TraceStatistics>,
 }
 
 impl UserSession {
-    /// Default session name for Pulsar user-mode telemetry.
+    /// Default session name for Pulsar user-mode and manifest telemetry.
     pub const DEFAULT_SESSION_NAME: &'static str = "Pulsar-User-Session";
 
     /// Returns the name of this session.
@@ -123,7 +151,12 @@ impl UserSession {
         self.last_statistics
     }
 
-    /// Queries live kernel ring-buffer statistics for this session.
+    /// Queries live kernel ring-buffer statistics (`EventsLost`, `RealTimeBuffersLost`, etc.) for this session.
+    ///
+    /// # Errors
+    ///
+    /// * [`EtwError::SessionNotStarted`] if the session is not currently running.
+    /// * [`EtwError::WindowsApi`] if `ControlTraceW` fails.
     pub fn query_statistics(&self) -> Result<TraceStatistics, EtwError> {
         let handle = self
             .handle
@@ -131,7 +164,12 @@ impl UserSession {
         query_win32_trace_session(handle, &self.session_name, &self.properties, NULL_GUID)
     }
 
-    /// Flushes active ring buffers immediately.
+    /// Forces an immediate flush of the session's active ring buffers.
+    ///
+    /// # Errors
+    ///
+    /// * [`EtwError::SessionNotStarted`] if the session is not currently running.
+    /// * [`EtwError::WindowsApi`] if `ControlTraceW` fails.
     pub fn flush(&self) -> Result<TraceStatistics, EtwError> {
         let handle = self
             .handle
@@ -140,14 +178,16 @@ impl UserSession {
     }
 
     /// Enables all registered providers (along with their kernel-side `EVENT_FILTER_DESCRIPTOR`s)
-    /// on the active trace session handle.
+    /// on the active trace session handle via `EnableTraceEx2`.
     fn enable_providers(&self, handle: CONTROLTRACE_HANDLE) {
         for provider in &self.providers {
+            // `built_filters` owns the pinned heap byte buffers referenced by `filter_slice[*].Ptr`
+            // and stays alive on the stack until `EnableTraceEx2` returns.
             let built_filters = provider.filter().build_descriptors();
             let filter_slice = built_filters.as_slice();
 
             let mut params: ENABLE_TRACE_PARAMETERS = unsafe { std::mem::zeroed() };
-            params.Version = 2; // ENABLE_TRACE_PARAMETERS_VERSION_2
+            params.Version = 2; // ENABLE_TRACE_PARAMETERS_VERSION_2 is required for EnableFilterDesc
             params.EnableProperty = provider.enable_property();
             if !filter_slice.is_empty() {
                 params.EnableFilterDesc =
@@ -155,6 +195,8 @@ impl UserSession {
                 params.FilterDescCount = filter_slice.len() as u32;
             }
 
+            // SAFETY: `handle` is an active session handle, `provider.guid()` is a valid GUID ref,
+            // and `params` points to `filter_slice` whose backing buffers in `built_filters` outlive this call.
             let status = unsafe {
                 EnableTraceEx2(
                     handle,
@@ -188,9 +230,11 @@ impl UserSession {
         }
     }
 
-    /// Disables all registered providers prior to stopping the trace session.
+    /// Disables all registered providers prior to stopping the trace session so providers stop
+    /// writing into the session buffers before teardown.
     fn disable_providers(&self, handle: CONTROLTRACE_HANDLE) {
         for provider in &self.providers {
+            // SAFETY: `handle` is valid and `EVENT_CONTROL_CODE_DISABLE_PROVIDER` accepts a null `EnableParameters`.
             unsafe {
                 let _ = EnableTraceEx2(
                     handle,

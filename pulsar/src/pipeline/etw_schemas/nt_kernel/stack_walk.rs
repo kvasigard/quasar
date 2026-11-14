@@ -1,15 +1,19 @@
-//! DTO definitions for ETW NT Kernel Logger Stack Walk events.
+//! Zero-copy MOF DTO and decoded event definitions for Windows Kernel `StackWalk` events (`StackWalk_TypeGroup1`).
 //!
-//! Event types for ETW Kernel Stack Tracing (`StackWalkGuid` `{DEF2FE46-7BD6-4B80-BD94-F57FE20D0CE3}`):
+//! # Event Opcodes & MOF Classes (`StackWalkGuid` `{def2fe46-7bd6-4b80-bd94-f57fe20d0ce3}`)
 //!
-//! +-------+---------------------------------+----------------------------------------------------+-----------------------+
-//! | Value | Constant / Event Name           | Description                                        | MOF Class             |
-//! +-------+---------------------------------+----------------------------------------------------+-----------------------+
-//! | 32    | EVENT_TRACE_TYPE_STACKWALK      | Call stack captured immediately after an event     | StackWalk_TypeGroup1  |
-//! +-------+---------------------------------+----------------------------------------------------+-----------------------+
+//! | Opcode | Constant / Event Name        | Description                                    | MOF Class             |
+//! |--------|------------------------------|------------------------------------------------|-----------------------|
+//! | `32`   | `EVENT_TRACE_TYPE_STACKWALK` | Call stack captured immediately after an event | `StackWalk_TypeGroup1` |
 //!
-//! Reference documentation:
-//! <https://learn.microsoft.com/en-us/windows/win32/etw/stackwalk>
+//! # Correlation Mechanism
+//!
+//! When kernel stack tracing is enabled for a classic MOF event via
+//! `TraceSetInformation(TraceStackTracingInfo)`, the kernel emits a `StackWalk_TypeGroup1`
+//! record whose `EventTimeStamp`, `StackProcess`, and `StackThread` fields match the
+//! `EventHeader.TimeStamp`, `ProcessId`, and `ThreadId` of the triggering event.
+//!
+//! Reference: <https://learn.microsoft.com/en-us/windows/win32/etw/stackwalk>
 
 use thiserror::Error;
 
@@ -17,39 +21,41 @@ use crate::model::types::StackTrace;
 use crate::pipeline::etw_schemas::cursor::ByteCursor;
 use crate::sensors::etw::RawEvent;
 
-/// Error type encountered while parsing StackWalk ETW DTO structures.
+/// Errors encountered while decoding a `StackWalk_TypeGroup1` (Opcode 32) payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum DtoStackWalkError {
+    /// The `UserData` buffer was shorter than the mandatory 16-byte fixed header (`EventTimeStamp + StackProcess + StackThread`).
     #[error("Buffer too short for StackWalk header (expected at least {0} bytes, got {1})")]
     HeaderTooShort(usize, usize),
 
+    /// The trailing `Stack1..StackN` byte slice was not a multiple of the event's pointer size (`4` or `8` bytes).
     #[error("Buffer length is not aligned to pointer size: {0} bytes remaining")]
     UnalignedFrames(usize),
 }
 
-/// Raw zero-copy DTO for `StackWalk_TypeGroup1` (Opcode 32) event payload.
+/// Borrowed zero-copy DTO for `StackWalk_TypeGroup1` (Opcode 32) MOF payload.
 ///
-/// Emitted by the kernel logger when stack tracing is enabled for specific kernel events.
-/// The `EventTimeStamp` matches the timestamp of the event that triggered the stack walk.
+/// Slices the trailing instruction pointer array (`RawFrames`) directly from the ETW buffer
+/// without allocating a `Vec<u64>` until [`Self::to_frames`] is called.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(non_snake_case, non_camel_case_types)]
 pub struct StackWalk_TypeGroup1<'a> {
-    /// Timestamp of the triggering event this stack trace is associated with.
+    /// Raw QPC timestamp of the triggering kernel event this stack trace belongs to.
     pub EventTimeStamp: u64,
 
-    /// Process ID where the stack trace was captured.
+    /// Process ID (`PID`) in which the stack trace was captured.
     pub StackProcess: u32,
 
-    /// Thread ID where the stack trace was captured.
+    /// Thread ID (`TID`) in which the stack trace was captured.
     pub StackThread: u32,
 
-    /// Array of instruction pointer addresses from caller to root (unaligned byte slice).
+    /// Borrowed byte slice of instruction pointer frames (`FrameCount * PointerSize` bytes).
     pub RawFrames: &'a [u8],
 
-    /// Number of pointer frames present in `RawFrames`.
+    /// Number of instruction pointer frames present in `RawFrames`.
     pub FrameCount: usize,
 
-    /// Pointer byte width (`4` or `8`) for each frame in `RawFrames`.
+    /// Byte width (`4` or `8`) of each instruction pointer frame in `RawFrames`.
     pub PointerSize: usize,
 }
 
@@ -86,7 +92,8 @@ impl<'a> StackWalk_TypeGroup1<'a> {
         })
     }
 
-    /// Iterates over the raw frame instruction pointers in the stack walk payload.
+    /// Returns an alignment-safe iterator over the instruction pointer frames in `RawFrames`
+    /// (zero-extending 32-bit frames to `u64`).
     pub fn iter_frames(&self) -> impl Iterator<Item = u64> + 'a {
         let ptr_size = self.PointerSize;
         self.RawFrames.chunks_exact(ptr_size).map(move |chunk| {
@@ -98,7 +105,7 @@ impl<'a> StackWalk_TypeGroup1<'a> {
         })
     }
 
-    /// Collects the instruction pointer frames into a `Vec<u64>`.
+    /// Collects the instruction pointer frames into an owned `Vec<u64>`.
     pub fn to_frames(&self) -> Vec<u64> {
         self.iter_frames().collect()
     }
@@ -122,10 +129,12 @@ impl<'a> TryFrom<&'a RawEvent> for StackWalk_TypeGroup1<'a> {
     }
 }
 
-/// Decoded out-of-band kernel stack walk event ready for [`CallStackCorrelator`](crate::pipeline::CallStackCorrelator).
+/// Owned, pre-decoded out-of-band kernel stack walk event sent inside
+/// [`TelemetryEnvelope::StackWalk`](crate::pipeline::TelemetryEnvelope::StackWalk) to
+/// [`CallStackCorrelator`](crate::pipeline::CallStackCorrelator).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackWalkEvent {
-    /// Timestamp of the triggering kernel event (`EventTimeStamp`).
+    /// Timestamp (`EventTimeStamp`) of the triggering kernel event.
     pub event_timestamp: u64,
     /// Target Process ID (`StackProcess`).
     pub process_id: u32,

@@ -1,13 +1,22 @@
 //! In-callback zero-copy ETW event decoder and priority-split router.
 //!
-//! [`PipelineEventRouter`] implements [`TraceRouter`](crate::sensors::etw::TraceRouter) to inspect
-//! raw ETW event headers at the C-ABI boundary, decode matching payloads directly from `&RawEvent`
-//! using [`ByteCursor`](crate::pipeline::etw_schemas::ByteCursor) without allocating a `Vec<u8>`
-//! copy of `UserData`, and route decoded items into two priority-separated channels:
-//! - **`state_tx` (High Priority):** State-building lifecycle events (such as `Event::Process`)
-//!   that must update `SystemState` / `ProcessTree` before kernel driver alerts are evaluated.
-//! - **`telemetry_tx` (Standard Priority):** High-volume telemetry events (`Event::Syscall`) and
-//!   asynchronous `StackWalkEvent` frames that pass through [`CallStackCorrelator`](crate::pipeline::CallStackCorrelator).
+//! # Why Decode Inside the Callback & Split Channels
+//!
+//! In a single-channel ETW architecture where every raw event copies its `UserData` into a
+//! `Vec<u8>` and enters a shared FIFO queue, two failure modes arise under load:
+//! 1. **Heap Allocation Churn:** Allocating and freeing a `Vec<u8>` for tens of thousands of
+//!    events per second wastes CPU cycles on events whose payload is only read once.
+//! 2. **State Starvation & Temporal Race:** When high-volume telemetry (or a process burst)
+//!    fills a single channel, `Process::Start` events sit behind thousands of queued records.
+//!    Meanwhile, the kernel driver's per-CPU ring buffer (`driver_rx`) delivers an immediate
+//!    alert (such as `LsassAccessEvent`) for the new PID before `ProcessContextSink` has seen
+//!    its `Process::Start` event, resulting in an `<unknown>` process attribution.
+//!
+//! [`PipelineEventRouter`] solves both problems by implementing [`TraceRouter`]:
+//! - It decodes [`ProcessEvent`], [`SyscallEvent`], and [`StackWalkEvent`] directly from
+//!   `&RawEvent` inside the callback using [`ByteCursor`](crate::pipeline::etw_schemas::ByteCursor).
+//! - It routes state-building process lifecycle events to a dedicated high-priority `state_tx`
+//!   channel and high-volume stack-correlated telemetry to `telemetry_tx`.
 
 use std::sync::mpsc::{SyncSender, TrySendError};
 
@@ -20,38 +29,51 @@ use crate::pipeline::etw_schemas::nt_kernel::stack_walk::StackWalkEvent;
 use crate::pipeline::event::Event;
 use crate::sensors::etw::{ConsumerOutcome, RawEvent, TraceRouter};
 
-/// Decoded telemetry item sent from [`PipelineEventRouter`] to the [`Pipeline`](crate::pipeline::Pipeline)
-/// correlator stage.
+/// Decoded telemetry item sent from [`PipelineEventRouter`] over `telemetry_tx` to the
+/// [`Pipeline`](crate::pipeline::Pipeline) stack-correlation stage.
+///
+/// Carrying already-decoded structs inside `TelemetryEnvelope` ensures [`Pipeline::feed_envelope`](crate::pipeline::Pipeline::feed_envelope)
+/// never has to re-parse raw byte slices on the dispatcher thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TelemetryEnvelope {
-    /// A decoded domain event that may optionally await an out-of-band kernel `StackWalk`.
+    /// A decoded domain [`Event`] that may optionally require out-of-band kernel `StackWalk` correlation.
     Trigger {
-        /// The decoded domain event.
+        /// The decoded domain event (e.g., [`Event::Syscall`]).
         event: Event,
-        /// Whether the correlator should buffer this event awaiting a matching `StackWalkEvent`.
+        /// When `true`, [`CallStackCorrelator`](crate::pipeline::CallStackCorrelator) buffers
+        /// `event` awaiting a matching [`TelemetryEnvelope::StackWalk`]. When `false` (for
+        /// example when an inline `ExtendedData` stack trace was already extracted), the event
+        /// bypasses correlation and is dispatched immediately.
         needs_async_stack: bool,
     },
-    /// An out-of-band kernel stack walk event (`StackWalk_TypeGroup1`, Opcode 32).
+    /// An out-of-band kernel stack walk event (`StackWalk_TypeGroup1`, Opcode 32) decoded
+    /// inside the ETW callback and ready for `(EventTimeStamp, ProcessId, ThreadId)` correlation.
     StackWalk(StackWalkEvent),
 }
 
 /// Zero-copy, in-callback router that decodes `&RawEvent` payloads and splits state-critical
 /// lifecycle events from high-volume stack-correlated telemetry.
+///
+/// # Concurrency & Backpressure Invariants
+///
+/// `PipelineEventRouter` is `Clone + Send + Sync` and uses non-blocking `SyncSender::try_send`
+/// on both channels so the Win32 `ProcessTrace` callback thread can never deadlock or stall
+/// waiting for the downstream dispatcher thread.
 #[derive(Clone)]
 pub struct PipelineEventRouter {
-    /// High-priority channel for state-building events (`Process::Start`, `DCStart`, `End`, etc.).
+    /// High-priority bounded channel for state-building lifecycle events (`Process::Start`, `DCStart`, `End`, `DCEnd`, `Defunct`).
     state_tx: SyncSender<Event>,
-    /// Standard channel for stack-correlated telemetry and `StackWalk` frames.
+    /// Bounded channel for stack-correlated telemetry ([`TelemetryEnvelope::Trigger`]) and [`TelemetryEnvelope::StackWalk`] frames.
     telemetry_tx: SyncSender<TelemetryEnvelope>,
 }
 
 impl PipelineEventRouter {
-    /// Creates a new [`PipelineEventRouter`] with dedicated priority-split channels.
+    /// Creates a new [`PipelineEventRouter`] writing to the priority-split `state_tx` and `telemetry_tx` channels.
     ///
     /// # Arguments
     ///
     /// * `state_tx` - High-priority channel drained first by [`EventDispatcher`](crate::pipeline::EventDispatcher).
-    /// * `telemetry_tx` - Standard channel feeding [`Pipeline`](crate::pipeline::Pipeline) and [`CallStackCorrelator`](crate::pipeline::CallStackCorrelator).
+    /// * `telemetry_tx` - Standard telemetry channel feeding [`Pipeline`](crate::pipeline::Pipeline) and [`CallStackCorrelator`](crate::pipeline::CallStackCorrelator).
     pub fn new(state_tx: SyncSender<Event>, telemetry_tx: SyncSender<TelemetryEnvelope>) -> Self {
         Self {
             state_tx,
@@ -59,6 +81,7 @@ impl PipelineEventRouter {
         }
     }
 
+    /// Maps a non-blocking `SyncSender::try_send` result to the corresponding [`ConsumerOutcome`].
     #[inline(always)]
     fn map_send_result<T>(res: Result<(), TrySendError<T>>) -> ConsumerOutcome {
         match res {
@@ -75,7 +98,11 @@ impl TraceRouter for PipelineEventRouter {
         let provider_id = event.provider_id();
         let opcode = event.opcode();
 
-        // 1. High-Priority State Path: Process lifecycle events (Start, End, DCStart, DCEnd, Defunct)
+        // 1. High-Priority State Path: Process lifecycle events (`Start`, `End`, `DCStart`, `DCEnd`, `Defunct`).
+        // IMPORTANT: We evaluate this path BEFORE the `EventHeader.ProcessId` gate below because
+        // kernel `Process::Start` and `DCStart` events are frequently logged in the context of
+        // the `System` process (`PID 4`) or `Idle` (`PID 0`), with the actual target PID stored
+        // inside the `UserData` payload!
         let is_process_provider = guid_matches(provider_id, &NT_KERNEL_PROCESS_GUID)
             || guid_matches(provider_id, &MANIFEST_KERNEL_PROCESS_GUID);
 
@@ -100,7 +127,9 @@ impl TraceRouter for PipelineEventRouter {
             };
         }
 
-        // 2. Fast PID gate for high-volume telemetry: ignore Idle (0), System (4), and our own agent PID
+        // 2. Fast PID gate for high-volume telemetry (`StackWalk`, `SysCallEnter`):
+        // Ignore `Idle` (0), `System` (4), and our own Pulsar agent PID (`current_pid`) to
+        // prevent feedback loops where the agent's own syscalls generate more ETW events.
         let pid = event.process_id();
         if pid == 0 || pid == 4 || pid == current_pid {
             return ConsumerOutcome::FilteredOut;

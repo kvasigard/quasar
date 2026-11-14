@@ -1,4 +1,14 @@
-//! Safe, owned representation of ETW events and extended stack payloads.
+//! Owned, heap-backed representation of an ETW event record (`EventRecord`).
+//!
+//! # Role in the Architecture
+//!
+//! While the production hot-path decodes telemetry directly from a zero-copy [`RawEvent`]
+//! inside [`PipelineEventRouter`](crate::pipeline::PipelineEventRouter), an owned
+//! [`EventRecord`] remains useful for:
+//! - Standalone sensor integration tests that forward raw events over a `SyncSender<EventRecord>`
+//!   channel before asserting on their contents.
+//! - Offline event replay or diagnostic capture where the record must outlive the synchronous
+//!   Win32 `ProcessTrace` callback.
 
 use std::fmt;
 use windows_sys::Win32::System::Diagnostics::Etw::{
@@ -9,31 +19,32 @@ use windows_sys::core::GUID;
 use crate::helpers::format_guid;
 use crate::sensors::etw::raw_event::{RawEvent, SyntheticEvent};
 
-/// An owned, thread-safe representation of an ETW Event.
+/// Owned, `Send + Sync` snapshot of a Win32 `EVENT_RECORD` and its inline call stack.
 ///
-/// Copies essential telemetry data from raw C-pointers provided by the ETW callback
-/// when an owned buffer is required. For zero-copy in-callback decoding, prefer [`RawEvent`].
+/// Copies header metadata, `UserData` bytes, and any inline `STACK_TRACE64`/`STACK_TRACE32`
+/// frames out of the transient ETW callback buffer so the record can be sent across threads
+/// or stored in collections. For zero-allocation in-callback decoding, prefer [`RawEvent`].
 #[derive(Clone)]
 pub struct EventRecord {
-    /// The GUID of the ETW Provider that emitted this event.
+    /// GUID of the ETW Provider (or classic MOF event class) that emitted this event.
     pub provider_id: GUID,
-    /// The Event ID, identifying the specific event type.
+    /// 16-bit Event ID (`EventDescriptor.Id`).
     pub event_id: u16,
-    /// The version of the event schema.
+    /// Schema version (`EventDescriptor.Version`).
     pub version: u8,
-    /// The opcode defining the action (e.g. Start, Stop, DCStart).
+    /// Event opcode (`EventDescriptor.Opcode`, e.g., `Start = 1`, `End = 2`, `SysCallEnter = 51`).
     pub opcode: u8,
-    /// The severity level of the event.
+    /// Severity level (`EventDescriptor.Level`).
     pub level: u8,
-    /// The Process ID (PID) that generated the event.
+    /// Process ID (`EventHeader.ProcessId`) that logged the event.
     pub process_id: u32,
-    /// The Thread ID (TID) that generated the event.
+    /// Thread ID (`EventHeader.ThreadId`) that logged the event.
     pub thread_id: u32,
-    /// The timestamp of the event (typically 100ns intervals since 1601 or QPC tick).
+    /// Raw event timestamp (`EventHeader.TimeStamp`, typically QPC ticks).
     pub timestamp: i64,
-    /// The raw payload of the event.
+    /// Owned copy of the raw binary `UserData` payload.
     pub user_data: Vec<u8>,
-    /// Extracted user/kernel stack instruction pointers from ExtendedData.
+    /// Optional inline call stack extracted from `ExtendedData` (`STACK_TRACE64` / `STACK_TRACE32`).
     pub stack_trace: Option<Vec<u64>>,
 }
 
@@ -58,7 +69,15 @@ impl fmt::Debug for EventRecord {
 }
 
 impl EventRecord {
-    /// Constructs a safe, owned `EventRecord` from a borrowed [`RawEvent`].
+    /// Clones a borrowed [`RawEvent`] into an owned [`EventRecord`].
+    ///
+    /// # Arguments
+    ///
+    /// * `raw` - Zero-copy view of the active `EVENT_RECORD`.
+    ///
+    /// # Returns
+    ///
+    /// An owned [`EventRecord`] with heap-allocated `user_data` and `stack_trace`.
     #[inline]
     pub fn from_raw_event(raw: &RawEvent) -> Self {
         Self {
@@ -75,19 +94,27 @@ impl EventRecord {
         }
     }
 
-    /// Constructs a safe, owned `EventRecord` by copying data from a raw ETW `EVENT_RECORD` pointer.
+    /// Constructs a safe, owned [`EventRecord`] by copying data from a raw Win32 `EVENT_RECORD` pointer.
+    ///
+    /// # Arguments
+    ///
+    /// * `raw_record` - Raw pointer provided by the Win32 `ProcessTrace` callback.
+    ///
+    /// # Returns
+    ///
+    /// `None` if `raw_record` is null; otherwise `Some(EventRecord)`.
     ///
     /// # Safety
     ///
-    /// The `raw_record` pointer must be a valid, readable pointer to an `EVENT_RECORD`
-    /// provided by the Win32 `ProcessTrace` callback.
+    /// If `raw_record` is non-null, it must point to a valid, readable `EVENT_RECORD` whose
+    /// `UserData` and `ExtendedData` buffers are valid for the duration of this call.
     #[inline]
     pub unsafe fn from_raw(raw_record: *const EVENT_RECORD) -> Option<Self> {
         let raw = unsafe { RawEvent::from_ptr(raw_record) }?;
         Some(Self::from_raw_event(raw))
     }
 
-    /// Returns the host pointer size (`4` or `8` bytes) for this record.
+    /// Returns the host pointer byte width (`4` or `8` bytes) for this record.
     #[inline(always)]
     pub const fn pointer_size(&self) -> usize {
         std::mem::size_of::<usize>()

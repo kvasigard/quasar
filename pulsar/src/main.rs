@@ -1,4 +1,24 @@
-//! Pulsar EDR Agent - Main entry point and orchestration.
+//! Pulsar EDR Agent — Main entry point, CLI parsing, and runtime lifecycle orchestration.
+//!
+//! # Startup & Shutdown Orchestration
+//!
+//! 1. **Driver & PPL Bootstrap (`init_driver_and_ppl`):** Installs/starts the Singularity KMDF
+//!    driver via SCM and elevates the user-mode agent process to `PPL-Antimalware` (unless
+//!    `--skip-driver` is passed).
+//! 2. **Rule Engine & Hot-Reload (`RuleEngine`):** Compiles `.rhai` rules from `--rules-dir` and
+//!    spawns a filesystem watcher thread.
+//! 3. **Priority-Split Pipeline (`setup_event_pipeline`):** Allocates the high-priority `state_tx`
+//!    (`16,384` capacity) and standard `telemetry_tx` (`50,000` capacity) channels, registers
+//!    `ProcessContextSink` before `DetectionSink` on [`EventDispatcher`], and spawns the
+//!    `pulsar-dispatcher` worker thread.
+//! 4. **System Logger V2 Session (`start_kernel_session`):** Configures [`KernelSessionBuilder`]
+//!    via [`SessionDirector`] (with syscall tracing **disabled by default** unless `--enable-syscalls`
+//!    is passed), starts the kernel trace session, and spawns the zero-copy consumer worker via
+//!    [`EtwSession::consume_with_router`].
+//! 5. **Deterministic Teardown (`teardown_session`):** On `Ctrl+C`, stops the ETW session in the
+//!    kernel (`ControlTraceW`), closes the `OpenTraceW` handle via [`ConsumerHandle::stop_and_join`],
+//!    logs final [`ConsumerMetricsSnapshot`](pulsar::sensors::etw::ConsumerMetricsSnapshot) counters,
+//!    and joins all worker threads.
 
 use std::sync::mpsc;
 use std::sync::{
@@ -14,7 +34,7 @@ use pulsar::sensors::driver::DriverSensor;
 use pulsar::sensors::etw::director::{KernelTraceConfig, SessionDirector};
 use pulsar::sensors::etw::{ConsumerHandle, EtwSession, KernelSession, KernelSessionBuilder};
 
-/// Pulsar Endpoint Detection and Response (EDR) Telemetry Agent.
+/// Command-line configuration for the Pulsar Endpoint Detection and Response (EDR) agent.
 #[derive(Parser, Debug)]
 #[command(
     name = "pulsar",
@@ -37,7 +57,7 @@ pub struct Cli {
     )]
     pub enable_syscalls: bool,
 
-    /// Backwards-compatible flag to force-disable syscall tracing.
+    /// Backwards-compatible hidden flag to force-disable syscall tracing.
     #[arg(long, hide = true)]
     pub disable_syscalls: bool,
 
@@ -52,7 +72,7 @@ pub struct Cli {
     )]
     pub skip_driver: bool,
 
-    /// Custom directory containing Rhai detection and suppression rules (defaults to './rules').
+    /// Custom directory containing Rhai detection and suppression rules (defaults to `./rules`).
     #[arg(long, default_value = "./rules", help = "Path to Rhai rules directory")]
     pub rules_dir: std::path::PathBuf,
 
@@ -82,7 +102,8 @@ fn init_driver_and_ppl(
     }
 }
 
-/// Initializes the priority-split telemetry ingestion channels and starts the event dispatcher thread.
+/// Initializes the priority-split telemetry ingestion channels, registers context and detection
+/// sinks, and spawns the background [`EventDispatcher`] worker thread.
 fn setup_event_pipeline(
     enable_syscalls: bool,
     enable_context: bool,
@@ -90,7 +111,8 @@ fn setup_event_pipeline(
     rule_engine: Option<Arc<pulsar::rules::RuleEngine>>,
     shutdown_flag: Arc<AtomicBool>,
 ) -> (PipelineEventRouter, JoinHandle<()>) {
-    // High-priority channel for process/image/thread state updates, and standard channel for stack-correlated telemetry.
+    // Dedicated high-priority channel for process/image/thread state updates, separated from
+    // the high-volume telemetry channel so process creation events are never starved.
     let (state_tx, state_rx) = mpsc::sync_channel::<Event>(16_384);
     let (telemetry_tx, telemetry_rx) = mpsc::sync_channel::<TelemetryEnvelope>(50_000);
 
@@ -99,7 +121,8 @@ fn setup_event_pipeline(
         dispatcher = dispatcher.with_driver_receiver(drx);
     }
 
-    // Register analytical sinks
+    // Register `ProcessContextSink` BEFORE `DetectionSink` so in-memory process state is
+    // updated prior to rule evaluation for every dispatched event.
     dispatcher.add_listener(Box::new(pulsar::sinks::ProcessContextSink::new(
         rule_engine.clone(),
     )));
@@ -131,7 +154,8 @@ fn setup_event_pipeline(
     (router, dispatcher_handle)
 }
 
-/// Configures and starts the System Logger V2 ETW session, returning the active session and consumer handle.
+/// Configures and starts the System Logger V2 ETW session, returning the active [`KernelSession`]
+/// and its background [`ConsumerHandle`].
 fn start_kernel_session(
     enable_syscalls: bool,
     enable_context: bool,
@@ -158,7 +182,7 @@ fn start_kernel_session(
     Ok((kernel_session, consumer_handle))
 }
 
-/// Registers the Ctrl+C signal handler and blocks the main thread until interruption is received.
+/// Registers the `Ctrl+C` signal handler and blocks the main thread until an interrupt signal arrives.
 fn wait_for_shutdown(shutdown_flag: Arc<AtomicBool>) {
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     let ctrlc_flag = Arc::clone(&shutdown_flag);
@@ -173,7 +197,8 @@ fn wait_for_shutdown(shutdown_flag: Arc<AtomicBool>) {
     let _ = shutdown_rx.recv();
 }
 
-/// Gracefully stops the ETW kernel trace session, driver sensor, and joins background worker threads.
+/// Gracefully stops the ETW kernel trace session, closes the consumer trace handle, logs
+/// telemetry health metrics, and joins all background worker threads.
 fn teardown_session(
     mut kernel_session: KernelSession,
     consumer_handle: ConsumerHandle,
@@ -183,23 +208,16 @@ fn teardown_session(
 ) {
     log::info!("Initiating graceful shutdown sequence...");
 
-    // Stop the ETW trace session first, then close the consumer trace handle and join
+    // 1. Stop the kernel trace session first (`ControlTraceW(..., EVENT_TRACE_CONTROL_STOP)`)
+    //    so the OS flushes any partial buffers and stops producing new events.
     if let Err(e) = kernel_session.stop() {
         log::error!("Failed to stop ETW kernel session: {}", e);
     }
 
-    let metrics = consumer_handle.metrics_snapshot();
+    // 2. Unblock `ProcessTrace` via `CloseTrace`, join the consumer thread, and log final metrics.
     if let Err(etw_err) = consumer_handle.stop_and_join() {
         log::error!("ETW consumer thread exited with error: {etw_err}");
     }
-    log::info!(
-        "ETW consumer metrics: received={}, dispatched={}, filtered_out={}, dropped_full={}, parse_errors={}",
-        metrics.events_received,
-        metrics.events_dispatched,
-        metrics.events_filtered_out,
-        metrics.events_dropped_channel_full,
-        metrics.parse_errors
-    );
 
     if let Some(sensor_handle) = driver_sensor_handle
         && let Err(e) = sensor_handle.join()
@@ -329,12 +347,23 @@ fn run(cli: Cli) -> Result<(), AppError> {
 
     wait_for_shutdown(shutdown_flag);
 
+    let final_metrics = Arc::clone(consumer_handle.metrics());
     teardown_session(
         kernel_session,
         consumer_handle,
         dispatcher_handle,
         driver_sensor_handle,
         rule_watcher_handle,
+    );
+    let snap = final_metrics.snapshot();
+    log::info!(
+        "ETW consumer metrics: received={}, dispatched={}, filtered_out={}, dropped_full={}, parse_errors={}, buffers={}",
+        snap.events_received,
+        snap.events_dispatched,
+        snap.events_filtered_out,
+        snap.events_dropped_channel_full,
+        snap.parse_errors,
+        snap.buffers_processed
     );
 
     drop(driver_client);

@@ -1,12 +1,20 @@
-//! Call stack correlator for pairing asynchronous ETW `StackWalk` events emitted by the NT Kernel Logger
-//! with their triggering domain events.
+//! Asynchronous call-stack correlator pairing out-of-band kernel `StackWalk` events with their
+//! triggering domain events.
 //!
-//! Because the NT Kernel Logger emits stack traces as separate out-of-band events, they must be correlated.
-//! This correlation is achieved by matching the triggering event's timestamp with the `EventTimeStamp`
-//! in the stack walk payload.
+//! # Why Out-of-Band Stack Correlation Is Required
 //!
-//! Manifest-based and TraceLogging ETW providers attach call stacks directly inside `RawEvent` / `EventRecord`
-//! extended data and do not require external correlation.
+//! Unlike user-mode manifest providers—which attach call stacks inline inside `EVENT_RECORD.ExtendedData`
+//! (`STACK_TRACE64` / `STACK_TRACE32`)—the Windows System Logger / NT Kernel Logger emits call
+//! stacks as separate out-of-band `StackWalk_TypeGroup1` (Opcode 32) events immediately after
+//! the triggering kernel event (e.g., `SysCallEnter`).
+//!
+//! Because multi-processor ETW buffers can occasionally deliver the `StackWalk` event slightly
+//! before or after its trigger event, [`CallStackCorrelator`] maintains bounded bidirectional
+//! pools (`pending_triggers` and `pending_stacks`) keyed by the composite tuple
+//! `(EventTimeStamp, ProcessId, ThreadId)` (`CorrelationKey`).
+//!
+//! Including both `ProcessId` and `ThreadId` alongside `EventTimeStamp` prevents cross-core
+//! timestamp collisions when two logical processors log events on the same QPC tick.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -16,39 +24,56 @@ use crate::pipeline::Event;
 use crate::pipeline::etw_schemas::nt_kernel::stack_walk::{StackWalk_TypeGroup1, StackWalkEvent};
 use crate::sensors::etw::EventRecord;
 
-/// Maximum number of unassociated items kept before evicting expired entries.
+/// Maximum number of unmatched trigger or stack entries held in memory before age-based eviction runs.
 const DEFAULT_MAX_PENDING: usize = 5_000;
 
-/// Maximum time an event waits for a stack walk before being emitted without a stack.
+/// Maximum wall-clock duration a trigger event waits for its `StackWalk` before being emitted without a stack.
 const DEFAULT_MAX_AGE: Duration = Duration::from_millis(50);
 
+/// Buffered trigger event awaiting its matching out-of-band `StackWalkEvent`.
 struct PendingTrigger {
+    /// Decoded domain event waiting for its `stack_trace` field to be populated.
     event: Event,
+    /// Host `Instant` when this trigger entered the correlation table.
     inserted_at: Instant,
 }
 
+/// Buffered out-of-band `StackTrace` that arrived ahead of its triggering event.
 struct PendingStack {
+    /// Extracted call stack frames.
     stack_trace: StackTrace,
+    /// Host `Instant` when this stack entered the correlation table.
     inserted_at: Instant,
 }
 
-/// Composite key `(EventTimeStamp, ProcessId, ThreadId)` uniquely identifying a thread's
-/// kernel event across concurrent logical processors.
+/// Composite correlation key `(EventTimeStamp, ProcessId, ThreadId)` uniquely identifying a
+/// thread's kernel event across concurrent logical processors.
 type CorrelationKey = (u64, u32, u32);
 
-/// Correlates asynchronous ETW StackWalk records with triggering domain events.
+/// Stateful correlator pairing asynchronous kernel `StackWalk` events with triggering [`Event`]s.
 ///
-/// Designed for the NT Kernel Logger where stack walking is emitted as an out-of-band event
-/// with a matching `(EventTimeStamp, StackProcess, StackThread)` tuple.
+/// # State & Eviction Invariants
+///
+/// * **No Silent Trigger Drops:** When [`Self::flush_expired`] is called periodically by
+///   [`EventDispatcher`](super::EventDispatcher), any trigger event older than `max_age` (`50ms`)
+///   is returned to the caller and dispatched *without* a stack trace rather than being silently
+///   discarded.
+/// * **Bounded Memory:** Both `pending_triggers` and `pending_stacks` are capped at `max_pending`
+///   (`5,000` entries) so an unmatched stream of `StackWalk` events can never cause unbounded
+///   heap growth.
 pub struct CallStackCorrelator {
+    /// Trigger events waiting for a matching `StackWalkEvent`.
     pending_triggers: HashMap<CorrelationKey, PendingTrigger>,
+    /// Out-of-order `StackWalkEvent`s waiting for their triggering event.
     pending_stacks: HashMap<CorrelationKey, PendingStack>,
+    /// Maximum table capacity before age-based eviction is enforced.
     max_pending: usize,
+    /// Maximum retention window (`50ms` default) before a pending item is considered expired.
     max_age: Duration,
 }
 
 impl CallStackCorrelator {
-    /// Creates a new `CallStackCorrelator` with default capacity and eviction settings.
+    /// Creates a new [`CallStackCorrelator`] with default capacity (`5,000`) and eviction age (`50ms`).
     pub fn new() -> Self {
         Self {
             pending_triggers: HashMap::with_capacity(1024),
@@ -60,9 +85,9 @@ impl CallStackCorrelator {
 
     /// Processes a pre-decoded [`StackWalkEvent`] (Opcode 32).
     ///
-    /// If the corresponding trigger event has already been buffered, the stack trace is attached
-    /// and the completed `Event` is returned immediately. Otherwise, the stack trace is stored
-    /// in the pending stack pool awaiting the trigger event.
+    /// If the corresponding trigger event is already waiting in `pending_triggers`, its stack
+    /// trace is attached and the completed [`Event`] is returned immediately. Otherwise, the
+    /// stack trace is buffered in `pending_stacks` in case the trigger arrives out-of-order.
     pub fn process_stack_walk_event(&mut self, sw: StackWalkEvent) -> Option<Event> {
         let key: CorrelationKey = (sw.event_timestamp, sw.process_id, sw.thread_id);
 
@@ -84,7 +109,7 @@ impl CallStackCorrelator {
         None
     }
 
-    /// Processes an incoming raw `StackWalk` event record (Opcode 32).
+    /// Decodes and processes an incoming owned `StackWalk` [`EventRecord`] (Opcode 32).
     pub fn process_stack_walk(&mut self, record: &EventRecord) -> Option<Event> {
         let dto = StackWalk_TypeGroup1::try_from(record.user_data.as_slice()).ok()?;
         self.process_stack_walk_event(StackWalkEvent {
@@ -95,10 +120,12 @@ impl CallStackCorrelator {
         })
     }
 
-    /// Processes an event that expects an asynchronous stack trace from the kernel.
+    /// Processes a domain [`Event`] that may expect an asynchronous stack trace from the kernel.
     ///
-    /// If the matching stack trace has already arrived out-of-order, it is attached immediately
-    /// and returned. Otherwise, the trigger event is buffered awaiting the `StackWalk` record.
+    /// * When `is_async_stack_traced` is `false`, returns `Some(event)` immediately with zero buffering.
+    /// * When `is_async_stack_traced` is `true` and a matching stack already arrived in
+    ///   `pending_stacks`, attaches the stack and returns `Some(event)` immediately.
+    /// * Otherwise, buffers `event` in `pending_triggers` and returns `None`.
     pub fn process_trigger(
         &mut self,
         mut event: Event,
@@ -142,8 +169,8 @@ impl CallStackCorrelator {
 
     /// Scans the pending pools and evicts entries that have exceeded `max_age`.
     ///
-    /// Trigger events that timed out without receiving a stack walk are returned so they can be
-    /// forwarded to listeners without a stack trace, preventing event loss.
+    /// Trigger events that timed out without receiving a `StackWalk` are returned so the
+    /// dispatcher can still forward them to detection sinks without a stack trace.
     pub fn flush_expired(&mut self) -> Vec<Event> {
         let now = Instant::now();
         let mut expired_events = Vec::new();
@@ -163,13 +190,14 @@ impl CallStackCorrelator {
         expired_events
     }
 
-    /// Returns `true` if there are currently no pending trigger events awaiting stack correlation.
+    /// Returns `true` if both `pending_triggers` and `pending_stacks` are empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.pending_triggers.is_empty() && self.pending_stacks.is_empty()
     }
 
-    /// Purges expired orphan stacks when `pending_stacks` exceeds capacity without dropping pending triggers.
+    /// Purges expired orphan stacks when `pending_stacks` exceeds `max_pending` without
+    /// dropping any pending trigger events.
     fn evict_stale_stacks(&mut self) {
         if self.pending_stacks.len() > self.max_pending {
             let now = Instant::now();

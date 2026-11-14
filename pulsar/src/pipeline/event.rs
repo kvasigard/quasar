@@ -1,7 +1,8 @@
-//! Unified pipeline event definitions, decoding, and dispatching.
+//! Unified pipeline event definitions, zero-copy decoding, and metadata accessors.
 //!
-//! This module defines the central [`Event`] enum representing all normalized telemetry
-//! flowing through the Pulsar analytics engine.
+//! [`Event`] is the normalized domain sum type flowing from [`PipelineEventRouter`](super::PipelineEventRouter)
+//! and [`DriverSensor`](crate::sensors::driver::DriverSensor) into [`EventDispatcher`](super::EventDispatcher)
+//! and all registered [`EventListener`](super::EventListener) sinks.
 
 use shared::ring_buffer::LsassAccessEvent;
 
@@ -10,21 +11,27 @@ use crate::model::types::StackTrace;
 use crate::pipeline::constants::*;
 use crate::sensors::etw::{EventRecord, RawEvent};
 
-/// Strongly-typed domain events flowing through the analytics pipeline.
+/// Normalized domain event flowing through the Pulsar analytics pipeline.
+///
+/// Each variant represents a distinct security telemetry class originating either from
+/// Windows ETW ([`Event::Process`], [`Event::Syscall`]) or from the Singularity kernel
+/// driver's per-CPU ring buffer ([`Event::LsassAccess`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// Process lifecycle change or telemetry event.
+    /// Process creation, termination, or rundown snapshot event (`PERF_PROCESS`).
     Process(ProcessEvent),
 
-    /// Kernel system call execution event.
+    /// Kernel system call entry event (`PERF_SYSCALL` / `SysCallEnter`, Opcode 51).
     Syscall(SyscallEvent),
 
-    /// Pre-operation handle creation or duplication targeting `lsass.exe` intercepted by kernel driver callbacks.
+    /// Pre-operation handle creation or duplication targeting `lsass.exe` intercepted by
+    /// the Singularity kernel driver (`ObRegisterCallbacks`).
     LsassAccess(LsassAccessEvent),
 }
 
 impl Event {
-    /// Returns the timestamp of this domain event.
+    /// Returns the raw timestamp (QPC ticks) of this domain event, or `0` for driver events
+    /// that do not carry an ETW header timestamp.
     pub fn timestamp(&self) -> i64 {
         match self {
             Event::Process(e) => e.timestamp,
@@ -33,7 +40,7 @@ impl Event {
         }
     }
 
-    /// Returns the OS process identifier associated with this event.
+    /// Returns the OS Process ID (PID) that emitted or initiated this event.
     pub fn process_id(&self) -> u32 {
         match self {
             Event::Process(e) => e.emitter_pid.0,
@@ -42,7 +49,7 @@ impl Event {
         }
     }
 
-    /// Returns the OS thread identifier associated with this event.
+    /// Returns the OS Thread ID (TID) that emitted or initiated this event.
     pub fn thread_id(&self) -> u32 {
         match self {
             Event::Process(e) => e.emitter_tid,
@@ -51,7 +58,7 @@ impl Event {
         }
     }
 
-    /// Attaches or updates the call stack trace for this domain event.
+    /// Attaches a correlated [`StackTrace`] to this domain event.
     pub fn attach_stack_trace(&mut self, stack_trace: StackTrace) {
         match self {
             Event::Process(e) => e.stack_trace = Some(stack_trace),
@@ -61,7 +68,12 @@ impl Event {
     }
 
     /// Decodes a borrowed [`RawEvent`] directly into a domain [`Event`] with zero intermediate
-    /// `Vec<u8>` allocation, returning `Some((Event, requires_async_stack))`.
+    /// `Vec<u8>` allocation.
+    ///
+    /// # Returns
+    ///
+    /// `Some((event, requires_async_stack))` if the event's provider GUID, opcode, and payload
+    /// schema are valid; `None` otherwise.
     pub fn from_raw_event(event: &RawEvent) -> Option<(Self, bool)> {
         let provider_id = event.provider_id();
         let opcode = event.opcode();
@@ -95,8 +107,8 @@ impl Event {
         None
     }
 
-    /// Attempts to decode an owned [`EventRecord`] into a domain [`Event`] and indicates
-    /// whether the event requires asynchronous kernel stack trace correlation.
+    /// Decodes an owned [`EventRecord`] into a domain [`Event`] and indicates whether the
+    /// event requires asynchronous kernel `StackWalk` correlation.
     pub fn from_record(record: &EventRecord) -> Option<(Self, bool)> {
         let is_process_provider = guid_matches(&record.provider_id, &NT_KERNEL_PROCESS_GUID)
             || guid_matches(&record.provider_id, &MANIFEST_KERNEL_PROCESS_GUID);

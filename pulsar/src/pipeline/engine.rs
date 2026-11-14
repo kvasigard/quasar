@@ -1,8 +1,12 @@
-//! Synchronous telemetry processing and stack correlation engine.
+//! Synchronous telemetry processing and stack correlation engine (`Pipeline`).
 //!
-//! This module provides the [`Pipeline`] processing engine responsible for ingesting
-//! decoded [`TelemetryEnvelope`]s (or raw ETW records) and correlating out-of-band kernel
-//! stack walk events via [`CallStackCorrelator`].
+//! # Role in the Architecture
+//!
+//! [`Pipeline`] wraps [`CallStackCorrelator`] and provides three ingestion entry points:
+//! - [`Pipeline::feed_envelope`]: Primary zero-copy path driven by [`EventDispatcher`](super::EventDispatcher)
+//!   for pre-decoded [`TelemetryEnvelope`] items emitted by [`PipelineEventRouter`](super::PipelineEventRouter).
+//! - [`Pipeline::feed_raw`]: Direct zero-copy `&RawEvent` ingestion for single-threaded or inline consumers.
+//! - [`Pipeline::feed`]: Owned `&EventRecord` ingestion for standalone unit tests.
 
 use crate::pipeline::call_stack_correlator::CallStackCorrelator;
 use crate::pipeline::constants::{NT_KERNEL_STACK_WALK_GUID, guid_matches, stack_walk_opcodes};
@@ -11,8 +15,9 @@ use crate::pipeline::event::Event;
 use crate::pipeline::router::TelemetryEnvelope;
 use crate::sensors::etw::{EventRecord, RawEvent};
 
-/// Synchronous telemetry ingestion and stack correlation engine.
+/// Synchronous telemetry correlation engine pairing trigger events with out-of-band kernel stack walks.
 pub struct Pipeline {
+    /// Stateful correlator matching `(EventTimeStamp, ProcessId, ThreadId)` tuples.
     correlator: CallStackCorrelator,
 }
 
@@ -23,7 +28,7 @@ impl Default for Pipeline {
 }
 
 impl Pipeline {
-    /// Creates a new `Pipeline` with default correlation settings.
+    /// Creates a new [`Pipeline`] with default [`CallStackCorrelator`] capacity and timeout settings.
     pub fn new() -> Self {
         Self {
             correlator: CallStackCorrelator::new(),
@@ -32,6 +37,11 @@ impl Pipeline {
 
     /// Feeds a pre-decoded [`TelemetryEnvelope`] from [`PipelineEventRouter`](crate::pipeline::PipelineEventRouter)
     /// into the stack correlator without any `Vec<u8>` re-parsing.
+    ///
+    /// # Returns
+    ///
+    /// `Some(Event)` when an event does not require async stack correlation or has just been
+    /// paired with its matching `StackWalkEvent`; `None` when buffered awaiting correlation.
     #[inline]
     pub fn feed_envelope(&mut self, envelope: TelemetryEnvelope) -> Option<Event> {
         match envelope {
@@ -43,7 +53,7 @@ impl Pipeline {
         }
     }
 
-    /// Feeds a borrowed zero-copy [`RawEvent`] directly into the pipeline.
+    /// Decodes and feeds a borrowed zero-copy [`RawEvent`] directly into the pipeline.
     #[inline]
     pub fn feed_raw(&mut self, event: &RawEvent) -> Option<Event> {
         if guid_matches(event.provider_id(), &NT_KERNEL_STACK_WALK_GUID)
@@ -58,7 +68,7 @@ impl Pipeline {
             .process_trigger(domain_event, requires_async_stack)
     }
 
-    /// Feeds an owned [`EventRecord`] into the pipeline.
+    /// Decodes and feeds an owned [`EventRecord`] into the pipeline.
     pub fn feed(&mut self, record: &EventRecord) -> Option<Event> {
         if guid_matches(&record.provider_id, &NT_KERNEL_STACK_WALK_GUID)
             && record.opcode == stack_walk_opcodes::STACK_WALK
@@ -71,13 +81,13 @@ impl Pipeline {
         self.correlator.process_trigger(event, needs_async_stack)
     }
 
-    /// Returns `true` if no events are currently buffered awaiting stack correlation.
+    /// Returns `true` if no events or orphan stack traces are currently buffered awaiting correlation.
     #[inline]
     pub fn is_correlator_empty(&self) -> bool {
         self.correlator.is_empty()
     }
 
-    /// Flushes and returns any buffered trigger events that timed out waiting for an async stack trace.
+    /// Flushes and returns any buffered trigger events that exceeded the stack-correlation timeout.
     pub fn flush_expired(&mut self) -> Vec<Event> {
         self.correlator.flush_expired()
     }

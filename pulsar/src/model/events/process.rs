@@ -1,8 +1,16 @@
-//! This file contains strongly-typed domain event types derived from the NT Kernel Logger
-//! ETW provider.
+//! Strongly-typed domain event types for kernel process lifecycle telemetry (`ProcessEvent`).
 //!
-//! Reference documentation:
-//! <https://learn.microsoft.com/en-us/windows/win32/etw/process-v2>
+//! # Role in the Architecture
+//!
+//! [`ProcessEvent`] normalizes versioned kernel MOF DTOs (`Process_V0..V4_TypeGroup1`) into a
+//! single version-independent domain representation consumed by [`ProcessContextSink`](crate::sinks::ProcessContextSink)
+//! and [`DetectionSink`](crate::sinks::DetectionSink).
+//!
+//! Supports zero-copy decoding directly from `&RawEvent` (via `TryFrom<&RawEvent>`) inside
+//! [`PipelineEventRouter`](crate::pipeline::PipelineEventRouter), as well as decoding from an
+//! owned [`EventRecord`] in tests.
+//!
+//! Reference: <https://learn.microsoft.com/en-us/windows/win32/etw/process-v2>
 
 use std::fmt;
 use thiserror::Error;
@@ -15,52 +23,56 @@ use crate::pipeline::etw_schemas::nt_kernel::process::{
 };
 use crate::sensors::etw::{EventRecord, RawEvent};
 
-/// Domain-level error encountered while parsing and validating process events.
+/// Domain-level error encountered while parsing and validating process lifecycle events.
 #[derive(Debug, Error)]
 pub enum ProcessModelError {
+    /// The ETW event header carried an opcode other than `1`, `2`, `3`, `4`, or `39`.
     #[error("Unknown or unsupported ETW process opcode: {0}")]
     UnknownOpcode(u8),
 
+    /// The ETW event header specified an unsupported schema version.
     #[error("Unsupported schema version: {0}")]
     UnsupportedVersion(u8),
 
+    /// The underlying binary `UserData` payload failed DTO schema decoding.
     #[error("Process DTO parse error: {0}")]
     Dto(#[from] DtoProcessError),
 
+    /// The extracted binary `UserSID` slice could not be converted into a valid [`Sid`].
     #[error("Invalid SID: {0}")]
     InvalidSid(String),
 }
 
-/// Identifies the specific lifecycle or telemetry event emitted by the ETW provider.
+/// Identifies the specific lifecycle transition or rundown snapshot represented by a [`ProcessEvent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ProcessEventKind {
-    /// Emitted in real-time when a new process is created and begins execution (EventType 1).
+    /// Emitted in real-time when a new process is created and begins execution (`Opcode = 1`).
     Start = 1,
 
-    /// Emitted in real-time when an active process terminates execution (EventType 2).
-    /// Represents the point in time where all threads of the process have exited
-    /// and the process exit code has been recorded.
+    /// Emitted in real-time when an active process terminates execution (`Opcode = 2`).
+    ///
+    /// Represents the point in time where all threads of the process have exited and the
+    /// process exit status code has been recorded.
     End = 2,
 
-    /// Snapshot event representing a process that was already running when the
-    /// ETW trace began (EventType 3, Data Collection Start). Emitted during the initial
-    /// rundown phase to build a baseline of active processes.
+    /// Snapshot event representing a process that was already running when the ETW session
+    /// started (`Opcode = 3`, Data Collection Start).
+    ///
+    /// Emitted during the initial kernel rundown phase so [`ProcessContextSink`](crate::sinks::ProcessContextSink)
+    /// can populate the baseline process tree without calling `CreateToolhelp32Snapshot`.
     DCStart = 3,
 
-    /// Snapshot event representing a process that was still active when the
-    /// ETW trace stopped (EventType 4, Data Collection End). Distinguishes active processes
-    /// from those that cleanly terminated or crashed mid-trace.
+    /// Snapshot event representing a process that was still active when the ETW session
+    /// stopped (`Opcode = 4`, Data Collection End).
     DCEnd = 4,
 
-    /// Snapshot event representing a terminated process whose kernel object (`EPROCESS`)
-    /// still lingers in memory (EventType 39, Defunct). Emitted during rundown for
-    /// "zombie" processes holding unclosed handles.
+    /// Snapshot event representing a terminated process whose kernel `_EPROCESS` object
+    /// still lingers in memory (`Opcode = 39`, Defunct) because another process holds an
+    /// unclosed handle to it.
     Defunct = 39,
 }
 
-/// Implement TryFrom trait as a helper to translate only the defined opcodes
-/// in ProcessEventKind and error on any other opcode.
 impl TryFrom<u8> for ProcessEventKind {
     type Error = ProcessModelError;
 
@@ -88,33 +100,41 @@ impl fmt::Display for ProcessEventKind {
     }
 }
 
-/// Unified domain event representing a process lifecycle change or telemetry record.
+/// Normalized domain event representing a process creation, termination, or rundown snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessEvent {
-    // Header & Event Ingestion Context
+    /// Raw QPC timestamp when the kernel logged the event (`EventHeader.TimeStamp`).
     pub timestamp: i64,
+    /// PID of the thread that logged the event (`EventHeader.ProcessId`, typically the creator/parent on `Start`).
     pub emitter_pid: ProcessId,
+    /// TID of the thread that logged the event (`EventHeader.ThreadId`).
     pub emitter_tid: u32,
+    /// Optional inline or correlated call stack frames.
     pub stack_trace: Option<StackTrace>,
+    /// Lifecycle transition kind (`Start`, `End`, `DCStart`, `DCEnd`, or `Defunct`).
     pub kind: ProcessEventKind,
 
-    // Process Hierarchy & Identification
-    /// Kernel address of the `EPROCESS` block.
+    /// Kernel address of the `_EPROCESS` structure (`UniqueProcessKey`).
     pub unique_process_key: UniqueProcessKey,
+    /// Target Process ID of the process being created, enumerated, or terminated.
     pub process_id: ProcessId,
+    /// Parent Process ID (`InheritedFromUniqueProcessId`).
     pub parent_id: ProcessId,
+    /// Terminal Services session ID under which the process runs.
     pub session_id: SessionId,
 
-    // Execution Outcome & Identity
-    /// Exit status is `None` for `Start` or `DCStart` event types,
-    /// and `Some` for `End` / `Defunct` event types.
+    /// Process exit status (`None` on `Start`/`DCStart`/`DCEnd`, `Some(ExitStatus)` on `End`/`Defunct`).
     pub exit_status: Option<ExitStatus>,
+    /// Security Identifier (`SID`) of the primary process token.
     pub user_sid: Sid,
+    /// Short executable file name from `_EPROCESS.ImageFileName` (e.g., `"svchost.exe"`).
     pub image_file_name: String,
+    /// Full process command line decoded from UTF-16LE (empty on legacy V0/V1 schemas).
     pub command_line: String,
 }
 
 impl ProcessEvent {
+    /// Constructs a [`ProcessEvent`] from a decoded Version 3 / Version 4+ DTO.
     #[inline]
     fn build_from_v3(
         timestamp: i64,
@@ -151,6 +171,7 @@ impl ProcessEvent {
         })
     }
 
+    /// Constructs a [`ProcessEvent`] from a decoded Version 2 DTO.
     #[inline]
     fn build_from_v2(
         timestamp: i64,
@@ -187,6 +208,7 @@ impl ProcessEvent {
         })
     }
 
+    /// Constructs a [`ProcessEvent`] from a decoded Version 1 DTO.
     #[inline]
     fn build_from_v1(
         timestamp: i64,
@@ -223,6 +245,7 @@ impl ProcessEvent {
         })
     }
 
+    /// Constructs a [`ProcessEvent`] from a decoded Version 0 DTO.
     #[inline]
     fn build_from_v0(
         timestamp: i64,

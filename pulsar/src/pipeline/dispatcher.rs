@@ -1,9 +1,20 @@
-//! Priority-aware event dispatcher distributing pipeline events to registered listeners.
+//! Priority-aware event dispatcher distributing pipeline events to registered analytical sinks.
 //!
-//! [`EventDispatcher`] enforces a strict three-tier priority draining order so that process
-//! state updates (`state_rx`) are always applied to `SystemState` / `ProcessTree` before
-//! kernel driver ring-buffer alerts (`driver_rx`) or high-volume telemetry (`telemetry_rx`)
-//! are evaluated by detection sinks.
+//! # Three-Tier Priority Draining Architecture
+//!
+//! [`EventDispatcher`] runs on a dedicated background thread (`pulsar-dispatcher`) and drains
+//! incoming event channels in a strict three-tier priority order on every iteration:
+//!
+//! 1. **Tier 1 (`state_rx` — Process Lifecycle State):** Drains up to `2048` high-priority
+//!    `Event::Process` events first. Because [`ProcessContextSink`](crate::sinks::ProcessContextSink)
+//!    is registered before [`DetectionSink`](crate::sinks::DetectionSink), draining `state_rx`
+//!    first guarantees that newly spawned processes are inserted into the in-memory process tree
+//!    before any alerts referencing their PID are evaluated.
+//! 2. **Tier 2 (`driver_rx` — Kernel Driver Ring Buffer):** Drains up to `512` events from the
+//!    Singularity kernel driver's per-CPU shared-memory ring buffer (e.g., `LsassAccessEvent`).
+//! 3. **Tier 3 (`telemetry_rx` — Correlated ETW Telemetry):** Drains up to `2048`
+//!    [`TelemetryEnvelope`] items through [`Pipeline::feed_envelope`], pairing trigger events
+//!    with out-of-band `StackWalk` frames and periodically flushing expired correlation entries.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,9 +30,36 @@ use crate::pipeline::event::Event;
 use crate::pipeline::router::TelemetryEnvelope;
 use crate::sensors::etw::EventRecord;
 
-/// The event listener contract defining strongly-typed domain event callbacks.
+/// Observer contract implemented by analytical and context-tracking sinks in the pipeline.
+///
+/// # Behavioral Contract & Ordering Invariants
+///
+/// * **Synchronous Fan-Out:** [`EventDispatcher`] invokes [`EventListener::on_event`] sequentially
+///   on each registered listener in registration order on the `pulsar-dispatcher` thread.
+/// * **Registration Order Matters:** Context-building listeners (such as
+///   [`ProcessContextSink`](crate::sinks::ProcessContextSink)) **must** be registered before
+///   detection listeners (such as [`DetectionSink`](crate::sinks::DetectionSink)) so that
+///   in-memory process/module state is updated before rules inspect it for the same event.
+///
+/// # Examples
+///
+/// ```
+/// use pulsar::model::events::ProcessEvent;
+/// use pulsar::pipeline::EventListener;
+///
+/// struct ProcessLogger;
+///
+/// impl EventListener for ProcessLogger {
+///     fn on_process(&self, event: &ProcessEvent) {
+///         println!("Process {}: {}", event.process_id.0, event.image_file_name);
+///     }
+/// }
+/// ```
 pub trait EventListener: Send + Sync {
-    /// Generic dispatch hook invoked for every domain event flowing through the pipeline.
+    /// Generic dispatch hook invoked for every normalized [`Event`] flowing through the dispatcher.
+    ///
+    /// By default, delegates to [`Self::on_process`], [`Self::on_syscall`], or
+    /// [`Self::on_lsass_access`] based on the [`Event`] variant.
     fn on_event(&self, event: &Event) {
         match event {
             Event::Process(process_event) => self.on_process(process_event),
@@ -30,35 +68,43 @@ pub trait EventListener: Send + Sync {
         }
     }
 
-    /// Called when a process lifecycle or rundown event occurs.
+    /// Invoked when a process creation, termination, or rundown [`ProcessEvent`] is dispatched.
     fn on_process(&self, _event: &ProcessEvent) {}
 
-    /// Called when a kernel system call execution event occurs.
+    /// Invoked when a kernel system call (`SysCallEnter`) [`SyscallEvent`] is dispatched.
     fn on_syscall(&self, _event: &SyscallEvent) {}
 
-    /// Called when an unauthorized or sensitive handle operation targeting `lsass.exe` is intercepted.
+    /// Invoked when a kernel driver `ObRegisterCallbacks` [`LsassAccessEvent`] is dispatched.
     fn on_lsass_access(&self, _event: &LsassAccessEvent) {}
 }
 
+/// Internal channel topology backing [`EventDispatcher`].
 enum EtwInput {
-    /// Priority-split zero-copy channels driven by [`PipelineEventRouter`](crate::pipeline::PipelineEventRouter).
+    /// Production zero-copy priority-split channels fed by [`PipelineEventRouter`](crate::pipeline::PipelineEventRouter).
     PrioritySplit {
+        /// High-priority channel carrying decoded state-building [`Event`]s.
         state_rx: Receiver<Event>,
+        /// Standard telemetry channel carrying [`TelemetryEnvelope`]s for stack correlation.
         telemetry_rx: Receiver<TelemetryEnvelope>,
     },
-    /// Legacy single-channel raw [`EventRecord`] receiver.
+    /// Single-channel raw [`EventRecord`] receiver used by standalone unit tests.
     RawRecords(Receiver<EventRecord>),
 }
 
-/// Central event dispatcher distributing ingested telemetry across registered analytics listeners.
+/// Central event dispatcher that drains priority-tiered telemetry channels, drives
+/// [`CallStackCorrelator`](crate::pipeline::CallStackCorrelator) via [`Pipeline`], and fans out
+/// completed [`Event`]s to registered [`EventListener`] sinks.
 pub struct EventDispatcher {
+    /// Primary ETW input channel topology (priority-split or legacy raw record channel).
     input: EtwInput,
+    /// Optional receiver for kernel driver ring-buffer alerts (`LsassAccessEvent`, etc.).
     driver_rx: Option<Receiver<Event>>,
+    /// Ordered list of analytical sinks notified for each dispatched [`Event`].
     listeners: Vec<Box<dyn EventListener>>,
 }
 
 impl EventDispatcher {
-    /// Creates a new `EventDispatcher` consuming from priority-split zero-copy channels
+    /// Creates a new [`EventDispatcher`] consuming from priority-split zero-copy channels
     /// (`state_rx` for high-priority `Process` state events, `telemetry_rx` for stack-correlated telemetry).
     pub fn with_priority_channels(
         state_rx: Receiver<Event>,
@@ -74,7 +120,7 @@ impl EventDispatcher {
         }
     }
 
-    /// Creates a new `EventDispatcher` consuming raw [`EventRecord`] items from a single channel.
+    /// Creates a new [`EventDispatcher`] consuming owned [`EventRecord`] items from a single channel.
     pub fn new(etw_rx: Receiver<EventRecord>) -> Self {
         Self {
             input: EtwInput::RawRecords(etw_rx),
@@ -83,18 +129,23 @@ impl EventDispatcher {
         }
     }
 
-    /// Attaches an auxiliary receiver for events originating from the kernel driver ring buffer sensor.
+    /// Attaches an auxiliary receiver for events originating from the kernel driver per-CPU ring-buffer sensor.
     pub fn with_driver_receiver(mut self, driver_rx: Receiver<Event>) -> Self {
         self.driver_rx = Some(driver_rx);
         self
     }
 
-    /// Registers a new event listener sink to receive dispatched events.
+    /// Registers an [`EventListener`] sink to receive dispatched events in registration order.
     pub fn add_listener(&mut self, listener: Box<dyn EventListener>) {
         self.listeners.push(listener);
     }
 
-    /// Launches the dispatch routing loop in a named background worker thread.
+    /// Consumes the dispatcher and launches its priority-draining loop on a dedicated
+    /// `pulsar-dispatcher` background thread until `shutdown_flag` is set or channels disconnect.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the OS fails to spawn the `pulsar-dispatcher` thread.
     pub fn start(self, shutdown_flag: Arc<AtomicBool>) -> JoinHandle<()> {
         thread::Builder::new()
             .name("pulsar-dispatcher".to_string())
@@ -102,6 +153,7 @@ impl EventDispatcher {
             .expect("Failed to spawn pulsar-dispatcher thread")
     }
 
+    /// Main priority-draining loop executed on the `pulsar-dispatcher` worker thread.
     fn run(self, shutdown_flag: Arc<AtomicBool>) {
         log::debug!(target: "dispatcher", "EventDispatcher background thread started.");
         let mut pipeline = Pipeline::new();
@@ -115,7 +167,8 @@ impl EventDispatcher {
                     state_rx,
                     telemetry_rx,
                 } => {
-                    // Tier 1: High-priority state events (Process::Start/DCStart/End)
+                    // Tier 1: Drain up to 2048 high-priority state events (`Process::Start/DCStart/End`)
+                    // first so the in-memory `ProcessTree` is always up to date before Tier 2/3 evaluation.
                     for _ in 0..2048 {
                         match state_rx.try_recv() {
                             Ok(event) => {
@@ -126,7 +179,7 @@ impl EventDispatcher {
                         }
                     }
 
-                    // Tier 2: Kernel driver ring-buffer alerts
+                    // Tier 2: Drain up to 512 kernel driver ring-buffer alerts.
                     if let Some(ref driver_rx) = self.driver_rx {
                         for _ in 0..512 {
                             match driver_rx.try_recv() {
@@ -139,7 +192,7 @@ impl EventDispatcher {
                         }
                     }
 
-                    // Tier 3: Stack-correlated telemetry and StackWalk events
+                    // Tier 3: Drain up to 2048 stack-correlated telemetry and `StackWalk` envelopes.
                     for _ in 0..2048 {
                         match telemetry_rx.try_recv() {
                             Ok(envelope) => {
@@ -152,6 +205,7 @@ impl EventDispatcher {
                         }
                     }
 
+                    // Periodically flush trigger events whose async `StackWalk` did not arrive within `max_age`.
                     if !pipeline.is_correlator_empty()
                         && last_flush.elapsed() >= Duration::from_millis(25)
                     {
@@ -161,6 +215,8 @@ impl EventDispatcher {
                         last_flush = Instant::now();
                     }
 
+                    // If all three tiers were empty, park briefly on `state_rx` (`5ms` timeout)
+                    // to avoid busy-spinning a CPU core during idle periods.
                     if !processed_any {
                         match state_rx.recv_timeout(Duration::from_millis(5)) {
                             Ok(event) => self.dispatch(&event),
@@ -232,7 +288,8 @@ impl EventDispatcher {
             }
         }
 
-        // Final sweep on shutdown so no queued state or driver events are lost
+        // Perform a final drain sweep on shutdown so no queued state, driver, or buffered
+        // correlator events are lost when the agent stops.
         match &self.input {
             EtwInput::PrioritySplit {
                 state_rx,
@@ -268,7 +325,7 @@ impl EventDispatcher {
         log::debug!(target: "dispatcher", "Event bus stopped by signal or disconnection. Dispatcher terminating.");
     }
 
-    /// Dispatches a fully assembled domain event to all registered listeners.
+    /// Fans out a normalized domain [`Event`] to all registered [`EventListener`]s in registration order.
     #[inline]
     fn dispatch(&self, event: &Event) {
         for listener in &self.listeners {

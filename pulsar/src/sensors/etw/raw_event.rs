@@ -1,9 +1,23 @@
 //! Zero-copy view over a raw Win32 `EVENT_RECORD` and its extended data items.
 //!
-//! [`RawEvent`] is a `#[repr(transparent)]` wrapper around [`EVENT_RECORD`] that allows
-//! the ETW consumer callback and schema decoders to inspect headers, determine 32-bit vs.
-//! 64-bit pointer sizes, slice `UserData`, and iterate `ExtendedData` without any heap
-//! allocation.
+//! # Responsibility & Data Flow
+//!
+//! When Windows delivers ETW events via `ProcessTrace`, it invokes the registered
+//! `EventRecordCallback` with a transient `*mut EVENT_RECORD` pointer backed by the ETW
+//! consumer thread's current ring-buffer page.
+//!
+//! Copying `UserData` into a heap-allocated `Vec<u8>` on every callback invocation—before
+//! even checking whether the event's opcode or PID is relevant—creates severe allocator
+//! pressure under high-throughput kernel telemetry.
+//!
+//! [`RawEvent`] eliminates that overhead via a `#[repr(transparent)]` wrapper around
+//! [`EVENT_RECORD`]. It provides safe, zero-cost accessors for header metadata, dynamic
+//! 32-bit vs. 64-bit pointer width detection (`EVENT_HEADER_FLAG_32_BIT_HEADER`), borrowed
+//! `UserData` byte slices, and `ExtendedData` items (`STACK_TRACE64`, `STACK_TRACE32`,
+//! `PROCESS_START_KEY`, and `SID`).
+//!
+//! For unit and integration tests outside of a live `ProcessTrace` session, [`SyntheticEvent`]
+//! owns pinned backing buffers and dereferences directly to [`RawEvent`].
 
 use std::ffi::c_void;
 use std::fmt;
@@ -20,98 +34,134 @@ use windows_sys::core::GUID;
 
 use crate::helpers::format_guid;
 
-/// Zero-copy, `#[repr(transparent)]` wrapper over a Win32 [`EVENT_RECORD`].
+/// Zero-copy, `#[repr(transparent)]` view over a Win32 [`EVENT_RECORD`].
 ///
-/// A `&RawEvent` is valid for the duration of the `ProcessTrace` [`EventRecordCallback`]
-/// invocation (or for the lifetime of a [`SyntheticEvent`] in tests).
+/// # Ownership & Lifetime Invariants
+///
+/// `RawEvent` is never constructed by value on the stack in production code; it is always
+/// borrowed as `&'a RawEvent` via [`RawEvent::from_ptr`] or [`RawEvent::from_ref`].
+///
+/// * **In-callback lifetime:** Inside `ProcessTrace`, the underlying `EVENT_RECORD`, its
+///   `UserData` byte buffer, and its `ExtendedData` array are owned by the OS trace buffer
+///   and remain valid strictly for the duration of the synchronous callback invocation.
+/// * **Layout guarantee:** Because `RawEvent` is `#[repr(transparent)]` over `EVENT_RECORD`,
+///   casting `*const EVENT_RECORD` to `*const RawEvent` is a zero-cost pointer reinterpretation.
 #[repr(transparent)]
 pub struct RawEvent(EVENT_RECORD);
 
 impl RawEvent {
     /// Safely constructs a borrowed [`RawEvent`] reference from a raw [`EVENT_RECORD`] pointer.
     ///
+    /// # Arguments
+    ///
+    /// * `ptr` - Raw pointer supplied by the Win32 `EventRecordCallback`.
+    ///
+    /// # Returns
+    ///
+    /// `None` if `ptr` is null; otherwise `Some(&'a RawEvent)` bound to lifetime `'a`.
+    ///
     /// # Safety
     ///
     /// If `ptr` is non-null, it must point to a valid, initialized [`EVENT_RECORD`] whose
-    /// `UserData` and `ExtendedData` buffers remain valid for lifetime `'a`.
+    /// `UserData` (for `UserDataLength` bytes) and `ExtendedData` (for `ExtendedDataCount`
+    /// items) remain valid and unmutated for the entirety of lifetime `'a`.
     #[inline(always)]
     pub unsafe fn from_ptr<'a>(ptr: *const EVENT_RECORD) -> Option<&'a Self> {
         if ptr.is_null() {
             None
         } else {
-            // SAFETY: `RawEvent` is `#[repr(transparent)]` over `EVENT_RECORD` and `ptr` is non-null.
+            // SAFETY: `RawEvent` is `#[repr(transparent)]` over `EVENT_RECORD` and `ptr` has
+            // been verified non-null; the caller guarantees pointee validity for `'a`.
             Some(unsafe { &*(ptr as *const Self) })
         }
     }
 
-    /// Wraps an existing [`EVENT_RECORD`] reference as a [`RawEvent`] at zero cost.
+    /// Reinterprets an existing [`EVENT_RECORD`] reference as a [`RawEvent`] reference at zero cost.
+    ///
+    /// # Arguments
+    ///
+    /// * `record` - Shared reference to an initialized [`EVENT_RECORD`].
+    ///
+    /// # Returns
+    ///
+    /// A borrowed [`RawEvent`] tied to the lifetime of `record`.
     #[inline(always)]
     pub const fn from_ref(record: &EVENT_RECORD) -> &Self {
-        // SAFETY: `RawEvent` is `#[repr(transparent)]` over `EVENT_RECORD`.
+        // SAFETY: `RawEvent` is `#[repr(transparent)]` over `EVENT_RECORD`, so both types
+        // have identical size, alignment, and memory layout.
         unsafe { &*(record as *const EVENT_RECORD as *const Self) }
     }
 
-    /// Returns a reference to the underlying Win32 [`EVENT_RECORD`].
+    /// Returns a shared reference to the underlying Win32 [`EVENT_RECORD`].
     #[inline(always)]
     pub const fn as_raw(&self) -> &EVENT_RECORD {
         &self.0
     }
 
-    /// Returns the GUID of the ETW provider that emitted this event.
+    /// Returns the GUID of the ETW provider (or classic MOF event class) that emitted this event.
     #[inline(always)]
     pub const fn provider_id(&self) -> &GUID {
         &self.0.EventHeader.ProviderId
     }
 
-    /// Returns the 16-bit Event ID from the event descriptor.
+    /// Returns the 16-bit Event ID from `EventHeader.EventDescriptor.Id`.
+    ///
+    /// Note that classic MOF kernel events (emitted by the NT Kernel Logger / System Logger)
+    /// typically set `EventDescriptor.Id` to `0` and identify the event type via [`Self::opcode`].
     #[inline(always)]
     pub const fn event_id(&self) -> u16 {
         self.0.EventHeader.EventDescriptor.Id
     }
 
-    /// Returns the schema version of the event.
+    /// Returns the schema version (`EventDescriptor.Version`) of the event payload.
     #[inline(always)]
     pub const fn version(&self) -> u8 {
         self.0.EventHeader.EventDescriptor.Version
     }
 
-    /// Returns the event opcode (e.g., `Start = 1`, `End = 2`, `SysCallEnter = 51`).
+    /// Returns the event opcode (`EventDescriptor.Opcode`, e.g., `Start = 1`, `End = 2`, `SysCallEnter = 51`).
     #[inline(always)]
     pub const fn opcode(&self) -> u8 {
         self.0.EventHeader.EventDescriptor.Opcode
     }
 
-    /// Returns the severity level of the event.
+    /// Returns the severity level (`EventDescriptor.Level`) of the event.
     #[inline(always)]
     pub const fn level(&self) -> u8 {
         self.0.EventHeader.EventDescriptor.Level
     }
 
-    /// Returns the 64-bit keyword bitmask of the event.
+    /// Returns the 64-bit keyword bitmask (`EventDescriptor.Keyword`) of the event.
     #[inline(always)]
     pub const fn keyword(&self) -> u64 {
         self.0.EventHeader.EventDescriptor.Keyword
     }
 
-    /// Returns the raw `EventHeader.Flags` bitmask.
+    /// Returns the raw `EventHeader.Flags` bitmask (e.g., `EVENT_HEADER_FLAG_32_BIT_HEADER`).
     #[inline(always)]
     pub const fn flags(&self) -> u16 {
         self.0.EventHeader.Flags
     }
 
-    /// Returns the Process ID (PID) recorded in the ETW header.
+    /// Returns the Process ID (PID) recorded in `EventHeader.ProcessId`.
+    ///
+    /// Note: For `Process::Start` events, `EventHeader.ProcessId` is the parent/creator PID,
+    /// whereas the newly created child PID is stored inside the `UserData` payload.
     #[inline(always)]
     pub const fn process_id(&self) -> u32 {
         self.0.EventHeader.ProcessId
     }
 
-    /// Returns the Thread ID (TID) recorded in the ETW header.
+    /// Returns the Thread ID (TID) recorded in `EventHeader.ThreadId`.
     #[inline(always)]
     pub const fn thread_id(&self) -> u32 {
         self.0.EventHeader.ThreadId
     }
 
-    /// Returns the raw timestamp of the event (QPC ticks or FileTime 100ns intervals).
+    /// Returns the raw timestamp of the event (`EventHeader.TimeStamp`).
+    ///
+    /// When `PROCESS_TRACE_MODE_RAW_TIMESTAMP` and `ClientContext = 1` are configured on the
+    /// session, this value represents raw QPC (QueryPerformanceCounter) ticks.
     #[inline(always)]
     pub const fn timestamp(&self) -> i64 {
         self.0.EventHeader.TimeStamp
@@ -123,24 +173,29 @@ impl RawEvent {
         &self.0.EventHeader.ActivityId
     }
 
-    /// Returns the logical processor index on which the event was logged.
+    /// Returns the logical processor index on which the event was logged by the kernel.
     #[inline(always)]
     pub const fn processor_index(&self) -> u16 {
-        // SAFETY: `BufferContext.Anonymous` and `ProcessorIndex` are plain integer union fields.
+        // SAFETY: `BufferContext.Anonymous` is a plain integer struct variant inside `ETW_BUFFER_CONTEXT`
+        // that is always initialized by the OS kernel before invoking `EventRecordCallback`.
         unsafe { self.0.BufferContext.Anonymous.ProcessorIndex }
     }
 
-    /// Returns `true` if the event was emitted by a 32-bit process (e.g. WOW64 on 64-bit Windows).
+    /// Returns `true` if the event was emitted by a 32-bit provider (such as a WOW64 process on 64-bit Windows).
     #[inline(always)]
     pub const fn is_32bit(&self) -> bool {
         (self.0.EventHeader.Flags & (EVENT_HEADER_FLAG_32_BIT_HEADER as u16)) != 0
     }
 
-    /// Returns the pointer byte width (`4` or `8`) of pointer-sized fields inside `user_data()`.
+    /// Returns the byte width (`4` or `8`) of pointer-sized fields inside [`Self::user_data`].
     ///
-    /// Inspects `EVENT_HEADER_FLAG_32_BIT_HEADER` (`0x20`) and `EVENT_HEADER_FLAG_64_BIT_HEADER` (`0x40`)
-    /// so WOW64 32-bit events on a 64-bit OS are parsed with 4-byte pointers. Falls back to the host
-    /// architecture pointer width when neither header flag is set (such as in synthetic tests).
+    /// # Why Dynamic Pointer Width Matters
+    ///
+    /// On a 64-bit Windows host, 32-bit WOW64 processes and 32-bit user-mode providers emit
+    /// events with `EVENT_HEADER_FLAG_32_BIT_HEADER` (`0x20`), packing pointer fields as 4-byte
+    /// values rather than 8-byte values. Hardcoding `std::mem::size_of::<usize>()` corrupts
+    /// all subsequent field offsets in the payload. When neither flag is explicitly set (e.g.,
+    /// in minimal synthetic test records), this method falls back to the host `usize` width.
     #[inline(always)]
     pub const fn pointer_size(&self) -> usize {
         let flags = self.0.EventHeader.Flags;
@@ -153,7 +208,9 @@ impl RawEvent {
         }
     }
 
-    /// Returns a zero-copy byte slice over the event's `UserData` payload.
+    /// Returns a zero-copy byte slice over the event's binary `UserData` payload.
+    ///
+    /// Returns an empty slice `&[]` if `UserData` is null or `UserDataLength` is `0`.
     #[inline(always)]
     pub fn user_data(&self) -> &[u8] {
         let ptr = self.0.UserData as *const u8;
@@ -161,12 +218,15 @@ impl RawEvent {
         if ptr.is_null() || len == 0 {
             &[]
         } else {
-            // SAFETY: ETW guarantees `UserData` is valid for `UserDataLength` bytes during the callback.
+            // SAFETY: Windows ETW guarantees that when `UserData` is non-null, it points to at
+            // least `UserDataLength` initialized bytes inside the current trace buffer.
             unsafe { slice::from_raw_parts(ptr, len) }
         }
     }
 
     /// Returns a zero-copy slice of the `EVENT_HEADER_EXTENDED_DATA_ITEM` descriptors attached to this event.
+    ///
+    /// Returns an empty slice `&[]` if `ExtendedData` is null or `ExtendedDataCount` is `0`.
     #[inline(always)]
     pub fn extended_data(&self) -> &[EVENT_HEADER_EXTENDED_DATA_ITEM] {
         let ptr = self.0.ExtendedData;
@@ -174,12 +234,21 @@ impl RawEvent {
         if ptr.is_null() || count == 0 {
             &[]
         } else {
-            // SAFETY: ETW guarantees `ExtendedData` is valid for `ExtendedDataCount` items during the callback.
+            // SAFETY: Windows ETW guarantees `ExtendedData` is valid for `ExtendedDataCount`
+            // contiguous `EVENT_HEADER_EXTENDED_DATA_ITEM` elements during the callback.
             unsafe { slice::from_raw_parts(ptr, count) }
         }
     }
 
     /// Searches the event's `ExtendedData` array for the first item matching `ext_type` and returns its payload slice.
+    ///
+    /// # Arguments
+    ///
+    /// * `ext_type` - One of the `EVENT_HEADER_EXT_TYPE_*` constants (e.g., `EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY`).
+    ///
+    /// # Returns
+    ///
+    /// `Some(&[u8])` containing the extended item's raw bytes, or `None` if no matching item is present.
     #[inline]
     pub fn find_extended_data(&self, ext_type: u16) -> Option<&[u8]> {
         for item in self.extended_data() {
@@ -187,7 +256,8 @@ impl RawEvent {
                 let data_ptr = item.DataPtr as usize as *const u8;
                 let data_len = item.DataSize as usize;
                 if !data_ptr.is_null() && data_len > 0 {
-                    // SAFETY: `DataPtr` is guaranteed by ETW to point to `DataSize` bytes.
+                    // SAFETY: `DataPtr` is a 64-bit address populated by the ETW runtime pointing
+                    // to `DataSize` bytes within the trace buffer.
                     return Some(unsafe { slice::from_raw_parts(data_ptr, data_len) });
                 }
             }
@@ -196,6 +266,9 @@ impl RawEvent {
     }
 
     /// Extracts the 64-bit `ProcessStartKey` from `ExtendedData` (`EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY`), if present.
+    ///
+    /// `ProcessStartKey` is a monotonically increasing per-boot identifier that uniquely identifies
+    /// a process across PID reuse when emitted by manifest providers.
     #[inline]
     pub fn process_start_key(&self) -> Option<u64> {
         let bytes = self.find_extended_data(EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY as u16)?;
@@ -206,9 +279,7 @@ impl RawEvent {
         }
     }
 
-    /// Extracts the raw binary `SID` from `ExtendedData` (`EVENT_HEADER_EXT_TYPE_SID`), if present.
-    ///
-    /// Note: `EVENT_HEADER_EXT_TYPE_SID` precedes the `SID` with a `TOKEN_USER` structure (`2 * pointer_size` bytes).
+    /// Extracts the raw binary `SID` buffer from `ExtendedData` (`EVENT_HEADER_EXT_TYPE_SID`), if present.
     #[inline]
     pub fn extended_sid_bytes(&self) -> Option<&[u8]> {
         self.find_extended_data(EVENT_HEADER_EXT_TYPE_SID as u16)
@@ -216,13 +287,21 @@ impl RawEvent {
 
     /// Extracts an inline call stack from `ExtendedData` (`STACK_TRACE64` or `STACK_TRACE32`), if present.
     ///
-    /// Note: The first 8 bytes of `EVENT_EXTENDED_ITEM_STACK_TRACE64` / `STACK_TRACE32` contain `MatchId: u64`,
-    /// followed by the array of instruction pointer addresses.
+    /// Manifest and TraceLogging providers enabled with `EVENT_ENABLE_PROPERTY_STACK_TRACE`
+    /// attach call stacks directly inside `ExtendedData` rather than emitting a separate
+    /// out-of-band `StackWalk` event.
+    ///
+    /// # Returns
+    ///
+    /// `Some(Vec<u64>)` containing instruction pointers ordered from leaf caller to root frame
+    /// (with 32-bit frames zero-extended to `u64`), or `None` if no inline stack trace is attached.
     pub fn extract_call_stack(&self) -> Option<Vec<u64>> {
         for item in self.extended_data() {
             let data_ptr = item.DataPtr as usize as *const u8;
             let data_size = item.DataSize as usize;
 
+            // Both `EVENT_EXTENDED_ITEM_STACK_TRACE64` and `EVENT_EXTENDED_ITEM_STACK_TRACE32`
+            // begin with an 8-byte `MatchId: u64` field followed by the `Address[]` array.
             if data_ptr.is_null() || data_size <= 8 {
                 continue;
             }
@@ -234,7 +313,9 @@ impl RawEvent {
                 if count == 0 {
                     continue;
                 }
-                // SAFETY: Skip 8-byte `MatchId` header and read `count` unaligned 64-bit addresses.
+                // SAFETY: `data_size > 8` guarantees `data_ptr.add(8)` is within bounds for `count`
+                // 8-byte words. `read_unaligned` is used because ETW extended data payloads are only
+                // guaranteed to be 2-byte or 4-byte aligned in the trace buffer.
                 let base = unsafe { data_ptr.add(8) as *const u64 };
                 let mut stack = Vec::with_capacity(count);
                 for i in 0..count {
@@ -247,7 +328,8 @@ impl RawEvent {
                 if count == 0 {
                     continue;
                 }
-                // SAFETY: Skip 8-byte `MatchId` header and read `count` unaligned 32-bit addresses.
+                // SAFETY: `data_size > 8` guarantees `data_ptr.add(8)` is within bounds for `count`
+                // 4-byte words; `read_unaligned` avoids alignment faults.
                 let base = unsafe { data_ptr.add(8) as *const u32 };
                 let mut stack = Vec::with_capacity(count);
                 for i in 0..count {
@@ -277,19 +359,35 @@ impl fmt::Debug for RawEvent {
     }
 }
 
-/// Owned builder and container for constructing synthetic [`RawEvent`] instances in unit and integration tests.
+/// Owned test container that constructs a self-contained [`EVENT_RECORD`] and dereferences to [`RawEvent`].
 ///
-/// Holds a pinned heap slice (`Box<[u8]>`) and an optional `ExtendedData` buffer alongside an [`EVENT_RECORD`],
-/// dereferencing directly to [`RawEvent`].
+/// # Role & Invariants
+///
+/// Because [`RawEvent`] wraps a raw Win32 [`EVENT_RECORD`] whose `UserData` and `ExtendedData`
+/// fields are raw pointers, unit tests cannot safely construct a `RawEvent` without keeping its
+/// pointee buffers alive at stable addresses.
+///
+/// `SyntheticEvent` owns heap-allocated `Box<[u8]>` and `Box<[EVENT_HEADER_EXTENDED_DATA_ITEM]>`
+/// slices whose heap addresses remain fixed even when `SyntheticEvent` is moved by value.
+/// Implementing `Deref<Target = RawEvent>` allows any function accepting `&RawEvent` to be
+/// tested directly with `&SyntheticEvent`.
 pub struct SyntheticEvent {
+    /// Underlying Win32 `EVENT_RECORD` whose raw pointers reference the boxed slices below.
     record: EVENT_RECORD,
+    /// Pinned heap buffer backing `record.UserData`.
     _user_data: Box<[u8]>,
+    /// Pinned heap array backing `record.ExtendedData`.
     _ext_items: Box<[EVENT_HEADER_EXTENDED_DATA_ITEM]>,
+    /// Pinned heap buffer backing `record.ExtendedData[0].DataPtr`.
     _ext_payload: Box<[u8]>,
 }
 
 impl SyntheticEvent {
-    /// Creates a new [`SyntheticEvent`] with the given header parameters and payload bytes.
+    /// Creates a new [`SyntheticEvent`] with the specified header metadata and binary `UserData` payload.
+    ///
+    /// By default, `EventHeader.Flags` is initialized to match the host architecture pointer width
+    /// (`EVENT_HEADER_FLAG_64_BIT_HEADER` on 64-bit targets). Use [`Self::with_flags`] to simulate
+    /// 32-bit WOW64 events.
     pub fn new(
         provider_id: GUID,
         version: u8,
@@ -326,22 +424,24 @@ impl SyntheticEvent {
         }
     }
 
-    /// Sets the `EventDescriptor.Id` on this synthetic event.
+    /// Sets `EventHeader.EventDescriptor.Id` on this synthetic event.
     pub fn with_event_id(mut self, event_id: u16) -> Self {
         self.record.EventHeader.EventDescriptor.Id = event_id;
         self
     }
 
-    /// Sets the `EventHeader.Flags` (e.g., `EVENT_HEADER_FLAG_32_BIT_HEADER` to simulate a WOW64 32-bit event).
+    /// Overrides `EventHeader.Flags` (e.g., passing `EVENT_HEADER_FLAG_32_BIT_HEADER as u16` to
+    /// test 32-bit WOW64 pointer decoding).
     pub fn with_flags(mut self, flags: u16) -> Self {
         self.record.EventHeader.Flags = flags;
         self
     }
 
-    /// Attaches a 64-bit inline `STACK_TRACE64` extended data item to this synthetic event.
+    /// Attaches a 64-bit inline `EVENT_HEADER_EXT_TYPE_STACK_TRACE64` extended data item
+    /// containing an 8-byte `MatchId` header followed by `frames`.
     pub fn with_inline_stack64(mut self, frames: &[u64]) -> Self {
         let mut payload = Vec::with_capacity(8 + frames.len() * 8);
-        payload.extend_from_slice(&0u64.to_ne_bytes()); // MatchId
+        payload.extend_from_slice(&0u64.to_ne_bytes()); // 8-byte MatchId header required by ETW layout
         for &frame in frames {
             payload.extend_from_slice(&frame.to_ne_bytes());
         }
@@ -350,7 +450,7 @@ impl SyntheticEvent {
         let item = EVENT_HEADER_EXTENDED_DATA_ITEM {
             Reserved1: 0,
             ExtType: EVENT_HEADER_EXT_TYPE_STACK_TRACE64 as u16,
-             Anonymous: unsafe { std::mem::zeroed() },
+            Anonymous: unsafe { std::mem::zeroed() },
             DataSize: boxed_payload.len() as u16,
             DataPtr: boxed_payload.as_ptr() as usize as u64,
         };
@@ -363,10 +463,11 @@ impl SyntheticEvent {
         self
     }
 
-    /// Attaches a 32-bit inline `STACK_TRACE32` extended data item to this synthetic event.
+    /// Attaches a 32-bit inline `EVENT_HEADER_EXT_TYPE_STACK_TRACE32` extended data item
+    /// containing an 8-byte `MatchId` header followed by 32-bit `frames`.
     pub fn with_inline_stack32(mut self, frames: &[u32]) -> Self {
         let mut payload = Vec::with_capacity(8 + frames.len() * 4);
-        payload.extend_from_slice(&0u64.to_ne_bytes()); // MatchId
+        payload.extend_from_slice(&0u64.to_ne_bytes()); // 8-byte MatchId header required by ETW layout
         for &frame in frames {
             payload.extend_from_slice(&frame.to_ne_bytes());
         }

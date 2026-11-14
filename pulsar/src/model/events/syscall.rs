@@ -1,8 +1,14 @@
-//! Strongly-typed domain event for system call telemetry derived from the NT Kernel Logger
-//! ETW provider (`PerfInfo` group).
+//! Strongly-typed domain event for kernel system call telemetry (`SyscallEvent`).
 //!
-//! Reference documentation:
-//! <https://learn.microsoft.com/en-us/windows/win32/etw/nt-kernel-logger-constants>
+//! # Role in the Architecture
+//!
+//! [`SyscallEvent`] normalizes `SysCallEnter_TypeGroup1` (Opcode 51) records emitted by the
+//! Windows System Logger (`PERF_SYSCALL`) into a domain structure that can be paired with an
+//! out-of-band `StackWalk` in [`CallStackCorrelator`](crate::pipeline::CallStackCorrelator) and
+//! evaluated by [`DetectionSink`](crate::sinks::DetectionSink) for direct syscall or unbacked
+//! call-stack anomalies.
+//!
+//! Reference: <https://learn.microsoft.com/en-us/windows/win32/etw/nt-kernel-logger-constants>
 
 use thiserror::Error;
 
@@ -10,47 +16,50 @@ use crate::model::types::{ProcessId, StackTrace};
 use crate::pipeline::etw_schemas::nt_kernel::syscall::{DtoSyscallError, SysCallEnter_TypeGroup1};
 use crate::sensors::etw::{EventRecord, RawEvent};
 
-/// Domain error encountered while parsing and validating Syscall telemetry events.
+/// Domain error encountered while parsing and validating `SysCallEnter` telemetry events.
 #[derive(Debug, Error)]
 pub enum SyscallEventError {
+    /// The ETW event header carried an opcode other than `51` (`SysCallEnter`).
     #[error("Unknown or unsupported ETW syscall opcode: {0}")]
     UnknownOpcode(u8),
 
+    /// The binary `UserData` payload was shorter than a single pointer (`4` or `8` bytes).
     #[error("Syscall DTO parse error: {0}")]
     Dto(#[from] DtoSyscallError),
 }
 
-/// Strongly-typed domain event representing an invocation of a kernel system call.
+/// Normalized domain event representing a user-to-kernel system call transition (`SysCallEnter`).
 ///
-/// Emitted when a user-mode thread executes a system call transition into the Windows kernel.
-/// Security engines analyze the associated `stack_trace` and `syscall_address` to detect
-/// Direct Syscalls, unbacked code execution, and shellcode loaders.
+/// Emitted when `PERF_SYSCALL` is enabled and a thread enters ring 0. Security engines inspect
+/// `stack_trace` and `syscall_address` to detect direct syscalls (where the user-mode return
+/// address does not reside inside `ntdll.dll` or `win32u.dll`) and unbacked shellcode frames.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyscallEvent {
-    /// Ingestion timestamp (QPC / FileTime).
+    /// Raw QPC timestamp when the kernel logged the syscall entry (`EventHeader.TimeStamp`).
     pub timestamp: i64,
 
-    /// PID of the process executing the system call.
+    /// Process ID (`EventHeader.ProcessId`) executing the system call.
     pub process_id: ProcessId,
 
-    /// TID of the specific thread executing the system call.
+    /// Thread ID (`EventHeader.ThreadId`) executing the system call.
     pub thread_id: u32,
 
-    /// Virtual memory address of the target kernel syscall handler function (e.g. `NtCreateFile`).
+    /// Kernel virtual address of the target SSDT syscall handler (e.g., `NtCreateFile`).
     pub syscall_address: usize,
 
-    /// Associated call stack instruction pointer frames (if kernel stack walking is enabled).
+    /// Associated user/kernel call stack frames (attached either inline from `ExtendedData` or
+    /// asynchronously via [`CallStackCorrelator`](crate::pipeline::CallStackCorrelator)).
     pub stack_trace: Option<StackTrace>,
 }
 
 impl SyscallEvent {
-    /// Attaches or updates the correlated call stack trace for this system call.
+    /// Builder helper that attaches a correlated [`StackTrace`] and returns `self`.
     pub fn with_stack_trace(mut self, stack_trace: StackTrace) -> Self {
         self.stack_trace = Some(stack_trace);
         self
     }
 
-    /// Mutably attaches a correlated call stack trace to this system call.
+    /// Mutably attaches a correlated [`StackTrace`] to this system call event.
     pub fn attach_stack_trace(&mut self, stack_trace: StackTrace) {
         self.stack_trace = Some(stack_trace);
     }

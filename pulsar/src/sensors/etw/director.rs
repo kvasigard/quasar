@@ -1,4 +1,15 @@
-//! Session director providing modular recipes for configuring ETW kernel and user sessions.
+//! Session director providing declarative profiles and modular recipes for ETW kernel and user sessions.
+//!
+//! # Role in the Architecture
+//!
+//! [`SessionDirector`] separates *what* telemetry an EDR deployment wants to collect
+//! ([`KernelTraceConfig`] and [`Provider`] lists) from *how* [`KernelSessionBuilder`] and
+//! [`UserSessionBuilder`] wire up underlying Win32 flags, buffer pools, and stack-walk hooks.
+//!
+//! By design, [`KernelTraceConfig::default()`] enables process and image-load context telemetry
+//! (`PERF_PROCESS | PERF_IMAGE_LOAD`) while keeping extreme-volume system call tracing
+//! (`PERF_SYSCALL` + `SysCallEnter` stack walking) **disabled (`false`) by default** unless
+//! explicitly opted into via `--enable-syscalls` or [`KernelTraceConfig::with_syscalls`].
 
 use windows_sys::Win32::System::Diagnostics::Etw::{
     EVENT_TRACE_REAL_TIME_MODE, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_RAW_TIMESTAMP,
@@ -10,7 +21,10 @@ use super::provider::Provider;
 use super::session::EtwSessionBuilder;
 use super::user::UserSessionBuilder;
 
-/// Defines the GUID for Performance Information events (`{ce1dbfb4-137e-4da6-87b0-3f59aa102cbc}`).
+/// Classic MOF GUID for `PerfInfo` kernel events (`{ce1dbfb4-137e-4da6-87b0-3f59aa102cbc}`).
+///
+/// Used when registering `SysCallEnter` (Opcode 51) for kernel stack-walk capture via
+/// `TraceSetInformation(TraceStackTracingInfo)`.
 ///
 /// Reference: <https://learn.microsoft.com/en-us/windows/win32/etw/nt-kernel-logger-constants>
 pub const PERFINFO_GUID: GUID = GUID {
@@ -20,22 +34,26 @@ pub const PERFINFO_GUID: GUID = GUID {
     data4: [0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc],
 };
 
-/// Event ID for System Call Entry (`SysClEnter`) used in ETW stack tracing.
+/// Classic MOF Opcode (`51`) for System Call Entry (`SysCallEnter`) under [`PERFINFO_GUID`].
 pub const EVENT_ID_SYSCALL_ENTER: u8 = 51;
 
-/// Default buffer size in kilobytes for high-throughput kernel and user telemetry.
+/// Default size of each ETW ring buffer in kilobytes (`1024` KB = `1` MB per buffer).
 pub const DEFAULT_BUFFER_SIZE_KB: u32 = 1024;
-/// Default minimum number of buffers in the ETW ring-buffer pool.
+/// Default minimum number of pre-allocated buffers in the ETW session pool (`64` MB minimum pool).
 pub const DEFAULT_MIN_BUFFERS: u32 = 64;
-/// Default maximum number of buffers in the ETW ring-buffer pool.
+/// Default maximum number of buffers in the ETW session pool (`128` MB maximum pool).
 pub const DEFAULT_MAX_BUFFERS: u32 = 128;
-/// Default forced buffer flush timer in seconds.
+/// Default forced buffer flush interval in seconds (`1` second).
 pub const DEFAULT_FLUSH_TIMER_SECS: u32 = 1;
 
-/// Declarative configuration profile for the System Logger V2 [`KernelSession`](super::kernel::KernelSession).
+/// Declarative telemetry profile for configuring a System Logger V2 [`KernelSession`](super::kernel::KernelSession).
 ///
-/// By default, process and image-load context telemetry are enabled while high-volume
-/// system call telemetry (`enable_syscalls`) is **disabled** (`false`).
+/// # Default Invariant
+///
+/// [`KernelTraceConfig::default()`] enables `enable_process` and `enable_image_load` so the
+/// agent maintains an accurate process/module tree (`SystemState`), while leaving
+/// `enable_syscalls` set to `false` by default because `PERF_SYSCALL` generates hundreds of
+/// thousands of events per second across the OS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KernelTraceConfig {
     /// Enable process creation, termination, and rundown telemetry (`PERF_PROCESS`).
@@ -44,12 +62,13 @@ pub struct KernelTraceConfig {
     pub enable_image_load: bool,
     /// Enable thread creation, termination, and rundown telemetry (`PERF_THREAD`).
     pub enable_threads: bool,
-    /// Enable virtual memory allocation/free telemetry (`PERF_VIRTUAL_ALLOC`).
+    /// Enable virtual memory allocation/free telemetry (`PERF_VIRTUAL_ALLOC`, `Masks[2]`).
     pub enable_virtual_alloc: bool,
-    /// Enable Object Manager handle operation telemetry (`PERF_OB_HANDLE`).
+    /// Enable Object Manager handle operation telemetry (`PERF_OB_HANDLE`, `Masks[4]`).
     pub enable_ob_handle: bool,
-    /// Enable kernel system call (`SysCallEnter`) and stack walk telemetry (`PERF_SYSCALL`).
-    /// Disabled (`false`) by default due to extreme event volume.
+    /// Enable kernel system call (`SysCallEnter`) and stack walk telemetry (`PERF_SYSCALL`, `Masks[1]`).
+    ///
+    /// **Disabled (`false`) by default** due to extreme system-wide event volume.
     pub enable_syscalls: bool,
 }
 
@@ -67,7 +86,7 @@ impl Default for KernelTraceConfig {
 }
 
 impl KernelTraceConfig {
-    /// Creates the default EDR kernel trace profile (Process + ImageLoad enabled, Syscalls disabled).
+    /// Creates the default EDR kernel trace profile (`Process` + `ImageLoad` enabled, `Syscalls` disabled).
     #[inline]
     pub const fn new() -> Self {
         Self {
@@ -87,7 +106,7 @@ impl KernelTraceConfig {
         self
     }
 
-    /// Toggles process and image load context tracing.
+    /// Toggles both process (`PERF_PROCESS`) and image-load (`PERF_IMAGE_LOAD`) context tracing.
     #[inline]
     pub const fn with_context(mut self, enabled: bool) -> Self {
         self.enable_process = enabled;
@@ -117,12 +136,13 @@ impl KernelTraceConfig {
     }
 }
 
-/// Director helper providing composable, single-responsibility recipes for ETW sessions.
+/// Stateless director providing composable configuration recipes for [`KernelSessionBuilder`]
+/// and [`UserSessionBuilder`].
 pub struct SessionDirector;
 
 impl SessionDirector {
-    /// Configures the base real-time logging modes and ring-buffer allocation parameters
-    /// polymorphically on any builder implementing [`EtwSessionBuilder`].
+    /// Applies standard real-time logging modes and ring-buffer sizing polymorphically to any
+    /// builder implementing [`EtwSessionBuilder`].
     pub fn configure_base_session(
         builder: &mut impl EtwSessionBuilder,
         buffer_size_kb: u32,
@@ -142,30 +162,31 @@ impl SessionDirector {
             .set_flush_timer(flush_timer_secs);
     }
 
-    /// Enables kernel system call event emission and kernel-level stack walk tracing.
+    /// Enables kernel system call emission (`KernelFlag::SystemCall`) and registers `SysCallEnter`
+    /// (`PERFINFO_GUID`, Opcode 51) for out-of-band kernel stack walking.
     pub fn enable_syscall_monitoring(builder: &mut KernelSessionBuilder) {
         builder
             .enable_flag(KernelFlag::SystemCall)
             .enable_stack_tracing(PERFINFO_GUID, EVENT_ID_SYSCALL_ENTER);
     }
 
-    /// Enables process creation and termination telemetry.
+    /// Enables process creation, termination, and rundown telemetry (`KernelFlag::Process`).
     pub fn enable_process_monitoring(builder: &mut KernelSessionBuilder) {
         builder.enable_flag(KernelFlag::Process);
     }
 
-    /// Enables executable and DLL image mapping/unmapping telemetry.
+    /// Enables executable and DLL image mapping/unmapping telemetry (`KernelFlag::ImageLoad`).
     pub fn enable_image_monitoring(builder: &mut KernelSessionBuilder) {
         builder.enable_flag(KernelFlag::ImageLoad);
     }
 
-    /// Enables thread creation and termination telemetry.
+    /// Enables thread creation, termination, and rundown telemetry (`KernelFlag::Thread`).
     pub fn enable_thread_monitoring(builder: &mut KernelSessionBuilder) {
         builder.enable_flag(KernelFlag::Thread);
     }
 
-    /// Configures a [`KernelSessionBuilder`] using the default [`KernelTraceConfig`]
-    /// (Process + ImageLoad enabled, Syscalls disabled by default).
+    /// Configures a [`KernelSessionBuilder`] using [`KernelTraceConfig::default()`]
+    /// (`Process` + `ImageLoad` enabled, `Syscalls` disabled by default).
     pub fn construct_default_kernel_session(builder: &mut KernelSessionBuilder) {
         Self::construct_kernel_session_with_config(builder, KernelTraceConfig::default());
     }
@@ -203,8 +224,7 @@ impl SessionDirector {
         }
     }
 
-    /// Composes a tailored EDR kernel trace session based on active feature toggles
-    /// using standard internal ring-buffer configurations.
+    /// Composes an EDR kernel trace session from explicit `enable_syscalls` and `enable_context` toggles.
     pub fn construct_kernel_edr_session(
         builder: &mut KernelSessionBuilder,
         enable_syscalls: bool,
@@ -226,7 +246,7 @@ impl SessionDirector {
         Self::construct_kernel_edr_session(builder, enable_syscalls, enable_context);
     }
 
-    /// Composes a tailored user-mode trace session with standard ring-buffers and registered providers.
+    /// Configures a [`UserSessionBuilder`] with standard EDR ring-buffer sizes and registers all `providers`.
     pub fn construct_user_session(
         builder: &mut UserSessionBuilder,
         providers: impl IntoIterator<Item = Provider>,

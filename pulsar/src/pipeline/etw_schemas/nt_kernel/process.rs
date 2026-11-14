@@ -1,37 +1,44 @@
-/// Event types for ETW Kernel Process tracing:
-///
-/// +-------+---------------------------------+----------------------------------------------------+-----------------------+
-/// | Value | Constant / Event Name           | Description                                        | MOF Class             |
-/// +-------+---------------------------------+----------------------------------------------------+-----------------------+
-/// | 1     | EVENT_TRACE_TYPE_START          | Start process event.                               | Process_V2_TypeGroup1 |
-/// | 2     | EVENT_TRACE_TYPE_END            | End process event.                                 | Process_V2_TypeGroup1 |
-/// | 3     | EVENT_TRACE_TYPE_DC_START       | Start data collection (enumerates running at start)| Process_V2_TypeGroup1 |
-/// | 4     | EVENT_TRACE_TYPE_DC_END         | End data collection (enumerates running at end)    | Process_V2_TypeGroup1 |
-/// | 32    | Performance Counters            | Performance counters event.                        | Process_V2_TypeGroup2 |
-/// | 33    | Performance Counters Rundown    | Rundown of performance counters at session start.  | Process_V2_TypeGroup2 |
-/// | 39    | Defunct Process                 | Defunct process event.                             | Process_V2_TypeGroup1 |
-/// +-------+---------------------------------+----------------------------------------------------+-----------------------+
-///
-/// Process and thread start events may be logged in the context of the parent process or thread.
-/// As a result, the ProcessId and ThreadId members of EVENT_TRACE_HEADER may not correspond to
-/// the process and thread being created. This is why these events contain the process and thread
-/// identifiers in the event data (in addition to those in the event header).
-///
-/// Reference: https://learn.microsoft.com/en-us/windows/win32/etw/process-v2
+//! Zero-copy MOF DTO schemas for Windows Kernel `Process` events (`Process_V0..V4`).
+//!
+//! # Event Opcodes & MOF Classes
+//!
+//! | Opcode | Constant / Event Name            | Description                                         | MOF Class               |
+//! |--------|----------------------------------|-----------------------------------------------------|-------------------------|
+//! | `1`    | `EVENT_TRACE_TYPE_START`         | Process creation event                              | `Process_V*_TypeGroup1` |
+//! | `2`    | `EVENT_TRACE_TYPE_END`           | Process termination event                           | `Process_V*_TypeGroup1` |
+//! | `3`    | `EVENT_TRACE_TYPE_DC_START`      | Rundown of processes active at trace start          | `Process_V*_TypeGroup1` |
+//! | `4`    | `EVENT_TRACE_TYPE_DC_END`        | Rundown of processes active at trace stop           | `Process_V*_TypeGroup1` |
+//! | `32`   | Performance Counters             | Process resource utilization counters               | `Process_V2_TypeGroup2` |
+//! | `33`   | Performance Counters Rundown     | Rundown of performance counters at session stop     | `Process_V2_TypeGroup2` |
+//! | `39`   | Defunct Process                  | Zombie process whose `EPROCESS` object still exists | `Process_V*_TypeGroup1` |
+//!
+//! # Header PID vs. Payload PID
+//!
+//! Process creation (`Start`) and rundown (`DCStart`) events are frequently logged in the thread
+//! context of the parent process or the `System` kernel process (`PID 4`). Consequently,
+//! `EVENT_HEADER.ProcessId` represents the *creator/emitter* PID, whereas the actual target
+//! process's `ProcessId` and `ParentId` are embedded inside the `UserData` payload decoded by
+//! these DTOs.
+//!
+//! Reference: <https://learn.microsoft.com/en-us/windows/win32/etw/process-v2>
+
 use crate::helpers::strings::StringError;
 use crate::pipeline::etw_schemas::cursor::{ByteCursor, CursorError};
 use crate::sensors::etw::RawEvent;
 use thiserror::Error;
 
-/// Specific error type for Process ETW DTO parsing failures.
+/// Errors encountered while decoding a kernel `Process` MOF payload into a DTO.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum DtoProcessError {
+    /// The `UserData` buffer ended before the named field could be read.
     #[error("Buffer too short for field '{0}'")]
     BufferTooShort(&'static str),
 
+    /// The binary `UserSID` field had an invalid revision or truncated sub-authorities.
     #[error("Invalid binary SID in field '{0}'")]
     InvalidSid(&'static str),
 
+    /// Either `ImageFileName` (ANSI) or `CommandLine` (UTF-16LE) lacked a null terminator or had invalid encoding.
     #[error("String parsing error in field '{0}': {1}")]
     String(&'static str, #[source] StringError),
 }
@@ -48,18 +55,22 @@ impl From<CursorError> for DtoProcessError {
     }
 }
 
-// V0 Process Schema (Windows XP / Server 2003)
+/// Version 0 `Process` MOF schema (`Process_V0_TypeGroup1`, Windows XP / Server 2003).
 #[allow(nonstandard_style)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Process_V0_TypeGroup1<'a> {
+    /// Target Process ID.
     pub ProcessId: u32,
+    /// Parent Process ID.
     pub ParentId: u32,
+    /// Borrowed binary Security Identifier (`SID`) of the process token.
     pub UserSID: &'a [u8],
+    /// Null-terminated ANSI image file name (e.g., `"cmd.exe"`).
     pub ImageFileName: &'a str,
 }
 
 impl<'a> Process_V0_TypeGroup1<'a> {
-    /// Parses a V0 process payload from a bitness-aware [`ByteCursor`].
+    /// Parses a Version 0 process payload from a bitness-aware [`ByteCursor`].
     #[inline]
     pub fn parse(cursor: &mut ByteCursor<'a>) -> Result<Self, DtoProcessError> {
         cursor.ensure_remaining(8, "FixedHeader")?;
@@ -90,21 +101,28 @@ impl<'a> TryFrom<&'a RawEvent> for Process_V0_TypeGroup1<'a> {
     }
 }
 
-// V1 Process Schema (Windows Vista / 7 / Server 2008)
+/// Version 1 `Process` MOF schema (`Process_V1_TypeGroup1`, Windows Vista / 7 / Server 2008).
 #[allow(nonstandard_style)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Process_V1_TypeGroup1<'a> {
+    /// Physical address of the process page directory (`CR3`).
     pub PageDirectoryBase: usize,
+    /// Target Process ID.
     pub ProcessId: u32,
+    /// Parent Process ID.
     pub ParentId: u32,
+    /// Terminal Services session ID.
     pub SessionId: u32,
+    /// Process exit code (meaningful on `End` / `Defunct` opcodes).
     pub ExitStatus: i32,
+    /// Borrowed binary Security Identifier (`SID`) of the process token.
     pub UserSID: &'a [u8],
+    /// Null-terminated ANSI short image file name.
     pub ImageFileName: &'a str,
 }
 
 impl<'a> Process_V1_TypeGroup1<'a> {
-    /// Parses a V1 process payload from a bitness-aware [`ByteCursor`].
+    /// Parses a Version 1 process payload from a bitness-aware [`ByteCursor`].
     #[inline]
     pub fn parse(cursor: &mut ByteCursor<'a>) -> Result<Self, DtoProcessError> {
         let fixed_size = cursor.pointer_size() + 16;
@@ -140,23 +158,32 @@ impl<'a> TryFrom<&'a RawEvent> for Process_V1_TypeGroup1<'a> {
     }
 }
 
-// V2 Process Schema (Windows 8 / Server 2012)
+/// Version 2 `Process` MOF schema (`Process_V2_TypeGroup1`, Windows 8 / Server 2012).
 #[allow(nonstandard_style)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Process_V2_TypeGroup1<'a> {
+    /// Kernel address of the `_EPROCESS` structure (`UniqueProcessKey`).
     pub UniqueProcessKey: usize,
+    /// Target Process ID.
     pub ProcessId: u32,
+    /// Parent Process ID.
     pub ParentId: u32,
+    /// Terminal Services session ID.
     pub SessionId: u32,
+    /// Process exit status code.
     pub ExitStatus: i32,
+    /// Physical address of the process page directory table (`CR3`).
     pub DirectoryTableBase: usize,
+    /// Borrowed binary Security Identifier (`SID`) of the process token.
     pub UserSID: &'a [u8],
+    /// Null-terminated ANSI image file name (e.g., `"svchost.exe"`).
     pub ImageFileName: &'a str,
+    /// Borrowed UTF-16LE byte slice (excluding the 2-byte NUL terminator) of the process command line.
     pub CommandLine: &'a [u8],
 }
 
 impl<'a> Process_V2_TypeGroup1<'a> {
-    /// Parses a V2 process payload from a bitness-aware [`ByteCursor`].
+    /// Parses a Version 2 process payload from a bitness-aware [`ByteCursor`].
     #[inline]
     pub fn parse(cursor: &mut ByteCursor<'a>) -> Result<Self, DtoProcessError> {
         let ptr_size = cursor.pointer_size();
@@ -195,25 +222,38 @@ impl<'a> TryFrom<&'a RawEvent> for Process_V2_TypeGroup1<'a> {
     }
 }
 
-// V3 / V4 Process Schema (Windows 8.1 / 10 / 11 / Server 2012 R2+)
-// Adds `Flags: u32` after `DirectoryTableBase` (and V4 appends `PackageFullName` / `ApplicationId` after `CommandLine`).
+/// Version 3 and Version 4+ `Process` MOF schema (`Process_V3_TypeGroup1` / `Process_V4_TypeGroup1`,
+/// Windows 8.1 / 10 / 11 / Server 2012 R2+).
+///
+/// Compared to Version 2, Version 3 inserts `Flags: u32` immediately after `DirectoryTableBase`
+/// (and Version 4 appends `PackageFullName` and `ApplicationId` after `CommandLine`).
 #[allow(nonstandard_style)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Process_V3_TypeGroup1<'a> {
+    /// Kernel address of the `_EPROCESS` structure (`UniqueProcessKey`).
     pub UniqueProcessKey: usize,
+    /// Target Process ID.
     pub ProcessId: u32,
+    /// Parent Process ID.
     pub ParentId: u32,
+    /// Terminal Services session ID.
     pub SessionId: u32,
+    /// Process exit status code.
     pub ExitStatus: i32,
+    /// Physical address of the process page directory table (`CR3`).
     pub DirectoryTableBase: usize,
+    /// Process creation/rundown flags (`Flags`, added in schema V3).
     pub Flags: u32,
+    /// Borrowed binary Security Identifier (`SID`) of the process token.
     pub UserSID: &'a [u8],
+    /// Null-terminated ANSI image file name.
     pub ImageFileName: &'a str,
+    /// Borrowed UTF-16LE byte slice (excluding the 2-byte NUL terminator) of the process command line.
     pub CommandLine: &'a [u8],
 }
 
 impl<'a> Process_V3_TypeGroup1<'a> {
-    /// Parses a V3/V4+ process payload from a bitness-aware [`ByteCursor`].
+    /// Parses a Version 3 or Version 4+ process payload from a bitness-aware [`ByteCursor`].
     #[inline]
     pub fn parse(cursor: &mut ByteCursor<'a>) -> Result<Self, DtoProcessError> {
         let ptr_size = cursor.pointer_size();
@@ -253,29 +293,49 @@ impl<'a> TryFrom<&'a RawEvent> for Process_V3_TypeGroup1<'a> {
     }
 }
 
-// V2 Performance Counters Schema (Opcode 32 / 33)
+/// Version 2 Process Performance Counters MOF schema (`Process_V2_TypeGroup2`, Opcodes 32 and 33).
 #[allow(nonstandard_style)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Process_V2_TypeGroup2 {
+    /// Kernel address of the `_EPROCESS` structure.
     pub UniqueProcessKey: usize,
+    /// Target Process ID.
     pub ProcessId: u32,
+    /// Cumulative user-mode CPU time.
     pub UserTime: u64,
+    /// Cumulative kernel-mode CPU time.
     pub KernelTime: u64,
+    /// Peak virtual address space size in bytes.
     pub PeakVirtualSize: usize,
+    /// Peak working set size in bytes.
     pub PeakWorkingSetSize: usize,
+    /// Current virtual address space size in bytes.
     pub VirtualSize: usize,
+    /// Current pagefile usage in bytes.
     pub PagefileUsage: usize,
+    /// Peak pagefile usage in bytes.
     pub PeakPagefileUsage: usize,
+    /// Current working set size in bytes.
     pub WorkingSetSize: usize,
+    /// Total soft + hard page fault count.
     pub PageFaultCount: u32,
+    /// Total hard page fault count.
     pub HardFaultCount: u32,
+    /// Current private commit charge.
     pub CommitCharge: usize,
+    /// Peak private commit charge.
     pub PeakCommitCharge: usize,
+    /// Total I/O read operations.
     pub ReadOperationCount: u64,
+    /// Total I/O write operations.
     pub WriteOperationCount: u64,
+    /// Total non-read/write I/O operations.
     pub OtherOperationCount: u64,
+    /// Total bytes read.
     pub ReadTransferCount: u64,
+    /// Total bytes written.
     pub WriteTransferCount: u64,
+    /// Total bytes transferred in other I/O operations.
     pub OtherTransferCount: u64,
 }
 

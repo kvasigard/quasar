@@ -1,44 +1,44 @@
-//! DTO definitions for ETW NT Kernel Logger Syscall events.
+//! Zero-copy MOF DTO definitions for Windows Kernel `PerfInfo` Syscall events (`SysCallEnter`).
 //!
-//! Event types for ETW Kernel Syscall tracing (`PerfInfo` provider GUID `{CE1DBFB4-39EA-4851-89E0-A77CBFCCE4ED}`):
+//! # Event Opcodes & MOF Classes (`PerfInfo` GUID `{ce1dbfb4-137e-4da6-87b0-3f59aa102cbc}`)
 //!
-//! +-------+---------------------------------+----------------------------------------------------+-----------------------+
-//! | Value | Constant / Event Name           | Description                                        | MOF Class             |
-//! +-------+---------------------------------+----------------------------------------------------+-----------------------+
-//! | 51    | EVENT_TRACE_TYPE_SYSENTER       | System call entry (transition to kernel execution) | SysCallEnter          |
-//! | 52    | EVENT_TRACE_TYPE_SYSEXIT        | System call exit (return to user mode)             | SysCallExit           |
-//! +-------+---------------------------------+----------------------------------------------------+-----------------------+
+//! | Opcode | Constant / Event Name       | Description                                        | MOF Class      |
+//! |--------|-----------------------------|----------------------------------------------------|----------------|
+//! | `51`   | `EVENT_TRACE_TYPE_SYSENTER` | System call entry (transition to kernel execution) | `SysCallEnter` |
+//! | `52`   | `EVENT_TRACE_TYPE_SYSEXIT`  | System call exit (return to user mode)             | `SysCallExit`  |
 //!
-//! Reference documentation:
-//! <https://learn.microsoft.com/en-us/windows/win32/etw/nt-kernel-logger-constants>
+//! Reference: <https://learn.microsoft.com/en-us/windows/win32/etw/nt-kernel-logger-constants>
 
 use thiserror::Error;
 
 use crate::pipeline::etw_schemas::cursor::ByteCursor;
 use crate::sensors::etw::RawEvent;
 
-/// Error type encountered while parsing Syscall ETW DTO structures.
+/// Error returned when a `SysCallEnter` (Opcode 51) payload contains fewer bytes than the event's pointer width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum DtoSyscallError {
+    /// The `UserData` slice had fewer than `expected` (`4` or `8`) bytes (`got`).
     #[error("Buffer too short for Syscall payload (expected {0} bytes, got {1})")]
     BufferTooShort(usize, usize),
 }
 
-/// Raw zero-copy DTO for `SysCallEnter` (Opcode 51) event payload.
+/// Zero-copy DTO for `SysCallEnter` (Opcode 51) MOF payload.
 ///
-/// Captured immediately when a thread executes a system call transition into the kernel.
-/// The payload contains the entry point pointer of the servicing system call function in `ntoskrnl.exe` / `win32k.sys`.
+/// Emitted by the kernel when `PERF_SYSCALL` is enabled and a thread transitions into ring 0
+/// via `syscall` / `sysenter`. Contains the single pointer-sized virtual address of the
+/// servicing SSDT routine in `ntoskrnl.exe` or `win32k.sys`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 #[allow(non_snake_case)]
 pub struct SysCallEnter_TypeGroup1 {
-    /// Virtual memory address of the kernel system call handler routine (e.g. `NtCreateFile`, `NtAllocateVirtualMemory`).
-    /// In 64-bit Windows, this is an 8-byte pointer; in 32-bit Windows, it is a 4-byte pointer.
+    /// Virtual memory address of the kernel system call handler routine (e.g., `NtAllocateVirtualMemory`).
+    ///
+    /// Decoded via [`ByteCursor::read_ptr_usize`] (`8` bytes on 64-bit events, `4` bytes on 32-bit events).
     pub SysCallAddress: usize,
 }
 
 impl SysCallEnter_TypeGroup1 {
-    /// Parses `SysCallEnter` from a bitness-aware [`ByteCursor`].
+    /// Parses a `SysCallEnter` payload from a bitness-aware [`ByteCursor`].
     #[inline(always)]
     pub fn parse(cursor: &mut ByteCursor<'_>) -> Result<Self, DtoSyscallError> {
         let ptr_size = cursor.pointer_size();

@@ -1,5 +1,21 @@
-//! Safe RAII memory management for Win32 `EVENT_TRACE_PROPERTIES` / `EVENT_TRACE_PROPERTIES_V2`
-//! and kernel trace session statistics.
+//! Safe RAII memory layout manager for Win32 `EVENT_TRACE_PROPERTIES` / `EVENT_TRACE_PROPERTIES_V2`
+//! and kernel ring-buffer drop telemetry ([`TraceStatistics`]).
+//!
+//! # Windows ETW Variable-Length Buffer Layout
+//!
+//! `StartTraceW` and `ControlTraceW` do not accept separate pointers for the session name, log
+//! file path, or V2 extension blocks. Instead, Windows requires the caller to allocate a single
+//! contiguous, 8-byte-aligned memory block structured as follows:
+//!
+//! 1. Fixed header: `EVENT_TRACE_PROPERTIES` (`120` bytes) or `EVENT_TRACE_PROPERTIES_V2` (`168` bytes).
+//! 2. Null-terminated UTF-16 `LoggerName` string at byte offset `LoggerNameOffset`.
+//! 3. Optional null-terminated UTF-16 `LogFileName` string at byte offset `LogFileNameOffset`.
+//! 4. Optional V2 extension blocks (such as `ETW_EXT_ENABLE_FLAGS` containing the 32-byte
+//!    [`PerfGroupMask`]).
+//!
+//! [`TracePropertiesBuffer`] encapsulates this layout inside a `Vec<u64>` (guaranteeing 8-byte
+//! alignment regardless of allocator behavior) and exposes [`TraceStatistics`] populated by
+//! the kernel after `ControlTraceW` queries or stops a session.
 
 use std::mem::size_of;
 use windows_sys::Win32::System::Diagnostics::Etw::{
@@ -11,45 +27,61 @@ use windows_sys::core::GUID;
 use super::masks::PerfGroupMask;
 use super::session::EventTraceProperties;
 
-/// Extension item type ID for `PERFINFO_GROUPMASK` inside `EVENT_TRACE_PROPERTIES_V2.FilterDesc` / V2 extension blocks.
+/// V2 extension item type identifier (`ETW_EXT_ENABLE_FLAGS = 1`) used to embed a
+/// `PERFINFO_GROUPMASK` (`[u32; 8]`) inside an `EVENT_TRACE_PROPERTIES_V2` allocation.
 const ETW_EXT_ENABLE_FLAGS: u16 = 1;
 
-/// Kernel-level ring buffer and event loss statistics returned by `ControlTraceW`.
+/// Kernel-level ring-buffer utilization and event-loss counters returned by `ControlTraceW`.
+///
+/// Whenever `ControlTraceW` is invoked with `EVENT_TRACE_CONTROL_QUERY`, `EVENT_TRACE_CONTROL_FLUSH`,
+/// or `EVENT_TRACE_CONTROL_STOP`, the Windows kernel writes current buffer pool metrics back
+/// into the `EVENT_TRACE_PROPERTIES` header.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TraceStatistics {
-    /// Total number of buffers allocated for the ETW session pool.
+    /// Total number of ring buffers currently allocated by the kernel for this session pool.
     pub number_of_buffers: u32,
-    /// Number of buffers that are idle and available in the pool.
+    /// Number of buffers currently idle and available for writing in the pool.
     pub free_buffers: u32,
-    /// Number of events dropped by the kernel because all ring buffers were full.
+    /// Number of individual events dropped by the kernel because all ring buffers were full.
     pub events_lost: u32,
-    /// Total number of buffers flushed/written since the session started.
+    /// Total number of buffers flushed/delivered since the session started.
     pub buffers_written: u32,
     /// Number of file-backed buffers dropped.
     pub log_buffers_lost: u32,
-    /// Number of real-time consumer buffers dropped before user-mode could drain them.
+    /// Number of real-time consumer buffers dropped before the user-mode `ProcessTrace` thread could drain them.
     pub real_time_buffers_lost: u32,
 }
 
 impl TraceStatistics {
-    /// Returns `true` if any events or real-time buffers were lost during the trace session.
+    /// Returns `true` if the kernel reported any lost events or dropped real-time/log buffers.
     #[inline]
     pub const fn has_drops(&self) -> bool {
         self.events_lost > 0 || self.real_time_buffers_lost > 0 || self.log_buffers_lost > 0
     }
 }
 
-/// RAII memory manager for Win32 `EVENT_TRACE_PROPERTIES` and `EVENT_TRACE_PROPERTIES_V2`.
+/// RAII memory buffer encapsulating an 8-byte-aligned `EVENT_TRACE_PROPERTIES` or
+/// `EVENT_TRACE_PROPERTIES_V2` struct alongside its trailing UTF-16 strings and extension items.
 ///
-/// Windows requires `EVENT_TRACE_PROPERTIES[_V2]`, any V2 extension items, and trailing UTF-16
-/// strings (`LoggerName`, `LogFileName`) to reside in a single contiguous, 8-byte-aligned block
-/// of memory.
+/// # Invariants
+///
+/// * Backed by `Vec<u64>` so the base address is strictly 8-byte aligned on both 32-bit and
+///   64-bit targets, satisfying `WNODE_HEADER` alignment requirements.
+/// * `Wnode.BufferSize` always matches the exact byte capacity of `buffer`.
 pub struct TracePropertiesBuffer {
+    /// 8-byte-aligned backing storage holding the header struct, trailing UTF-16 strings, and optional V2 extensions.
     buffer: Vec<u64>,
 }
 
 impl TracePropertiesBuffer {
-    /// Allocates and initializes an aligned `EVENT_TRACE_PROPERTIES` buffer with trailing UTF-16 strings.
+    /// Allocates and initializes a classic V1 `EVENT_TRACE_PROPERTIES` buffer with trailing UTF-16 strings.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_name` - Name of the ETW session (copied to `LoggerNameOffset` as null-terminated UTF-16).
+    /// * `properties` - Ring-buffer sizing and logging mode configuration.
+    /// * `session_guid` - Session GUID (e.g., `SystemTraceControlGuid` for legacy NT Kernel Logger, or zeroed for user sessions).
+    /// * `enable_flags` - Legacy 32-bit `EnableFlags` bitmask (`Masks[0]`).
     pub fn new(
         session_name: &str,
         properties: &EventTraceProperties,
@@ -73,11 +105,14 @@ impl TracePropertiesBuffer {
         let base_byte_ptr = buffer.as_mut_ptr() as *mut u8;
         let props_ptr = base_byte_ptr as *mut EVENT_TRACE_PROPERTIES;
 
-        // SAFETY: The buffer is 8-byte aligned via `Vec<u64>` and allocated with at least `total_size` bytes.
+        // SAFETY: `buffer` is 8-byte aligned via `Vec<u64>` and allocated with at least `total_size`
+        // zeroed bytes, so writing `EVENT_TRACE_PROPERTIES` and copying the trailing wide strings
+        // at `struct_size` and `struct_size + name_len_bytes` is strictly in-bounds.
         unsafe {
             (*props_ptr).Wnode.BufferSize = (u64_len * size_of::<u64>()) as u32;
             (*props_ptr).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-            (*props_ptr).Wnode.ClientContext = 1; // QPC timestamp
+            // ClientContext = 1 selects high-resolution QPC (QueryPerformanceCounter) timestamps.
+            (*props_ptr).Wnode.ClientContext = 1;
             (*props_ptr).Wnode.Guid = session_guid;
 
             let mut log_mode = properties.log_file_mode;
@@ -116,7 +151,15 @@ impl TracePropertiesBuffer {
     }
 
     /// Allocates and initializes an aligned `EVENT_TRACE_PROPERTIES_V2` buffer, optionally embedding
-    /// a 256-bit [`PerfGroupMask`] (`ETW_EXT_ENABLE_FLAGS`) extension item for System Logger sessions.
+    /// a 256-bit [`PerfGroupMask`] (`ETW_EXT_ENABLE_FLAGS`) extension item for System Logger V2 sessions.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_name` - Name of the ETW session (e.g., `"Pulsar-Kernel-Logger"`).
+    /// * `properties` - Ring-buffer sizing and logging mode configuration.
+    /// * `session_guid` - Session GUID.
+    /// * `group_mask` - Optional 256-bit [`PerfGroupMask`]; when `has_extended_flags()` is true,
+    ///   appends an 8-byte-aligned `ETW_EXT_ENABLE_FLAGS` block after the string section.
     pub fn new_v2(
         session_name: &str,
         properties: &EventTraceProperties,
@@ -131,10 +174,12 @@ impl TracePropertiesBuffer {
             .unwrap_or_default();
 
         let struct_size = size_of::<EVENT_TRACE_PROPERTIES_V2>();
+        // Pad each variable-length section to an 8-byte boundary as required by V2 property blocks.
         let name_len_bytes = (name_wide.len() * size_of::<u16>()).next_multiple_of(8);
         let file_len_bytes = (file_wide.len() * size_of::<u16>()).next_multiple_of(8);
 
-        // V2 extension item for PerfGroupMask: 4-byte header (ExtType: u16, ExtSize: u16) + 32-byte PerfGroupMask = 36 bytes (padded to 40 for 8-byte alignment)
+        // V2 extension item for PerfGroupMask: 4-byte header (ExtType: u16, ExtSize: u16) +
+        // 32-byte PerfGroupMask = 36 bytes, padded to 40 bytes for 8-byte alignment.
         let has_ext_mask = group_mask.is_some_and(|m| m.has_extended_flags());
         let ext_len_bytes = if has_ext_mask { 40 } else { 0 };
 
@@ -150,6 +195,7 @@ impl TracePropertiesBuffer {
             (*props_ptr).Wnode.Flags = WNODE_FLAG_TRACED_GUID | WNODE_FLAG_VERSIONED_PROPERTIES;
             (*props_ptr).Wnode.ClientContext = 1; // QPC timestamp
             (*props_ptr).Wnode.Guid = session_guid;
+            // V2Control = 2 indicates an `EVENT_TRACE_PROPERTIES_V2` header (`WNODE_FLAG_VERSIONED_PROPERTIES`).
             (*props_ptr).Anonymous2.V2Control = 2;
 
             let mut log_mode = properties.log_file_mode;
@@ -192,7 +238,11 @@ impl TracePropertiesBuffer {
                     ext_ptr,
                     2,
                 );
-                std::ptr::copy_nonoverlapping(&item_size as *const u16 as *const u8, ext_ptr.add(2), 2);
+                std::ptr::copy_nonoverlapping(
+                    &item_size as *const u16 as *const u8,
+                    ext_ptr.add(2),
+                    2,
+                );
                 std::ptr::copy_nonoverlapping(
                     mask.masks.as_ptr() as *const u8,
                     ext_ptr.add(4),
@@ -204,10 +254,11 @@ impl TracePropertiesBuffer {
         Self { buffer }
     }
 
-    /// Extracts kernel buffer and event drop statistics from the underlying `EVENT_TRACE_PROPERTIES` header.
+    /// Reads the kernel buffer and event-loss statistics from the underlying `EVENT_TRACE_PROPERTIES` header.
     #[inline]
     pub fn statistics(&self) -> TraceStatistics {
-        // SAFETY: `self.buffer` always starts with a valid `EVENT_TRACE_PROPERTIES` header.
+        // SAFETY: `self.buffer` is always initialized with at least `size_of::<EVENT_TRACE_PROPERTIES>()`
+        // bytes and 8-byte alignment, and the V1 fields are prefix-identical in V2.
         let props = unsafe { &*self.as_ptr() };
         TraceStatistics {
             number_of_buffers: props.NumberOfBuffers,
@@ -219,13 +270,13 @@ impl TracePropertiesBuffer {
         }
     }
 
-    /// Provides a raw mutable pointer to the encapsulated `EVENT_TRACE_PROPERTIES` header.
+    /// Returns a raw mutable pointer to the encapsulated `EVENT_TRACE_PROPERTIES` header for Win32 FFI calls.
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut EVENT_TRACE_PROPERTIES {
         self.buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES
     }
 
-    /// Provides a raw immutable pointer to the encapsulated `EVENT_TRACE_PROPERTIES` header.
+    /// Returns a raw const pointer to the encapsulated `EVENT_TRACE_PROPERTIES` header.
     #[inline]
     pub fn as_ptr(&self) -> *const EVENT_TRACE_PROPERTIES {
         self.buffer.as_ptr() as *const EVENT_TRACE_PROPERTIES

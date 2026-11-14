@@ -1,10 +1,19 @@
-//! Zero-cost, bitness-aware binary cursor for decoding packed Windows ETW payloads.
+//! Zero-cost, bitness-aware sequential binary reader for packed Windows ETW payloads.
 //!
-//! [`ByteCursor`] eliminates manual byte-offset arithmetic and hardcoded host pointer sizes
-//! (`std::mem::size_of::<usize>()`) when parsing ETW MOF and manifest schemas. By carrying the
-//! event's actual pointer byte width (`4` bytes for 32-bit WOW64 events vs. `8` bytes for 64-bit
-//! events, derived from `EVENT_HEADER_FLAG_32_BIT_HEADER`), sequential field reads automatically
-//! advance by the exact number of bytes required.
+//! # Why `ByteCursor<'a>` Exists
+//!
+//! Windows ETW MOF and manifest payloads pack fixed-width primitives (`u8`, `u16`, `u32`, `u64`),
+//! pointer-sized fields (`PVOID` / `ULONG_PTR`), variable-length binary `SID` structures,
+//! null-terminated ANSI strings, and potentially unaligned UTF-16LE strings back-to-back with
+//! zero struct padding.
+//!
+//! Parsing these payloads with manual byte-offset arithmetic (`offset += ptr_size; offset += 4;`)
+//! and `std::mem::size_of::<usize>()` is error-prone and breaks when a 32-bit WOW64 provider
+//! emits an event with 4-byte pointers on a 64-bit host (`EVENT_HEADER_FLAG_32_BIT_HEADER`).
+//!
+//! [`ByteCursor`] encapsulates the borrowed payload slice (`&'a [u8]`), current read offset,
+//! and dynamic pointer byte width (`4` or `8`), providing bounds-checked, alignment-safe
+//! primitive and variable-length readers that advance the cursor automatically.
 
 use thiserror::Error;
 
@@ -13,47 +22,67 @@ use crate::helpers::strings::{
 };
 use crate::sensors::etw::RawEvent;
 
-/// Fallback binary `S-1-0-0` (Null SID) returned when a kernel ETW record carries a `0u32`
-/// null-SID marker (e.g., `Idle` pseudo-process during `DCStart`).
+/// Fallback binary `S-1-0-0` (`Null SID`, 12 bytes) returned when a kernel ETW record carries
+/// a `0u32` null-SID marker (such as the `Idle` pseudo-process during `DCStart` rundown).
 pub const NULL_SID_BYTES: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
-/// Errors encountered while reading structured fields from an ETW payload via [`ByteCursor`].
+/// Structured errors returned when decoding an ETW payload via [`ByteCursor`].
+///
+/// Every variant records the static name of the schema field being parsed (`field`) so
+/// malformed or truncated kernel payloads produce actionable diagnostic context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum CursorError {
-    /// The remaining slice does not contain enough bytes for the requested field.
+    /// The remaining unread slice contains fewer bytes than required to read `field`.
     #[error("Buffer too short for field '{field}' (needed {needed} bytes, remaining {remaining})")]
     BufferTooShort {
+        /// Name of the DTO field that could not be read.
         field: &'static str,
+        /// Minimum number of bytes required for the field.
         needed: usize,
+        /// Number of unread bytes actually remaining in the cursor.
         remaining: usize,
     },
 
-    /// A binary Windows SID structure had an invalid revision or truncated sub-authority array.
+    /// A binary Windows `SID` structure had a revision other than `1` or declared more
+    /// sub-authorities than fit in the remaining payload buffer.
     #[error("Invalid binary SID in field '{0}'")]
     InvalidSid(&'static str),
 
-    /// A null-terminated ANSI or UTF-16LE string failed to parse.
+    /// A null-terminated ANSI or UTF-16LE string lacked a terminator or contained invalid encoding.
     #[error("String parsing error in field '{0}': {1}")]
     String(&'static str, #[source] StringError),
 
-    /// Trailing payload bytes are not a multiple of the expected element size.
+    /// Trailing payload bytes for a pointer-array field (such as `StackWalk` frames) are not
+    /// an exact multiple of the element byte size.
     #[error("Unaligned trailing array in field '{field}': {remaining} bytes remaining")]
     UnalignedTrailingBytes {
+        /// Name of the array field being parsed.
         field: &'static str,
+        /// Number of trailing bytes that failed element-size alignment.
         remaining: usize,
     },
 }
 
 /// Zero-copy sequential binary reader parameterized by the event's pointer byte width (`4` or `8`).
+///
+/// # Invariants
+///
+/// * `pos <= data.len()` holds at all times.
+/// * `ptr_size` is strictly `4` or `8`.
+/// * All multi-byte integer and string reads are alignment-safe (`from_ne_bytes` on byte slices),
+///   because packed ETW fields following variable-length ANSI strings frequently start at odd byte offsets.
 #[derive(Debug, Clone, Copy)]
 pub struct ByteCursor<'a> {
+    /// Underlying borrowed ETW `UserData` byte slice.
     data: &'a [u8],
+    /// Current read position in bytes (`0..=data.len()`).
     pos: usize,
+    /// Byte width of pointer-sized (`PVOID` / `ULONG_PTR`) fields in this event (`4` or `8`).
     ptr_size: usize,
 }
 
 impl<'a> ByteCursor<'a> {
-    /// Creates a new [`ByteCursor`] over `data` using the host architecture's pointer width.
+    /// Creates a new [`ByteCursor`] over `data` defaulting to the host architecture's pointer width.
     #[inline(always)]
     pub const fn new(data: &'a [u8]) -> Self {
         Self {
@@ -63,7 +92,9 @@ impl<'a> ByteCursor<'a> {
         }
     }
 
-    /// Creates a new [`ByteCursor`] over `data` with an explicit pointer width (`4` or `8` bytes).
+    /// Creates a new [`ByteCursor`] over `data` with an explicit pointer byte width (`4` or `8`).
+    ///
+    /// Any `ptr_size` value other than `4` is normalized to `8`.
     #[inline(always)]
     pub const fn with_pointer_size(data: &'a [u8], ptr_size: usize) -> Self {
         let normalized_ptr_size = if ptr_size == 4 { 4 } else { 8 };
@@ -75,7 +106,7 @@ impl<'a> ByteCursor<'a> {
     }
 
     /// Creates a new [`ByteCursor`] directly from a borrowed [`RawEvent`], automatically
-    /// inheriting its payload slice and 32/64-bit pointer width.
+    /// inheriting both `event.user_data()` and `event.pointer_size()`.
     #[inline(always)]
     pub fn from_raw_event(event: &'a RawEvent) -> Self {
         Self::with_pointer_size(event.user_data(), event.pointer_size())
@@ -93,7 +124,7 @@ impl<'a> ByteCursor<'a> {
         self.data.len().saturating_sub(self.pos)
     }
 
-    /// Returns `true` if no unread bytes remain.
+    /// Returns `true` if no unread bytes remain (`self.remaining() == 0`).
     #[inline(always)]
     pub const fn is_empty(&self) -> bool {
         self.remaining() == 0
@@ -111,7 +142,11 @@ impl<'a> ByteCursor<'a> {
         &self.data[self.pos..]
     }
 
-    /// Verifies that at least `needed` bytes remain in the buffer.
+    /// Verifies that at least `needed` unread bytes remain in the buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CursorError::BufferTooShort`] if `self.remaining() < needed`.
     #[inline(always)]
     pub fn ensure_remaining(&self, needed: usize, field: &'static str) -> Result<(), CursorError> {
         let rem = self.remaining();
@@ -126,7 +161,11 @@ impl<'a> ByteCursor<'a> {
         }
     }
 
-    /// Reads exactly `len` bytes as a zero-copy subslice and advances the cursor.
+    /// Reads exactly `len` bytes as a zero-copy subslice and advances the cursor by `len`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CursorError::BufferTooShort`] if fewer than `len` bytes remain.
     #[inline(always)]
     pub fn read_bytes(&mut self, len: usize, field: &'static str) -> Result<&'a [u8], CursorError> {
         self.ensure_remaining(len, field)?;
@@ -136,6 +175,10 @@ impl<'a> ByteCursor<'a> {
     }
 
     /// Advances the cursor by `len` bytes without returning the skipped slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CursorError::BufferTooShort`] if fewer than `len` bytes remain.
     #[inline(always)]
     pub fn skip(&mut self, len: usize, field: &'static str) -> Result<(), CursorError> {
         self.ensure_remaining(len, field)?;
@@ -143,56 +186,56 @@ impl<'a> ByteCursor<'a> {
         Ok(())
     }
 
-    /// Reads an unsigned 8-bit integer (`u8`).
+    /// Reads an unsigned 8-bit integer (`u8`) and advances the cursor by 1 byte.
     #[inline(always)]
     pub fn read_u8(&mut self, field: &'static str) -> Result<u8, CursorError> {
         let bytes = self.read_bytes(1, field)?;
         Ok(bytes[0])
     }
 
-    /// Reads a native-endian unsigned 16-bit integer (`u16`).
+    /// Reads a native-endian unsigned 16-bit integer (`u16`) and advances the cursor by 2 bytes.
     #[inline(always)]
     pub fn read_u16(&mut self, field: &'static str) -> Result<u16, CursorError> {
         let bytes = self.read_bytes(2, field)?;
         Ok(u16::from_ne_bytes([bytes[0], bytes[1]]))
     }
 
-    /// Reads a native-endian unsigned 32-bit integer (`u32`).
+    /// Reads a native-endian unsigned 32-bit integer (`u32`) and advances the cursor by 4 bytes.
     #[inline(always)]
     pub fn read_u32(&mut self, field: &'static str) -> Result<u32, CursorError> {
         let bytes = self.read_bytes(4, field)?;
         Ok(u32::from_ne_bytes(bytes.try_into().unwrap()))
     }
 
-    /// Reads a native-endian signed 32-bit integer (`i32`).
+    /// Reads a native-endian signed 32-bit integer (`i32`) and advances the cursor by 4 bytes.
     #[inline(always)]
     pub fn read_i32(&mut self, field: &'static str) -> Result<i32, CursorError> {
         let bytes = self.read_bytes(4, field)?;
         Ok(i32::from_ne_bytes(bytes.try_into().unwrap()))
     }
 
-    /// Reads a native-endian unsigned 64-bit integer (`u64`).
+    /// Reads a native-endian unsigned 64-bit integer (`u64`) and advances the cursor by 8 bytes.
     #[inline(always)]
     pub fn read_u64(&mut self, field: &'static str) -> Result<u64, CursorError> {
         let bytes = self.read_bytes(8, field)?;
         Ok(u64::from_ne_bytes(bytes.try_into().unwrap()))
     }
 
-    /// Reads a native-endian signed 64-bit integer (`i64`).
+    /// Reads a native-endian signed 64-bit integer (`i64`) and advances the cursor by 8 bytes.
     #[inline(always)]
     pub fn read_i64(&mut self, field: &'static str) -> Result<i64, CursorError> {
         let bytes = self.read_bytes(8, field)?;
         Ok(i64::from_ne_bytes(bytes.try_into().unwrap()))
     }
 
-    /// Reads a native-endian unsigned 128-bit integer (`u128`).
+    /// Reads a native-endian unsigned 128-bit integer (`u128`) and advances the cursor by 16 bytes.
     #[inline(always)]
     pub fn read_u128(&mut self, field: &'static str) -> Result<u128, CursorError> {
         let bytes = self.read_bytes(16, field)?;
         Ok(u128::from_ne_bytes(bytes.try_into().unwrap()))
     }
 
-    /// Reads a pointer-sized integer (`4` or `8` bytes depending on `self.pointer_size()`)
+    /// Reads a pointer-sized integer (`4` or `8` bytes according to [`Self::pointer_size`])
     /// and zero-extends it to `u64`.
     #[inline(always)]
     pub fn read_ptr_u64(&mut self, field: &'static str) -> Result<u64, CursorError> {
@@ -203,16 +246,29 @@ impl<'a> ByteCursor<'a> {
         }
     }
 
-    /// Reads a pointer-sized integer (`4` or `8` bytes depending on `self.pointer_size()`)
+    /// Reads a pointer-sized integer (`4` or `8` bytes according to [`Self::pointer_size`])
     /// as a host `usize`.
     #[inline(always)]
     pub fn read_ptr_usize(&mut self, field: &'static str) -> Result<usize, CursorError> {
         Ok(self.read_ptr_u64(field)? as usize)
     }
 
-    /// Reads a Windows binary Security Identifier (`SID`) from the current cursor position,
-    /// handling both raw `SID` structures and kernel ETW `[extension("Sid")]` payloads prefixed
-    /// by a `TOKEN_USER` (`2 * pointer_size` bytes) header or a `0u32` null-SID marker.
+    /// Reads a Windows binary Security Identifier (`SID`) from the current cursor position.
+    ///
+    /// # Windows ETW `[extension("Sid")]` Binary Quirks
+    ///
+    /// In kernel MOF schemas (`Process_V0..V4`), `UserSID` is serialized in one of three forms:
+    /// 1. **Null-SID Marker (`4` zero bytes):** When a kernel pseudo-process (such as `Idle`, PID 0)
+    ///    has no token SID, the kernel writes a 32-bit `0u32` (4 bytes) and immediately starts
+    ///    `ImageFileName`. In that case, this method advances by 4 bytes and returns [`NULL_SID_BYTES`].
+    /// 2. **`TOKEN_USER`-Prefixed SID (Real Kernel Events):** When a SID is present, the kernel
+    ///    writes a `TOKEN_USER` (`SID_AND_ATTRIBUTES`) header of size `2 * pointer_size` bytes
+    ///    (`8` bytes on 32-bit, `16` bytes on 64-bit) followed immediately by the variable-length
+    ///    `SID` (`8 + 4 * SubAuthorityCount` bytes). Note that on 64-bit Windows, the kernel pointer
+    ///    in `TOKEN_USER.User.Sid` can be page-aligned (e.g., `0xFFFF_8000_0000_0000`), meaning its
+    ///    low 32 bits are `0x0000_0000` while bytes `6..8` are `0xFFFF`!
+    /// 3. **Direct Raw `SID` (Synthetic / Manifest Tests):** Starts directly with `Revision == 1`,
+    ///    `SubAuthorityCount` in `1..=15`, and `IdentifierAuthority` upper bytes `[0, 0, 0, 0]`.
     #[inline]
     pub fn read_sid(&mut self, field: &'static str) -> Result<&'a [u8], CursorError> {
         let rem = self.remaining_slice();
@@ -224,8 +280,8 @@ impl<'a> ByteCursor<'a> {
             });
         }
 
-        // In Windows ETW MOF `[extension("Sid")]`, a leading 32-bit 0 indicates no SID is attached
-        // (unless it is the low 32 bits of a 64-bit canonical kernel pointer `0xFFFF...`).
+        // Guard against misidentifying a page-aligned 64-bit canonical kernel pointer
+        // (`0xFFFF_xxxx_0000_0000`) inside `TOKEN_USER` as a 4-byte `0u32` null-SID marker.
         let is_64bit_kernel_ptr =
             self.ptr_size == 8 && rem.len() >= 8 && rem[6] == 0xFF && rem[7] == 0xFF;
         if rem[0..4] == [0, 0, 0, 0] && !is_64bit_kernel_ptr {
@@ -241,9 +297,9 @@ impl<'a> ByteCursor<'a> {
             });
         }
 
-        // Distinguish a direct raw SID (Revision == 1, SubAuthorityCount 1..=15, upper 4 bytes of
-        // big-endian IdentifierAuthority == 0) from a kernel ETW `TOKEN_USER` (`2 * ptr_size` bytes)
-        // header preceding the SID.
+        // Distinguish a direct raw SID (`Revision == 1`, `SubAuthorityCount` in `1..=15`, and
+        // upper 4 bytes of big-endian `IdentifierAuthority == 0`) from a `TOKEN_USER` header
+        // (`2 * ptr_size` bytes) preceding the SID.
         let is_raw_sid = rem[0] == 1 && (1..=15).contains(&rem[1]) && rem[2..6] == [0, 0, 0, 0];
         let sid_offset = if is_raw_sid { 0 } else { 2 * self.ptr_size };
 
@@ -282,6 +338,11 @@ impl<'a> ByteCursor<'a> {
 
     /// Reads a zero-copy null-terminated UTF-16LE byte slice (excluding the 2-byte `[0, 0]` terminator)
     /// without requiring 2-byte memory alignment, and advances the cursor past the terminator.
+    ///
+    /// Returning `&'a [u8]` rather than `&'a [u16]` is essential because UTF-16 fields in ETW
+    /// (such as `Process_V2::CommandLine`) immediately follow a variable-length single-byte ANSI
+    /// string (`ImageFileName`) and therefore start at an odd byte address whenever `ImageFileName`
+    /// has an even number of characters.
     #[inline]
     pub fn read_utf16_bytes(&mut self, field: &'static str) -> Result<&'a [u8], CursorError> {
         let (bytes, consumed) = parse_utf16_bytes(self.remaining_slice())
@@ -290,7 +351,8 @@ impl<'a> ByteCursor<'a> {
         Ok(bytes)
     }
 
-    /// Reads a null-terminated UTF-16LE string and decodes it into an owned `String` safely regardless of alignment.
+    /// Reads a null-terminated UTF-16LE string and decodes it into an owned `String` safely
+    /// regardless of byte alignment.
     #[inline]
     pub fn read_utf16_string(&mut self, field: &'static str) -> Result<String, CursorError> {
         let raw_bytes = self.read_utf16_bytes(field)?;

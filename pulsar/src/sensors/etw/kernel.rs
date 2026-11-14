@@ -1,9 +1,29 @@
-//! System Logger V2 and NT Kernel Logger ETW session implementation.
+//! System Logger V2 (`EVENT_TRACE_SYSTEM_LOGGER_MODE`) and legacy NT Kernel Logger session management.
 //!
-//! By default, [`KernelSession`] uses modern Windows `EVENT_TRACE_SYSTEM_LOGGER_MODE` (`0x0200_0000`)
-//! with `EVENT_TRACE_PROPERTIES_V2` and a 256-bit [`PerfGroupMask`] under a dedicated session name
-//! (`"Pulsar-Kernel-Logger"`). This avoids OS-wide singleton collisions with tools like Process Monitor
-//! or WPR and unlocks extended kernel groups (`PERF_VIRTUAL_ALLOC`, `PERF_OB_HANDLE`, etc.).
+//! # Why System Logger V2 Over Classic `"NT Kernel Logger"`
+//!
+//! Historically, consuming kernel MOF events required claiming the single OS-wide `"NT Kernel Logger"`
+//! session name and `SystemTraceControlGuid`. That approach suffers from two major limitations
+//! for an EDR agent:
+//! 1. **Singleton Collision:** Only one process on the entire machine can own `"NT Kernel Logger"`.
+//!    Running Process Monitor, `xperf`, or Windows Performance Recorder alongside the agent causes
+//!    session contention or hijacking.
+//! 2. **32-Bit `EnableFlags` Ceiling:** Classic `EVENT_TRACE_PROPERTIES.EnableFlags` cannot enable
+//!    extended kernel groups in `Masks[1..7]` such as `PERF_VIRTUAL_ALLOC` (`Masks[2]`) or
+//!    `PERF_OB_HANDLE` (`Masks[4]`).
+//!
+//! [`KernelSession`] defaults to Windows 8.1+ `EVENT_TRACE_SYSTEM_LOGGER_MODE` (`0x0200_0000`)
+//! under a dedicated session name (`"Pulsar-Kernel-Logger"`, up to 8 concurrent system loggers
+//! supported by the OS) using `EVENT_TRACE_PROPERTIES_V2` and `TraceSetInformation(TraceSystemTraceEnableFlagsInfo)`.
+//! If the host environment rejects V2 System Logger mode, [`KernelSession::start`] automatically
+//! falls back to the legacy `"NT Kernel Logger"` session so telemetry collection remains resilient.
+//!
+//! # Batch Stack-Walk Registration
+//!
+//! Calling `TraceSetInformation(..., TraceStackTracingInfo, ...)` **replaces** the entire list of
+//! stack-walk hooks for that session rather than appending to it. [`KernelSessionBuilder::enable_stack_tracing`]
+//! accumulates all requested `(GUID, Opcode)` pairs and [`KernelSession`] submits them in a single
+//! contiguous `[CLASSIC_EVENT_ID]` slice call after session startup.
 
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -27,13 +47,22 @@ use super::session::{
     stop_win32_trace_session,
 };
 
-/// Process-local RAII guard ensuring only one kernel logger instance is active per Pulsar agent process.
+/// Process-local RAII guard ensuring at most one [`KernelSession`] is active within the
+/// current Pulsar agent process at any given time.
+///
+/// Automatically releases the atomic lock (`IS_TAKEN`) when the owning [`KernelSession`] is
+/// stopped or dropped.
 pub struct NtKernelGuard(());
 
 static IS_TAKEN: AtomicBool = AtomicBool::new(false);
 
 impl NtKernelGuard {
-    /// Attempts to acquire the process-local lock for the kernel logger.
+    /// Attempts to atomically acquire the process-local lock for the kernel logger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EtwError::KernelLoggerAlreadyActive`] if another [`KernelSession`] in this
+    /// process currently holds the guard.
     pub fn acquire() -> Result<Self, EtwError> {
         if IS_TAKEN
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -55,12 +84,20 @@ impl Drop for NtKernelGuard {
     }
 }
 
-/// Builder for configuring a [`KernelSession`] with a 256-bit [`PerfGroupMask`] and batch stack walk hooks.
+/// Builder for configuring a [`KernelSession`] with a 256-bit [`PerfGroupMask`] and batch
+/// `CLASSIC_EVENT_ID` stack-walk hooks.
+///
+/// By default, targets the modern V2 System Logger mode (`"Pulsar-Kernel-Logger"`).
 pub struct KernelSessionBuilder {
+    /// Target session name (`"Pulsar-Kernel-Logger"` by default).
     session_name: String,
+    /// When `true`, uses `EVENT_TRACE_SYSTEM_LOGGER_MODE` + `EVENT_TRACE_PROPERTIES_V2`.
     use_system_logger_v2: bool,
+    /// Ring-buffer sizing and flush timer properties.
     properties: EventTraceProperties,
+    /// 256-bit (`[u32; 8]`) kernel group bitmask.
     group_mask: PerfGroupMask,
+    /// Deduplicated list of `(EventGuid, Opcode)` pairs for batch `TraceStackTracingInfo` submission.
     stack_tracing_events: Vec<(GUID, u8)>,
 }
 
@@ -71,7 +108,8 @@ impl Default for KernelSessionBuilder {
 }
 
 impl KernelSessionBuilder {
-    /// Creates a new `KernelSessionBuilder` targeting the modern `"Pulsar-Kernel-Logger"` V2 session.
+    /// Creates a new [`KernelSessionBuilder`] targeting the modern `"Pulsar-Kernel-Logger"` V2 session
+    /// with an empty [`PerfGroupMask`].
     pub fn new() -> Self {
         Self {
             session_name: KernelSession::DEFAULT_SESSION_NAME.to_string(),
@@ -82,13 +120,14 @@ impl KernelSessionBuilder {
         }
     }
 
-    /// Overrides the kernel session name (defaults to `"Pulsar-Kernel-Logger"`).
+    /// Overrides the kernel session name (defaults to [`KernelSession::DEFAULT_SESSION_NAME`]).
     pub fn with_session_name(&mut self, name: impl Into<String>) -> &mut Self {
         self.session_name = name.into();
         self
     }
 
-    /// Configures the builder to use the legacy `"NT Kernel Logger"` singleton instead of V2 System Logger mode.
+    /// Configures the builder to use (or disable) the legacy `"NT Kernel Logger"` singleton
+    /// instead of modern V2 System Logger mode.
     pub fn with_legacy_nt_kernel_logger(&mut self, legacy: bool) -> &mut Self {
         self.use_system_logger_v2 = !legacy;
         if legacy {
@@ -106,15 +145,17 @@ impl KernelSessionBuilder {
         self
     }
 
-    /// Merges an entire [`PerfGroupMask`] into this builder.
+    /// Merges an entire [`PerfGroupMask`] into this builder via bitwise OR.
     pub fn enable_group_mask(&mut self, mask: PerfGroupMask) -> &mut Self {
         self.group_mask |= mask;
         self
     }
 
-    /// Instructs the kernel logger to capture call stack traces (`StackWalk_TypeGroup1`) for a specific `(GUID, Opcode)` pair.
+    /// Registers a kernel MOF `(GUID, Opcode)` pair for out-of-band call stack capture (`StackWalk_TypeGroup1`).
     ///
-    /// All registered events are submitted atomically in a single `TraceSetInformation(TraceStackTracingInfo)` call.
+    /// Duplicate `(guid, event_type)` pairs are ignored. All registered pairs are submitted
+    /// atomically in a single `TraceSetInformation(TraceStackTracingInfo)` call when the session
+    /// starts, preventing later hooks from overwriting earlier ones.
     pub fn enable_stack_tracing(&mut self, guid: GUID, event_type: u8) -> &mut Self {
         let exists = self.stack_tracing_events.iter().any(|(g, t)| {
             g.data1 == guid.data1
@@ -135,12 +176,17 @@ impl KernelSessionBuilder {
         self
     }
 
-    /// Returns a reference to the configured [`PerfGroupMask`].
+    /// Returns a reference to the configured 256-bit [`PerfGroupMask`].
     pub const fn group_mask(&self) -> &PerfGroupMask {
         &self.group_mask
     }
 
-    /// Consumes the builder recipe to produce a configured [`KernelSession`].
+    /// Acquires the process-local `NtKernelGuard` and constructs a configured [`KernelSession`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EtwError::KernelLoggerAlreadyActive`] if another [`KernelSession`] is already
+    /// alive in the current process.
     pub fn build(&self) -> Result<KernelSession, EtwError> {
         let guard = NtKernelGuard::acquire()?;
 
@@ -199,26 +245,40 @@ impl EtwSessionBuilder for KernelSessionBuilder {
     }
 }
 
-/// Active or configured session object managing the lifecycle of a System Logger V2 or NT Kernel Logger session.
+/// Active or configured controller for a Windows System Logger V2 (or fallback `"NT Kernel Logger"`) session.
+///
+/// # Ownership & RAII Lifecycle
+///
+/// * Holds an `NtKernelGuard` from construction (`build()`) until [`Self::stop`] or `Drop`.
+/// * Owns the Win32 `CONTROLTRACE_HANDLE` while running (`handle: Some(...)`).
+/// * Automatically stops the kernel trace session on `Drop` if [`Self::stop`] has not yet been called.
 pub struct KernelSession {
+    /// Active session name (`"Pulsar-Kernel-Logger"` in V2 mode, or `"NT Kernel Logger"` in legacy fallback mode).
     session_name: String,
+    /// Indicates whether `EVENT_TRACE_SYSTEM_LOGGER_MODE` and V2 properties are active.
     use_system_logger_v2: bool,
+    /// Ring-buffer sizing and mode configuration.
     properties: EventTraceProperties,
+    /// 256-bit (`[u32; 8]`) kernel group bitmask.
     group_mask: PerfGroupMask,
+    /// Registered `(EventGuid, Opcode)` pairs for batch stack-walk tracing.
     stack_tracing_events: Vec<(GUID, u8)>,
+    /// Active Win32 session control handle returned by `StartTraceW`.
     handle: Option<CONTROLTRACE_HANDLE>,
+    /// Final or most recently queried ring-buffer [`TraceStatistics`].
     last_statistics: Option<TraceStatistics>,
+    /// Process-local singleton guard released upon `stop()` or `Drop`.
     _guard: Option<NtKernelGuard>,
 }
 
 impl KernelSession {
-    /// Default modern System Logger V2 session name.
+    /// Default modern System Logger V2 session name (`"Pulsar-Kernel-Logger"`).
     pub const DEFAULT_SESSION_NAME: &'static str = "Pulsar-Kernel-Logger";
 
     /// Legacy singleton session name (`"NT Kernel Logger"`).
     pub const LEGACY_SESSION_NAME: &'static str = "NT Kernel Logger";
 
-    /// Backwards-compatible constant alias.
+    /// Backwards-compatible constant alias for [`Self::DEFAULT_SESSION_NAME`].
     pub const SESSION_NAME: &'static str = Self::DEFAULT_SESSION_NAME;
 
     /// Returns the active session name.
@@ -245,22 +305,46 @@ impl KernelSession {
         self.last_statistics
     }
 
-    /// Queries live kernel ring-buffer statistics for this session.
+    /// Queries live kernel ring-buffer statistics (`EventsLost`, `RealTimeBuffersLost`, etc.) for this session.
+    ///
+    /// # Errors
+    ///
+    /// * [`EtwError::SessionNotStarted`] if the session is not currently running.
+    /// * [`EtwError::WindowsApi`] if `ControlTraceW` fails.
     pub fn query_statistics(&self) -> Result<TraceStatistics, EtwError> {
         let handle = self
             .handle
             .ok_or_else(|| EtwError::SessionNotStarted(self.session_name.clone()))?;
-        query_win32_trace_session(handle, &self.session_name, &self.properties, self.session_guid())
+        query_win32_trace_session(
+            handle,
+            &self.session_name,
+            &self.properties,
+            self.session_guid(),
+        )
     }
 
-    /// Flushes active kernel ring buffers immediately.
+    /// Forces an immediate flush of the session's active kernel ring buffers.
+    ///
+    /// # Errors
+    ///
+    /// * [`EtwError::SessionNotStarted`] if the session is not currently running.
+    /// * [`EtwError::WindowsApi`] if `ControlTraceW` fails.
     pub fn flush(&self) -> Result<TraceStatistics, EtwError> {
         let handle = self
             .handle
             .ok_or_else(|| EtwError::SessionNotStarted(self.session_name.clone()))?;
-        flush_win32_trace_session(handle, &self.session_name, &self.properties, self.session_guid())
+        flush_win32_trace_session(
+            handle,
+            &self.session_name,
+            &self.properties,
+            self.session_guid(),
+        )
     }
 
+    /// Returns the session GUID required by `StartTraceW` / `ControlTraceW`.
+    ///
+    /// System Logger V2 sessions use a zeroed GUID (allowing Windows to assign a dynamic GUID),
+    /// whereas the legacy `"NT Kernel Logger"` requires `SystemTraceControlGuid`.
     #[inline]
     const fn session_guid(&self) -> GUID {
         if self.use_system_logger_v2 {
@@ -290,7 +374,9 @@ impl KernelSession {
     /// Applies the 256-bit [`PerfGroupMask`] (`TraceSystemTraceEnableFlagsInfo`) and the contiguous
     /// `[CLASSIC_EVENT_ID]` stack-walk hook list (`TraceStackTracingInfo`) to the started session.
     fn configure_kernel_extensions(&self, handle: CONTROLTRACE_HANDLE) {
-        // 1. Apply full 8-slot PerfGroupMask via TraceSetInformation(TraceSystemTraceEnableFlagsInfo)
+        // 1. Apply the full 8-slot `PerfGroupMask` via `TraceSetInformation(TraceSystemTraceEnableFlagsInfo)`.
+        // Even when `StartTraceW` was called with V2 properties, calling `TraceSetInformation` explicitly
+        // guarantees that extended slots (`Masks[1..7]`) are active across all Windows 10/11 builds.
         if self.use_system_logger_v2 || self.group_mask.has_extended_flags() {
             // SAFETY: `self.group_mask` is `#[repr(C)]` with `[u32; 8]` (32 bytes), matching `PERFINFO_GROUPMASK`.
             let status = unsafe {
@@ -310,8 +396,9 @@ impl KernelSession {
             }
         }
 
-        // 2. Apply all registered stack-walk hooks in a SINGLE TraceSetInformation call
-        // (calling TraceStackTracingInfo in a loop would overwrite previous hooks!).
+        // 2. Apply all registered stack-walk hooks in a SINGLE `TraceSetInformation` call.
+        // Windows replaces the entire stack-tracing table on each `TraceStackTracingInfo` call,
+        // so invoking it in a loop would clobber all previous entries except the last one.
         let hook_ids = self.build_classic_event_ids();
         if !hook_ids.is_empty() {
             let byte_size = (hook_ids.len() * size_of::<CLASSIC_EVENT_ID>()) as u32;
@@ -369,6 +456,8 @@ impl EtwSession for KernelSession {
             self.use_system_logger_v2,
         );
 
+        // If System Logger V2 fails (for example on an older OS build or restricted configuration),
+        // transparently fall back to the classic `"NT Kernel Logger"` session.
         let handle = match result {
             Ok(h) => h,
             Err(err) if self.use_system_logger_v2 => {
@@ -480,7 +569,11 @@ mod tests {
         assert!(session.group_mask().contains(KernelFlag::VirtualAlloc));
 
         let hooks = session.build_classic_event_ids();
-        assert_eq!(hooks.len(), 2, "Batch stack trace hooks must retain both events without overwriting");
+        assert_eq!(
+            hooks.len(),
+            2,
+            "Batch stack trace hooks must retain both events without overwriting"
+        );
         assert_eq!(hooks[0].Type, 51);
         assert_eq!(hooks[1].Type, 1);
     }
