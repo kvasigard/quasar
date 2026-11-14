@@ -17,6 +17,10 @@ pub enum EtwError {
     #[error("ETW session '{0}' has not been started")]
     SessionNotStarted(String),
 
+    /// The ETW event callback panicked during execution and was safely contained at the FFI boundary.
+    #[error("ETW consumer callback panicked during execution")]
+    CallbackPanicked,
+
     /// An underlying Windows ETW API returned a failure status code.
     #[error("Windows ETW API Error {code}: {message}")]
     WindowsApi { code: u32, message: String },

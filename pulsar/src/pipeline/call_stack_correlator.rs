@@ -5,7 +5,7 @@
 //! This correlation is achieved by matching the triggering event's timestamp with the `EventTimeStamp`
 //! in the stack walk payload.
 //!
-//! Manifest-based and TraceLogging ETW providers attach call stacks directly inside `EventRecord`
+//! Manifest-based and TraceLogging ETW providers attach call stacks directly inside `RawEvent` / `EventRecord`
 //! extended data and do not require external correlation.
 
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::model::types::StackTrace;
 use crate::pipeline::Event;
-use crate::pipeline::etw_schemas::nt_kernel::stack_walk::StackWalk_TypeGroup1;
+use crate::pipeline::etw_schemas::nt_kernel::stack_walk::{StackWalk_TypeGroup1, StackWalkEvent};
 use crate::sensors::etw::EventRecord;
 
 /// Maximum number of unassociated items kept before evicting expired entries.
@@ -58,32 +58,41 @@ impl CallStackCorrelator {
         }
     }
 
-    /// Processes an incoming raw `StackWalk` event record (Opcode 32).
+    /// Processes a pre-decoded [`StackWalkEvent`] (Opcode 32).
     ///
     /// If the corresponding trigger event has already been buffered, the stack trace is attached
     /// and the completed `Event` is returned immediately. Otherwise, the stack trace is stored
     /// in the pending stack pool awaiting the trigger event.
-    pub fn process_stack_walk(&mut self, record: &EventRecord) -> Option<Event> {
-        let dto = StackWalk_TypeGroup1::try_from(record.user_data.as_slice()).ok()?;
-        let key: CorrelationKey = (dto.EventTimeStamp, dto.StackProcess, dto.StackThread);
-        let stack_trace = StackTrace::new(dto.to_frames());
+    pub fn process_stack_walk_event(&mut self, sw: StackWalkEvent) -> Option<Event> {
+        let key: CorrelationKey = (sw.event_timestamp, sw.process_id, sw.thread_id);
 
         if let Some(pending) = self.pending_triggers.remove(&key) {
             let mut event = pending.event;
-            event.attach_stack_trace(stack_trace);
+            event.attach_stack_trace(sw.stack_trace);
             return Some(event);
         }
 
         self.pending_stacks.insert(
             key,
             PendingStack {
-                stack_trace,
+                stack_trace: sw.stack_trace,
                 inserted_at: Instant::now(),
             },
         );
 
         self.evict_stale_stacks();
         None
+    }
+
+    /// Processes an incoming raw `StackWalk` event record (Opcode 32).
+    pub fn process_stack_walk(&mut self, record: &EventRecord) -> Option<Event> {
+        let dto = StackWalk_TypeGroup1::try_from(record.user_data.as_slice()).ok()?;
+        self.process_stack_walk_event(StackWalkEvent {
+            event_timestamp: dto.EventTimeStamp,
+            process_id: dto.StackProcess,
+            thread_id: dto.StackThread,
+            stack_trace: StackTrace::new(dto.to_frames()),
+        })
     }
 
     /// Processes an event that expects an asynchronous stack trace from the kernel.
@@ -152,6 +161,12 @@ impl CallStackCorrelator {
             .retain(|_, item| now.duration_since(item.inserted_at) <= self.max_age);
 
         expired_events
+    }
+
+    /// Returns `true` if there are currently no pending trigger events awaiting stack correlation.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.pending_triggers.is_empty() && self.pending_stacks.is_empty()
     }
 
     /// Purges expired orphan stacks when `pending_stacks` exceeds capacity without dropping pending triggers.

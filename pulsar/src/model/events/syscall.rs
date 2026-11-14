@@ -1,4 +1,4 @@
-//! Strongly-typed domain event for system call telemetry derived from the legacy NT Kernel Logger
+//! Strongly-typed domain event for system call telemetry derived from the NT Kernel Logger
 //! ETW provider (`PerfInfo` group).
 //!
 //! Reference documentation:
@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::model::types::{ProcessId, StackTrace};
 use crate::pipeline::etw_schemas::nt_kernel::syscall::{DtoSyscallError, SysCallEnter_TypeGroup1};
-use crate::sensors::etw::EventRecord;
+use crate::sensors::etw::{EventRecord, RawEvent};
 
 /// Domain error encountered while parsing and validating Syscall telemetry events.
 #[derive(Debug, Error)]
@@ -56,17 +56,36 @@ impl SyscallEvent {
     }
 }
 
+impl TryFrom<&RawEvent> for SyscallEvent {
+    type Error = SyscallEventError;
+
+    #[inline]
+    fn try_from(event: &RawEvent) -> Result<Self, Self::Error> {
+        if event.opcode() != 51 {
+            return Err(SyscallEventError::UnknownOpcode(event.opcode()));
+        }
+
+        let dto = SysCallEnter_TypeGroup1::try_from(event)?;
+
+        Ok(Self {
+            timestamp: event.timestamp(),
+            process_id: ProcessId(event.process_id()),
+            thread_id: event.thread_id(),
+            syscall_address: dto.SysCallAddress,
+            stack_trace: event.extract_call_stack().map(StackTrace::new),
+        })
+    }
+}
+
 impl TryFrom<&EventRecord> for SyscallEvent {
     type Error = SyscallEventError;
 
-    /// Validates the opcode and transforms the raw `EventRecord` into a strongly-typed `SyscallEvent`.
+    #[inline]
     fn try_from(record: &EventRecord) -> Result<Self, Self::Error> {
-        // Opcode 51: SysCallEnter
         if record.opcode != 51 {
             return Err(SyscallEventError::UnknownOpcode(record.opcode));
         }
 
-        // Deserialize zero-copy SysCallEnter DTO
         let dto = SysCallEnter_TypeGroup1::try_from(record.user_data.as_slice())?;
 
         Ok(Self {
@@ -82,32 +101,32 @@ impl TryFrom<&EventRecord> for SyscallEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sensors::etw::SyntheticEvent;
     use windows_sys::core::GUID;
 
     /// Verifies extraction of target kernel function addresses from Opcode 51 records and validates rejection of non-SysCallEnter opcodes.
-    /// Mandatory for direct syscall anomaly detectors to guarantee only valid transition entry events are ingested.
     #[test]
     fn test_syscall_event_construction_and_opcode_filter() {
         let syscall_target: usize = 0x7FFF_1234_5678;
-        let mut record = EventRecord {
-            provider_id: GUID {
-                data1: 0xce1dbfb4,
-                data2: 0x137e,
-                data3: 0x4da6,
-                data4: [0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc],
-            },
-            event_id: 0,
-            version: 2,
-            opcode: 51, // SysCallEnter
-            level: 0,
-            process_id: 8888,
-            thread_id: 9999,
-            timestamp: 12345,
-            user_data: syscall_target.to_ne_bytes().to_vec(),
-            stack_trace: Some(vec![0x7FFF_AAAA, 0x7FFF_BBBB]),
+        let guid = GUID {
+            data1: 0xce1dbfb4,
+            data2: 0x137e,
+            data3: 0x4da6,
+            data4: [0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc],
         };
 
-        let event = SyscallEvent::try_from(&record).expect("Opcode 51 must produce SyscallEvent");
+        let syn = SyntheticEvent::new(
+            guid,
+            2,
+            51,
+            8888,
+            9999,
+            12345,
+            syscall_target.to_ne_bytes().to_vec(),
+        )
+        .with_inline_stack64(&[0x7FFF_AAAA, 0x7FFF_BBBB]);
+
+        let event = SyscallEvent::try_from(syn.as_raw_event()).expect("Opcode 51 must parse");
         assert_eq!(event.syscall_address, syscall_target);
         assert_eq!(event.process_id, ProcessId(8888));
         assert_eq!(
@@ -115,10 +134,17 @@ mod tests {
             &[0x7FFF_AAAA, 0x7FFF_BBBB]
         );
 
-        // Wrong opcode (e.g. SysCallExit 52)
-        record.opcode = 52;
+        let syn_wrong = SyntheticEvent::new(
+            guid,
+            2,
+            52,
+            8888,
+            9999,
+            12345,
+            syscall_target.to_ne_bytes().to_vec(),
+        );
         assert!(matches!(
-            SyscallEvent::try_from(&record),
+            SyscallEvent::try_from(syn_wrong.as_raw_event()),
             Err(SyscallEventError::UnknownOpcode(52))
         ));
     }

@@ -12,11 +12,13 @@
 //! Reference documentation:
 //! <https://learn.microsoft.com/en-us/windows/win32/etw/nt-kernel-logger-constants>
 
-use std::mem::size_of;
 use thiserror::Error;
 
+use crate::pipeline::etw_schemas::cursor::ByteCursor;
+use crate::sensors::etw::RawEvent;
+
 /// Error type encountered while parsing Syscall ETW DTO structures.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum DtoSyscallError {
     #[error("Buffer too short for Syscall payload (expected {0} bytes, got {1})")]
     BufferTooShort(usize, usize),
@@ -35,30 +37,48 @@ pub struct SysCallEnter_TypeGroup1 {
     pub SysCallAddress: usize,
 }
 
+impl SysCallEnter_TypeGroup1 {
+    /// Parses `SysCallEnter` from a bitness-aware [`ByteCursor`].
+    #[inline(always)]
+    pub fn parse(cursor: &mut ByteCursor<'_>) -> Result<Self, DtoSyscallError> {
+        let ptr_size = cursor.pointer_size();
+        let rem = cursor.remaining();
+        if rem < ptr_size {
+            return Err(DtoSyscallError::BufferTooShort(ptr_size, rem));
+        }
+
+        let addr = cursor
+            .read_ptr_usize("SysCallAddress")
+            .map_err(|_| DtoSyscallError::BufferTooShort(ptr_size, rem))?;
+
+        Ok(Self {
+            SysCallAddress: addr,
+        })
+    }
+}
+
 impl<'a> TryFrom<&'a [u8]> for SysCallEnter_TypeGroup1 {
     type Error = DtoSyscallError;
 
-    /// Validates buffer boundaries and reads the pointer-sized `SysCallAddress` without copying.
+    #[inline(always)]
     fn try_from(bytes: &'a [u8]) -> Result<Self, Self::Error> {
-        const PTR_SIZE: usize = size_of::<usize>();
+        Self::parse(&mut ByteCursor::new(bytes))
+    }
+}
 
-        if bytes.len() < PTR_SIZE {
-            return Err(DtoSyscallError::BufferTooShort(PTR_SIZE, bytes.len()));
-        }
+impl TryFrom<&RawEvent> for SysCallEnter_TypeGroup1 {
+    type Error = DtoSyscallError;
 
-        let address_bytes = bytes[..PTR_SIZE]
-            .try_into()
-            .map_err(|_| DtoSyscallError::BufferTooShort(PTR_SIZE, bytes.len()))?;
-
-        Ok(Self {
-            SysCallAddress: usize::from_ne_bytes(address_bytes),
-        })
+    #[inline(always)]
+    fn try_from(event: &RawEvent) -> Result<Self, Self::Error> {
+        Self::parse(&mut ByteCursor::from_raw_event(event))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::size_of;
 
     /// Verifies zero-copy extraction of the kernel syscall entry address and validates rejection of undersized buffers.
     /// Critical for direct syscall detection engines to avoid processing corrupt instruction addresses that trigger false alerts.
@@ -76,5 +96,13 @@ mod tests {
             SysCallEnter_TypeGroup1::try_from(truncated),
             Err(DtoSyscallError::BufferTooShort(_, _))
         ));
+    }
+
+    #[test]
+    fn test_syscall_enter_32bit_pointer_deserialization() {
+        let bytes = 0x8050_1234u32.to_ne_bytes();
+        let mut cursor = ByteCursor::with_pointer_size(&bytes, 4);
+        let dto = SysCallEnter_TypeGroup1::parse(&mut cursor).expect("32-bit syscall must parse");
+        assert_eq!(dto.SysCallAddress, 0x8050_1234);
     }
 }

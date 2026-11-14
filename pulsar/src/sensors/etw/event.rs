@@ -1,18 +1,18 @@
 //! Safe, owned representation of ETW events and extended stack payloads.
 
-use crate::helpers::format_guid;
 use std::fmt;
-use std::slice;
 use windows_sys::Win32::System::Diagnostics::Etw::{
-    EVENT_HEADER_EXT_TYPE_STACK_TRACE32, EVENT_HEADER_EXT_TYPE_STACK_TRACE64,
-    EVENT_HEADER_EXTENDED_DATA_ITEM, EVENT_RECORD,
+    EVENT_HEADER_FLAG_32_BIT_HEADER, EVENT_HEADER_FLAG_64_BIT_HEADER, EVENT_RECORD,
 };
 use windows_sys::core::GUID;
+
+use crate::helpers::format_guid;
+use crate::sensors::etw::raw_event::{RawEvent, SyntheticEvent};
 
 /// An owned, thread-safe representation of an ETW Event.
 ///
 /// Copies essential telemetry data from raw C-pointers provided by the ETW callback
-/// so that it can be safely sent across thread boundaries to the dispatcher.
+/// when an owned buffer is required. For zero-copy in-callback decoding, prefer [`RawEvent`].
 #[derive(Clone)]
 pub struct EventRecord {
     /// The GUID of the ETW Provider that emitted this event.
@@ -37,7 +37,6 @@ pub struct EventRecord {
     pub stack_trace: Option<Vec<u64>>,
 }
 
-// Manually implement Debug to format the GUID and preview UserData payload
 impl fmt::Debug for EventRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let peek_len = std::cmp::min(self.user_data.len(), 32);
@@ -59,106 +58,64 @@ impl fmt::Debug for EventRecord {
 }
 
 impl EventRecord {
-    /// Constructs a safe, owned `EventRecord` by copying data from a raw ETW `EVENT_RECORD`.
-    ///
-    /// # Arguments
-    ///
-    /// * `raw_record` - Pointer to the raw Win32 `EVENT_RECORD`.
-    ///
-    /// # Returns
-    ///
-    /// `Some(EventRecord)` if the pointer is non-null and successfully parsed, otherwise `None`.
+    /// Constructs a safe, owned `EventRecord` from a borrowed [`RawEvent`].
+    #[inline]
+    pub fn from_raw_event(raw: &RawEvent) -> Self {
+        Self {
+            provider_id: *raw.provider_id(),
+            event_id: raw.event_id(),
+            version: raw.version(),
+            opcode: raw.opcode(),
+            level: raw.level(),
+            process_id: raw.process_id(),
+            thread_id: raw.thread_id(),
+            timestamp: raw.timestamp(),
+            user_data: raw.user_data().to_vec(),
+            stack_trace: raw.extract_call_stack(),
+        }
+    }
+
+    /// Constructs a safe, owned `EventRecord` by copying data from a raw ETW `EVENT_RECORD` pointer.
     ///
     /// # Safety
     ///
     /// The `raw_record` pointer must be a valid, readable pointer to an `EVENT_RECORD`
     /// provided by the Win32 `ProcessTrace` callback.
+    #[inline]
     pub unsafe fn from_raw(raw_record: *const EVENT_RECORD) -> Option<Self> {
-        if raw_record.is_null() {
-            return None;
-        }
+        let raw = unsafe { RawEvent::from_ptr(raw_record) }?;
+        Some(Self::from_raw_event(raw))
+    }
 
-        // SAFETY: Verified non-null pointer above.
-        let record = unsafe { &*raw_record };
-        let header = &record.EventHeader;
-        let descriptor = &header.EventDescriptor;
+    /// Returns the host pointer size (`4` or `8` bytes) for this record.
+    #[inline(always)]
+    pub const fn pointer_size(&self) -> usize {
+        std::mem::size_of::<usize>()
+    }
 
-        // Extract the variable-length UserData payload into an owned Vec<u8>
-        let user_data = if !record.UserData.is_null() && record.UserDataLength > 0 {
-            // SAFETY: Verified non-null and valid length.
-            unsafe {
-                let slice = slice::from_raw_parts(
-                    record.UserData as *const u8,
-                    record.UserDataLength as usize,
-                );
-                slice.to_vec()
-            }
+    /// Converts this owned [`EventRecord`] into a [`SyntheticEvent`] that dereferences to [`RawEvent`].
+    pub fn to_synthetic_event(&self) -> SyntheticEvent {
+        let flags = if std::mem::size_of::<usize>() == 8 {
+            EVENT_HEADER_FLAG_64_BIT_HEADER as u16
         } else {
-            Vec::new()
+            EVENT_HEADER_FLAG_32_BIT_HEADER as u16
         };
+        let mut syn = SyntheticEvent::new(
+            self.provider_id,
+            self.version,
+            self.opcode,
+            self.process_id,
+            self.thread_id,
+            self.timestamp,
+            self.user_data.clone(),
+        )
+        .with_event_id(self.event_id)
+        .with_flags(flags);
 
-        let mut stack_trace = None;
-
-        if record.ExtendedDataCount > 0 && !record.ExtendedData.is_null() {
-            // SAFETY: ExtendedData is non-null and ExtendedDataCount specifies the array length.
-            unsafe {
-                let ext_data_slice = slice::from_raw_parts(
-                    record.ExtendedData as *const EVENT_HEADER_EXTENDED_DATA_ITEM,
-                    record.ExtendedDataCount as usize,
-                );
-
-                for item in ext_data_slice {
-                    if item.DataPtr == 0 {
-                        continue;
-                    }
-                    let data_size = item.DataSize as usize;
-                    // Minimum size is 8 bytes for the MatchId header
-                    if data_size <= 8 {
-                        continue;
-                    }
-
-                    // Match 64-bit stack traces
-                    if item.ExtType == EVENT_HEADER_EXT_TYPE_STACK_TRACE64 as u16 {
-                        let raw_bytes = slice::from_raw_parts(
-                            (item.DataPtr as *const u8).add(8),
-                            data_size - 8,
-                        );
-                        let frames: Vec<u64> = raw_bytes
-                            .chunks_exact(std::mem::size_of::<u64>())
-                            .map(|chunk| u64::from_ne_bytes(chunk.try_into().unwrap()))
-                            .collect();
-                        stack_trace = Some(frames);
-                        break;
-                    }
-                    // Match 32-bit stack traces
-                    else if item.ExtType == EVENT_HEADER_EXT_TYPE_STACK_TRACE32 as u16 {
-                        let raw_bytes = slice::from_raw_parts(
-                            (item.DataPtr as *const u8).add(8),
-                            data_size - 8,
-                        );
-                        let frames: Vec<u64> = raw_bytes
-                            .chunks_exact(std::mem::size_of::<u32>())
-                            .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()) as u64)
-                            .collect();
-                        stack_trace = Some(frames);
-                        break;
-                    }
-                }
-            }
+        if let Some(ref frames) = self.stack_trace {
+            syn = syn.with_inline_stack64(frames);
         }
-
-        Some(Self {
-            provider_id: header.ProviderId,
-            event_id: descriptor.Id,
-            version: descriptor.Version,
-            opcode: descriptor.Opcode,
-            level: descriptor.Level,
-            process_id: header.ProcessId,
-            thread_id: header.ThreadId,
-            timestamp: header.TimeStamp,
-            user_data,
-            stack_trace,
-        })
+        syn
     }
 }
 

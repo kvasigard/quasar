@@ -1,13 +1,15 @@
-//! Synchronous telemetry processing engine.
+//! Synchronous telemetry processing and stack correlation engine.
 //!
 //! This module provides the [`Pipeline`] processing engine responsible for ingesting
-//! raw ETW records, decoding them into domain events, and correlating out-of-band kernel
-//! stack walk events.
+//! decoded [`TelemetryEnvelope`]s (or raw ETW records) and correlating out-of-band kernel
+//! stack walk events via [`CallStackCorrelator`].
 
 use crate::pipeline::call_stack_correlator::CallStackCorrelator;
 use crate::pipeline::constants::{NT_KERNEL_STACK_WALK_GUID, guid_matches, stack_walk_opcodes};
+use crate::pipeline::etw_schemas::nt_kernel::stack_walk::StackWalkEvent;
 use crate::pipeline::event::Event;
-use crate::sensors::etw::EventRecord;
+use crate::pipeline::router::TelemetryEnvelope;
+use crate::sensors::etw::{EventRecord, RawEvent};
 
 /// Synchronous telemetry ingestion and stack correlation engine.
 pub struct Pipeline {
@@ -22,65 +24,60 @@ impl Default for Pipeline {
 
 impl Pipeline {
     /// Creates a new `Pipeline` with default correlation settings.
-    ///
-    /// # Returns
-    ///
-    /// An initialized [`Pipeline`] instance.
     pub fn new() -> Self {
         Self {
             correlator: CallStackCorrelator::new(),
         }
     }
 
-    /// Feeds a raw ETW record into the pipeline.
-    ///
-    /// Automatically decodes domain events and correlates asynchronous kernel stack traces.
-    ///
-    /// # Arguments
-    ///
-    /// * `record` - The raw [`EventRecord`] received from the sensor.
-    ///
-    /// # Returns
-    ///
-    /// `Some(Event)` when an event is ready for dispatch (either immediately or after
-    /// stack correlation), or `None` if the event is pending a stack walk or was ignored.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use pulsar::pipeline::Pipeline;
-    /// use pulsar::sensors::etw::EventRecord;
-    ///
-    /// # fn example(record: &EventRecord) {
-    /// let mut pipeline = Pipeline::new();
-    /// if let Some(event) = pipeline.feed(record) {
-    ///     println!("Processed event: {:?}", event);
-    /// }
-    /// # }
-    /// ```
+    /// Feeds a pre-decoded [`TelemetryEnvelope`] from [`PipelineEventRouter`](crate::pipeline::PipelineEventRouter)
+    /// into the stack correlator without any `Vec<u8>` re-parsing.
+    #[inline]
+    pub fn feed_envelope(&mut self, envelope: TelemetryEnvelope) -> Option<Event> {
+        match envelope {
+            TelemetryEnvelope::StackWalk(sw) => self.correlator.process_stack_walk_event(sw),
+            TelemetryEnvelope::Trigger {
+                event,
+                needs_async_stack,
+            } => self.correlator.process_trigger(event, needs_async_stack),
+        }
+    }
+
+    /// Feeds a borrowed zero-copy [`RawEvent`] directly into the pipeline.
+    #[inline]
+    pub fn feed_raw(&mut self, event: &RawEvent) -> Option<Event> {
+        if guid_matches(event.provider_id(), &NT_KERNEL_STACK_WALK_GUID)
+            && event.opcode() == stack_walk_opcodes::STACK_WALK
+        {
+            let sw = StackWalkEvent::try_from(event).ok()?;
+            return self.correlator.process_stack_walk_event(sw);
+        }
+
+        let (domain_event, requires_async_stack) = Event::from_raw_event(event)?;
+        self.correlator
+            .process_trigger(domain_event, requires_async_stack)
+    }
+
+    /// Feeds an owned [`EventRecord`] into the pipeline.
     pub fn feed(&mut self, record: &EventRecord) -> Option<Event> {
-        // Handle asynchronous out-of-band StackWalk records
         if guid_matches(&record.provider_id, &NT_KERNEL_STACK_WALK_GUID)
             && record.opcode == stack_walk_opcodes::STACK_WALK
         {
             return self.correlator.process_stack_walk(record);
         }
 
-        // Decode the raw record into a domain event
         let (event, requires_async_stack) = Event::from_record(record)?;
-
-        // Inline stack traces bypass asynchronous kernel stack wait
         let needs_async_stack = requires_async_stack && record.stack_trace.is_none();
         self.correlator.process_trigger(event, needs_async_stack)
     }
 
+    /// Returns `true` if no events are currently buffered awaiting stack correlation.
+    #[inline]
+    pub fn is_correlator_empty(&self) -> bool {
+        self.correlator.is_empty()
+    }
+
     /// Flushes and returns any buffered trigger events that timed out waiting for an async stack trace.
-    ///
-    /// This prevents event loss under heavy system load when kernel stack walk events may be dropped.
-    ///
-    /// # Returns
-    ///
-    /// A vector of [`Event`] items that timed out without receiving a stack walk.
     pub fn flush_expired(&mut self) -> Vec<Event> {
         self.correlator.flush_expired()
     }

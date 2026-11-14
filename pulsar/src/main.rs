@@ -9,12 +9,10 @@ use std::thread::JoinHandle;
 
 use clap::Parser;
 use pulsar::error::AppError;
-use pulsar::pipeline::{Event, EventDispatcher};
+use pulsar::pipeline::{Event, EventDispatcher, PipelineEventRouter, TelemetryEnvelope};
 use pulsar::sensors::driver::DriverSensor;
-use pulsar::sensors::etw::director::SessionDirector;
-use pulsar::sensors::etw::{
-    EtwError, EtwSession, EventRecord, KernelSession, KernelSessionBuilder,
-};
+use pulsar::sensors::etw::director::{KernelTraceConfig, SessionDirector};
+use pulsar::sensors::etw::{ConsumerHandle, EtwSession, KernelSession, KernelSessionBuilder};
 
 /// Pulsar Endpoint Detection and Response (EDR) Telemetry Agent.
 #[derive(Parser, Debug)]
@@ -24,7 +22,7 @@ use pulsar::sensors::etw::{
     version,
     about = "Lightweight Windows Endpoint Detection and Response (EDR) agent",
     long_about = "Pulsar is the user-mode agent for the Quasar EDR engine. It manages driver lifecycle, \
-                  spins up real-time NT Kernel Logger ETW sessions, and routes telemetry through \
+                  spins up real-time System Logger V2 ETW sessions, and routes telemetry through \
                   analytical sinks for behavioral detection and context tracking."
 )]
 pub struct Cli {
@@ -32,11 +30,15 @@ pub struct Cli {
     #[arg(short, long)]
     pub uninstall: bool,
 
-    /// Disable Direct Syscall anomaly detection and kernel stack tracing.
+    /// Explicitly enable Direct Syscall anomaly detection and kernel stack tracing (disabled by default).
     #[arg(
         long,
-        help = "Disable direct syscall anomaly detection and stack tracing"
+        help = "Enable direct syscall anomaly detection and kernel stack tracing (disabled by default)"
     )]
+    pub enable_syscalls: bool,
+
+    /// Backwards-compatible flag to force-disable syscall tracing.
+    #[arg(long, hide = true)]
     pub disable_syscalls: bool,
 
     /// Disable ETW kernel process and image load event tracing.
@@ -80,18 +82,19 @@ fn init_driver_and_ppl(
     }
 }
 
-/// Initializes the telemetry ingestion channel and starts the event dispatcher thread.
+/// Initializes the priority-split telemetry ingestion channels and starts the event dispatcher thread.
 fn setup_event_pipeline(
     enable_syscalls: bool,
     enable_context: bool,
     driver_rx: Option<mpsc::Receiver<Event>>,
     rule_engine: Option<Arc<pulsar::rules::RuleEngine>>,
     shutdown_flag: Arc<AtomicBool>,
-) -> (mpsc::SyncSender<EventRecord>, JoinHandle<()>) {
-    // Bound the channel queue to 50,000 items to prevent unbounded memory allocation under heavy telemetry bursts.
-    let (tx, rx) = mpsc::sync_channel::<EventRecord>(50_000);
+) -> (PipelineEventRouter, JoinHandle<()>) {
+    // High-priority channel for process/image/thread state updates, and standard channel for stack-correlated telemetry.
+    let (state_tx, state_rx) = mpsc::sync_channel::<Event>(16_384);
+    let (telemetry_tx, telemetry_rx) = mpsc::sync_channel::<TelemetryEnvelope>(50_000);
 
-    let mut dispatcher = EventDispatcher::new(rx);
+    let mut dispatcher = EventDispatcher::with_priority_channels(state_rx, telemetry_rx);
     if let Some(drx) = driver_rx {
         dispatcher = dispatcher.with_driver_receiver(drx);
     }
@@ -108,7 +111,7 @@ fn setup_event_pipeline(
     if enable_syscalls {
         log::info!("Feature enabled: Syscall Tracing.");
     } else {
-        log::debug!("Feature disabled: Syscall Tracing.");
+        log::debug!("Feature disabled (default): Syscall Tracing.");
     }
 
     if enable_context {
@@ -124,23 +127,27 @@ fn setup_event_pipeline(
     }
 
     let dispatcher_handle = dispatcher.start(shutdown_flag);
-    (tx, dispatcher_handle)
+    let router = PipelineEventRouter::new(state_tx, telemetry_tx);
+    (router, dispatcher_handle)
 }
 
-/// Configures and starts the NT Kernel Logger ETW session, returning the active session and consumer handle.
+/// Configures and starts the System Logger V2 ETW session, returning the active session and consumer handle.
 fn start_kernel_session(
     enable_syscalls: bool,
     enable_context: bool,
-    tx: mpsc::SyncSender<EventRecord>,
-) -> Result<(KernelSession, JoinHandle<Result<(), EtwError>>), AppError> {
+    router: PipelineEventRouter,
+) -> Result<(KernelSession, ConsumerHandle), AppError> {
     let mut session_builder = KernelSessionBuilder::new();
-    SessionDirector::construct_edr_session(&mut session_builder, enable_syscalls, enable_context);
+    let config = KernelTraceConfig::default()
+        .with_syscalls(enable_syscalls)
+        .with_context(enable_context);
+    SessionDirector::construct_kernel_session_with_config(&mut session_builder, config);
 
     let mut kernel_session = session_builder.build()?;
 
     kernel_session.start()?;
 
-    let consumer_handle = match kernel_session.consume(tx) {
+    let consumer_handle = match kernel_session.consume_with_router(router) {
         Ok(handle) => handle,
         Err(e) => {
             let _ = kernel_session.stop();
@@ -169,26 +176,30 @@ fn wait_for_shutdown(shutdown_flag: Arc<AtomicBool>) {
 /// Gracefully stops the ETW kernel trace session, driver sensor, and joins background worker threads.
 fn teardown_session(
     mut kernel_session: KernelSession,
-    consumer_handle: JoinHandle<Result<(), EtwError>>,
+    consumer_handle: ConsumerHandle,
     dispatcher_handle: JoinHandle<()>,
     driver_sensor_handle: Option<JoinHandle<()>>,
     rule_watcher_handle: Option<JoinHandle<()>>,
 ) {
     log::info!("Initiating graceful shutdown sequence...");
 
+    // Stop the ETW trace session first, then close the consumer trace handle and join
     if let Err(e) = kernel_session.stop() {
         log::error!("Failed to stop ETW kernel session: {}", e);
     }
 
-    match consumer_handle.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(etw_err)) => {
-            log::error!("ETW consumer thread exited with error: {etw_err}");
-        }
-        Err(e) => {
-            log::error!("Consumer thread panicked during execution: {:?}", e);
-        }
+    let metrics = consumer_handle.metrics_snapshot();
+    if let Err(etw_err) = consumer_handle.stop_and_join() {
+        log::error!("ETW consumer thread exited with error: {etw_err}");
     }
+    log::info!(
+        "ETW consumer metrics: received={}, dispatched={}, filtered_out={}, dropped_full={}, parse_errors={}",
+        metrics.events_received,
+        metrics.events_dispatched,
+        metrics.events_filtered_out,
+        metrics.events_dropped_channel_full,
+        metrics.parse_errors
+    );
 
     if let Some(sensor_handle) = driver_sensor_handle
         && let Err(e) = sensor_handle.join()
@@ -284,11 +295,11 @@ fn run(cli: Cli) -> Result<(), AppError> {
         (None, None)
     };
 
-    // Setup event bus and dispatching pipeline
-    let enable_syscalls = !cli.disable_syscalls;
+    // Syscall events are OFF by default unless explicitly enabled via `--enable-syscalls`
+    let enable_syscalls = cli.enable_syscalls && !cli.disable_syscalls;
     let enable_context = !cli.disable_context;
 
-    let (tx, dispatcher_handle) = setup_event_pipeline(
+    let (router, dispatcher_handle) = setup_event_pipeline(
         enable_syscalls,
         enable_context,
         driver_rx,
@@ -296,10 +307,8 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Arc::clone(&shutdown_flag),
     );
 
-    // Launch NT Kernel Logger ETW trace session; if it fails, signal shutdown and join background threads
-    // before dropping `driver_client` so the sensor never reads unmapped MDL pages.
     let (kernel_session, consumer_handle) =
-        match start_kernel_session(enable_syscalls, enable_context, tx) {
+        match start_kernel_session(enable_syscalls, enable_context, router) {
             Ok(pair) => pair,
             Err(err) => {
                 shutdown_flag.store(true, Ordering::SeqCst);
@@ -318,10 +327,8 @@ fn run(cli: Cli) -> Result<(), AppError> {
         "Quasar EDR Engine is active and capturing telemetry. Press Ctrl+C to safely stop..."
     );
 
-    // Wait for user termination signal
     wait_for_shutdown(shutdown_flag);
 
-    // Teardown trace sessions and background workers
     teardown_session(
         kernel_session,
         consumer_handle,
@@ -330,7 +337,6 @@ fn run(cli: Cli) -> Result<(), AppError> {
         rule_watcher_handle,
     );
 
-    // Dropping driver_client triggers EvtFileCleanup in driver after all threads have joined
     drop(driver_client);
 
     Ok(())

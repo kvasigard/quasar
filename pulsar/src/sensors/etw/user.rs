@@ -1,23 +1,31 @@
-//! Traditional and manifest-based ETW user trace session management.
+//! Traditional and manifest-based ETW user trace session management with kernel-side provider filtering.
 
-use std::sync::mpsc::SyncSender;
-use std::thread::JoinHandle;
-
-use super::consumer::spawn_trace_consumer;
-use super::error::EtwError;
-use super::event::EventRecord;
-use super::properties::TracePropertiesBuffer;
-use super::provider::Provider;
-use super::session::{EtwSession, EtwSessionBuilder, EventTraceProperties};
-
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS};
+use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::System::Diagnostics::Etw::{
-    CONTROLTRACE_HANDLE, ControlTraceW, ENABLE_TRACE_PARAMETERS,
-    EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_TRACE_CONTROL_STOP, EnableTraceEx2, StartTraceW,
+    CONTROLTRACE_HANDLE, ENABLE_TRACE_PARAMETERS, EVENT_CONTROL_CODE_DISABLE_PROVIDER,
+    EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_FILTER_DESCRIPTOR, EnableTraceEx2,
 };
 use windows_sys::core::GUID;
 
-/// Builder for configuring and starting a traditional ETW [`UserSession`].
+use super::consumer::ConsumerHandle;
+use super::error::EtwError;
+use super::properties::TraceStatistics;
+use super::provider::Provider;
+use super::router::TraceRouter;
+use super::session::{
+    EtwSession, EtwSessionBuilder, EventTraceProperties, flush_win32_trace_session,
+    query_win32_trace_session, spawn_session_consumer, start_win32_trace_session,
+    stop_win32_trace_session,
+};
+
+const NULL_GUID: GUID = GUID {
+    data1: 0,
+    data2: 0,
+    data3: 0,
+    data4: [0; 8],
+};
+
+/// Builder for configuring and starting a traditional or manifest-based ETW [`UserSession`].
 pub struct UserSessionBuilder {
     session_name: String,
     properties: EventTraceProperties,
@@ -26,10 +34,6 @@ pub struct UserSessionBuilder {
 
 impl UserSessionBuilder {
     /// Creates a new `UserSessionBuilder` with the specified session name.
-    ///
-    /// # Arguments
-    ///
-    /// * `session_name` - The unique name for this ETW trace session.
     pub fn new(session_name: impl Into<String>) -> Self {
         Self {
             session_name: session_name.into(),
@@ -38,27 +42,21 @@ impl UserSessionBuilder {
         }
     }
 
-    /// Registers an ETW provider to be enabled when the session starts.
-    ///
-    /// # Arguments
-    ///
-    /// * `provider` - The [`Provider`] configuration descriptor to attach.
+    /// Registers an ETW [`Provider`] (including any kernel-side [`ProviderFilter`](super::filter::ProviderFilter)s)
+    /// to be enabled when the session starts.
     pub fn add_provider(&mut self, provider: Provider) -> &mut Self {
         self.providers.push(provider);
         self
     }
 
     /// Consumes the builder to construct a configured [`UserSession`].
-    ///
-    /// # Returns
-    ///
-    /// An initialized [`UserSession`] ready to `start()`.
     pub fn build(&self) -> Result<UserSession, EtwError> {
         Ok(UserSession {
             session_name: self.session_name.clone(),
             properties: self.properties.clone(),
             providers: self.providers.clone(),
             handle: None,
+            last_statistics: None,
         })
     }
 }
@@ -100,27 +98,62 @@ impl EtwSessionBuilder for UserSessionBuilder {
     }
 }
 
-/// Active ETW session managing traditional/manifest-based providers via `EnableTraceEx2`.
-///
-/// Unlike the NT Kernel Logger (which uses fixed `EnableFlags` bitmasks), a `UserSession`
-/// dynamically attaches arbitrary ETW providers at runtime.
+/// Active ETW session managing traditional, manifest, and PPL providers via `EnableTraceEx2`.
 pub struct UserSession {
     session_name: String,
     properties: EventTraceProperties,
     providers: Vec<Provider>,
     handle: Option<CONTROLTRACE_HANDLE>,
+    last_statistics: Option<TraceStatistics>,
 }
 
 impl UserSession {
     /// Default session name for Pulsar user-mode telemetry.
     pub const DEFAULT_SESSION_NAME: &'static str = "Pulsar-User-Session";
 
-    /// Enables all registered providers on the active trace session handle.
+    /// Returns the name of this session.
+    #[inline]
+    pub fn session_name(&self) -> &str {
+        &self.session_name
+    }
+
+    /// Returns the [`TraceStatistics`] captured when the session was last queried or stopped.
+    #[inline]
+    pub const fn last_statistics(&self) -> Option<TraceStatistics> {
+        self.last_statistics
+    }
+
+    /// Queries live kernel ring-buffer statistics for this session.
+    pub fn query_statistics(&self) -> Result<TraceStatistics, EtwError> {
+        let handle = self
+            .handle
+            .ok_or_else(|| EtwError::SessionNotStarted(self.session_name.clone()))?;
+        query_win32_trace_session(handle, &self.session_name, &self.properties, NULL_GUID)
+    }
+
+    /// Flushes active ring buffers immediately.
+    pub fn flush(&self) -> Result<TraceStatistics, EtwError> {
+        let handle = self
+            .handle
+            .ok_or_else(|| EtwError::SessionNotStarted(self.session_name.clone()))?;
+        flush_win32_trace_session(handle, &self.session_name, &self.properties, NULL_GUID)
+    }
+
+    /// Enables all registered providers (along with their kernel-side `EVENT_FILTER_DESCRIPTOR`s)
+    /// on the active trace session handle.
     fn enable_providers(&self, handle: CONTROLTRACE_HANDLE) {
         for provider in &self.providers {
+            let built_filters = provider.filter().build_descriptors();
+            let filter_slice = built_filters.as_slice();
+
             let mut params: ENABLE_TRACE_PARAMETERS = unsafe { std::mem::zeroed() };
             params.Version = 2; // ENABLE_TRACE_PARAMETERS_VERSION_2
             params.EnableProperty = provider.enable_property();
+            if !filter_slice.is_empty() {
+                params.EnableFilterDesc =
+                    filter_slice.as_ptr() as *mut EVENT_FILTER_DESCRIPTOR;
+                params.FilterDescCount = filter_slice.len() as u32;
+            }
 
             let status = unsafe {
                 EnableTraceEx2(
@@ -139,13 +172,35 @@ impl UserSession {
                 log::warn!(
                     target: "etw_user",
                     "Failed to enable provider '{}' on session '{}' (Error code: {})",
-                    provider.name(), self.session_name, status
+                    provider.name(),
+                    self.session_name,
+                    status
                 );
             } else {
                 log::debug!(
                     target: "etw_user",
-                    "Successfully enabled provider '{}' on session '{}'",
-                    provider.name(), self.session_name
+                    "Successfully enabled provider '{}' on session '{}' ({} kernel filters)",
+                    provider.name(),
+                    self.session_name,
+                    filter_slice.len()
+                );
+            }
+        }
+    }
+
+    /// Disables all registered providers prior to stopping the trace session.
+    fn disable_providers(&self, handle: CONTROLTRACE_HANDLE) {
+        for provider in &self.providers {
+            unsafe {
+                let _ = EnableTraceEx2(
+                    handle,
+                    provider.guid(),
+                    EVENT_CONTROL_CODE_DISABLE_PROVIDER,
+                    0,
+                    0,
+                    0,
+                    0,
+                    std::ptr::null(),
                 );
             }
         }
@@ -153,15 +208,6 @@ impl UserSession {
 }
 
 impl EtwSession for UserSession {
-    /// Starts the user ETW trace session with Windows and enables all registered providers.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` on success, or `Err(EtwError)` if starting fails.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EtwError::SessionAlreadyRunning`] or [`EtwError::WindowsApi`] on error.
     fn start(&mut self) -> Result<(), EtwError> {
         if self.handle.is_some() {
             log::warn!(target: "etw_user", "Attempted to start an already running UserSession.");
@@ -170,131 +216,45 @@ impl EtwSession for UserSession {
 
         log::info!(target: "etw_user", "Starting user ETW session: {}", self.session_name);
 
-        let name_wide: Vec<u16> = self.session_name.encode_utf16().chain(Some(0)).collect();
-        let null_guid = GUID {
-            data1: 0,
-            data2: 0,
-            data3: 0,
-            data4: [0; 8],
-        };
-        let mut props_buf =
-            TracePropertiesBuffer::new(&self.session_name, &self.properties, null_guid, 0);
+        let handle = start_win32_trace_session(
+            &self.session_name,
+            &self.properties,
+            NULL_GUID,
+            None,
+            false,
+        )?;
 
-        let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
-        let mut status =
-            unsafe { StartTraceW(&mut handle, name_wide.as_ptr(), props_buf.as_mut_ptr()) };
-
-        if status == ERROR_ALREADY_EXISTS {
-            log::warn!(target: "etw_user", "Trace session '{}' already exists. Recreating...", self.session_name);
-
-            let mut stop_buf =
-                TracePropertiesBuffer::new(&self.session_name, &self.properties, null_guid, 0);
-            unsafe {
-                ControlTraceW(
-                    CONTROLTRACE_HANDLE { Value: 0 },
-                    name_wide.as_ptr(),
-                    stop_buf.as_mut_ptr(),
-                    EVENT_TRACE_CONTROL_STOP,
-                );
-
-                status = StartTraceW(&mut handle, name_wide.as_ptr(), props_buf.as_mut_ptr());
-            }
-        }
-
-        if status == ERROR_SUCCESS {
-            log::debug!(target: "etw_user", "Successfully started user ETW trace session.");
-            self.handle = Some(handle);
-            self.enable_providers(handle);
-            Ok(())
-        } else {
-            log::error!(
-                target: "etw_user",
-                "Failed to start user trace session '{}'. Windows Error Code: {}",
-                self.session_name, status
-            );
-            Err(EtwError::from_win32_code(status))
-        }
+        self.handle = Some(handle);
+        self.enable_providers(handle);
+        log::debug!(target: "etw_user", "Successfully started user ETW trace session.");
+        Ok(())
     }
 
-    /// Stops the ETW trace session and releases associated OS trace handles.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` on success, or `Err(EtwError)` on failure.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EtwError::WindowsApi`] if `ControlTraceW` fails.
     fn stop(&mut self) -> Result<(), EtwError> {
-        let handle = match self.handle.take() {
-            Some(h) => h,
-            None => {
-                log::trace!(target: "etw_user", "Stop called on uninitialized user session. Ignoring.");
-                return Ok(());
-            }
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
         };
 
         log::info!(target: "etw_user", "Stopping user ETW session '{}'...", self.session_name);
 
-        let name_wide: Vec<u16> = self.session_name.encode_utf16().chain(Some(0)).collect();
-        let null_guid = GUID {
-            data1: 0,
-            data2: 0,
-            data3: 0,
-            data4: [0; 8],
-        };
-        let mut props_buf =
-            TracePropertiesBuffer::new(&self.session_name, &self.properties, null_guid, 0);
+        self.disable_providers(handle);
+        let stats =
+            stop_win32_trace_session(handle, &self.session_name, &self.properties, NULL_GUID)?;
+        self.last_statistics = Some(stats);
 
-        let status = unsafe {
-            ControlTraceW(
-                handle,
-                name_wide.as_ptr(),
-                props_buf.as_mut_ptr(),
-                EVENT_TRACE_CONTROL_STOP,
-            )
-        };
-
-        if status != ERROR_SUCCESS {
-            log::error!(
-                target: "etw_user",
-                "Failed to stop user trace session '{}'. Windows Error Code: {}",
-                self.session_name, status
-            );
-            return Err(EtwError::from_win32_code(status));
-        }
-
-        log::debug!(target: "etw_user", "User ETW session '{}' stopped successfully.", self.session_name);
+        log::debug!(
+            target: "etw_user",
+            "User ETW session '{}' stopped successfully.",
+            self.session_name
+        );
         Ok(())
     }
 
-    /// Spawns a background thread consuming event records from this session via `ProcessTrace`.
-    ///
-    /// # Arguments
-    ///
-    /// * `sender` - Channel sender forwarding parsed events to the dispatcher.
-    ///
-    /// # Returns
-    ///
-    /// A `JoinHandle` for the consumer thread.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EtwError::SessionNotStarted`] if the session is not started, or [`EtwError::WindowsApi`] if `OpenTraceW` fails.
-    fn consume(
-        &self,
-        sender: SyncSender<EventRecord>,
-    ) -> Result<JoinHandle<Result<(), EtwError>>, EtwError> {
-        if self.handle.is_none() {
-            log::warn!(target: "etw_user", "Attempted to consume events from an unstarted UserSession.");
-            return Err(EtwError::SessionNotStarted(self.session_name.clone()));
-        }
-
-        spawn_trace_consumer(self.session_name.clone(), sender)
+    fn consume_with_router<R: TraceRouter>(&self, router: R) -> Result<ConsumerHandle, EtwError> {
+        spawn_session_consumer(self.handle.is_some(), &self.session_name, router)
     }
 }
 
-/// RAII implementation ensuring user trace sessions stop cleanly on drop.
 impl Drop for UserSession {
     fn drop(&mut self) {
         let _ = self.stop();
@@ -304,6 +264,7 @@ impl Drop for UserSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sensors::etw::event::EventRecord;
     use crate::sensors::etw::provider::TraceLevel;
 
     /// Verifies UserSessionBuilder configuration, buffer property setters, and provider accumulation.
@@ -361,7 +322,6 @@ mod tests {
         };
 
         if status != windows_sys::Win32::Foundation::ERROR_SUCCESS {
-            // If the environment does not allow provider registration, skip gracefully
             return;
         }
 
@@ -373,7 +333,9 @@ mod tests {
             .set_max_buffers(8)
             .set_flush_timer(1)
             .add_provider(
-                Provider::new("TestFullChainProvider", TEST_GUID).with_level(TraceLevel::Verbose),
+                Provider::new("TestFullChainProvider", TEST_GUID)
+                    .with_level(TraceLevel::Verbose)
+                    .include_event_ids([42]),
             );
 
         let mut session = builder.build().expect("Builder must succeed");
@@ -381,13 +343,13 @@ mod tests {
             unsafe {
                 windows_sys::Win32::System::Diagnostics::Etw::EventUnregister(reg_handle);
             }
-            // If running without Administrator / trace session creation privileges, skip gracefully
             return;
         }
 
-        let consumer_handle = session.consume(tx).expect("Consumer must start");
+        let consumer_handle = session
+            .consume_with_router(tx)
+            .expect("Consumer must start");
 
-        // Allow consumer thread and ETW session to initialize
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let descriptor = windows_sys::Win32::System::Diagnostics::Etw::EVENT_DESCRIPTOR {
@@ -415,12 +377,10 @@ mod tests {
             );
         }
 
-        // Receive event from the channel with a timeout
         let received = rx.recv_timeout(std::time::Duration::from_secs(2));
 
-        // Teardown session and unregister provider
         let _ = session.stop();
-        let _ = consumer_handle.join();
+        let _ = consumer_handle.stop_and_join();
         unsafe {
             windows_sys::Win32::System::Diagnostics::Etw::EventUnregister(reg_handle);
         }

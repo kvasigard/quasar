@@ -11,11 +11,14 @@
 //! Reference documentation:
 //! <https://learn.microsoft.com/en-us/windows/win32/etw/stackwalk>
 
-use std::mem::size_of;
 use thiserror::Error;
 
+use crate::model::types::StackTrace;
+use crate::pipeline::etw_schemas::cursor::ByteCursor;
+use crate::sensors::etw::RawEvent;
+
 /// Error type encountered while parsing StackWalk ETW DTO structures.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum DtoStackWalkError {
     #[error("Buffer too short for StackWalk header (expected at least {0} bytes, got {1})")]
     HeaderTooShort(usize, usize),
@@ -45,14 +48,49 @@ pub struct StackWalk_TypeGroup1<'a> {
 
     /// Number of pointer frames present in `RawFrames`.
     pub FrameCount: usize,
+
+    /// Pointer byte width (`4` or `8`) for each frame in `RawFrames`.
+    pub PointerSize: usize,
 }
 
 impl<'a> StackWalk_TypeGroup1<'a> {
+    /// Parses a `StackWalk_TypeGroup1` payload from a bitness-aware [`ByteCursor`].
+    #[inline]
+    pub fn parse(cursor: &mut ByteCursor<'a>) -> Result<Self, DtoStackWalkError> {
+        const HEADER_SIZE: usize = 16;
+        let ptr_size = cursor.pointer_size();
+        let total_len = cursor.remaining();
+
+        if total_len < HEADER_SIZE {
+            return Err(DtoStackWalkError::HeaderTooShort(HEADER_SIZE, total_len));
+        }
+
+        let event_timestamp = cursor.read_u64("EventTimeStamp").unwrap();
+        let stack_process = cursor.read_u32("StackProcess").unwrap();
+        let stack_thread = cursor.read_u32("StackThread").unwrap();
+
+        let raw_frames = cursor.remaining_slice();
+        if !raw_frames.len().is_multiple_of(ptr_size) {
+            return Err(DtoStackWalkError::UnalignedFrames(raw_frames.len()));
+        }
+
+        let frame_count = raw_frames.len() / ptr_size;
+
+        Ok(Self {
+            EventTimeStamp: event_timestamp,
+            StackProcess: stack_process,
+            StackThread: stack_thread,
+            RawFrames: raw_frames,
+            FrameCount: frame_count,
+            PointerSize: ptr_size,
+        })
+    }
+
     /// Iterates over the raw frame instruction pointers in the stack walk payload.
     pub fn iter_frames(&self) -> impl Iterator<Item = u64> + 'a {
-        const PTR_SIZE: usize = size_of::<usize>();
-        self.RawFrames.chunks_exact(PTR_SIZE).map(|chunk| {
-            if PTR_SIZE == 8 {
+        let ptr_size = self.PointerSize;
+        self.RawFrames.chunks_exact(ptr_size).map(move |chunk| {
+            if ptr_size == 8 {
                 u64::from_ne_bytes(chunk.try_into().unwrap())
             } else {
                 u32::from_ne_bytes(chunk.try_into().unwrap()) as u64
@@ -69,32 +107,45 @@ impl<'a> StackWalk_TypeGroup1<'a> {
 impl<'a> TryFrom<&'a [u8]> for StackWalk_TypeGroup1<'a> {
     type Error = DtoStackWalkError;
 
+    #[inline]
     fn try_from(bytes: &'a [u8]) -> Result<Self, Self::Error> {
-        // Header: EventTimeStamp (8 bytes) + StackProcess (4 bytes) + StackThread (4 bytes) = 16 bytes
-        const HEADER_SIZE: usize = 16;
-        const PTR_SIZE: usize = size_of::<usize>();
+        Self::parse(&mut ByteCursor::new(bytes))
+    }
+}
 
-        if bytes.len() < HEADER_SIZE {
-            return Err(DtoStackWalkError::HeaderTooShort(HEADER_SIZE, bytes.len()));
-        }
+impl<'a> TryFrom<&'a RawEvent> for StackWalk_TypeGroup1<'a> {
+    type Error = DtoStackWalkError;
 
-        let event_timestamp = u64::from_ne_bytes(bytes[0..8].try_into().unwrap());
-        let stack_process = u32::from_ne_bytes(bytes[8..12].try_into().unwrap());
-        let stack_thread = u32::from_ne_bytes(bytes[12..16].try_into().unwrap());
+    #[inline]
+    fn try_from(event: &'a RawEvent) -> Result<Self, Self::Error> {
+        Self::parse(&mut ByteCursor::from_raw_event(event))
+    }
+}
 
-        let raw_frames = &bytes[HEADER_SIZE..];
-        if !raw_frames.len().is_multiple_of(PTR_SIZE) {
-            return Err(DtoStackWalkError::UnalignedFrames(raw_frames.len()));
-        }
+/// Decoded out-of-band kernel stack walk event ready for [`CallStackCorrelator`](crate::pipeline::CallStackCorrelator).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackWalkEvent {
+    /// Timestamp of the triggering kernel event (`EventTimeStamp`).
+    pub event_timestamp: u64,
+    /// Target Process ID (`StackProcess`).
+    pub process_id: u32,
+    /// Target Thread ID (`StackThread`).
+    pub thread_id: u32,
+    /// Extracted instruction pointer call stack.
+    pub stack_trace: StackTrace,
+}
 
-        let frame_count = raw_frames.len() / PTR_SIZE;
+impl TryFrom<&RawEvent> for StackWalkEvent {
+    type Error = DtoStackWalkError;
 
+    #[inline]
+    fn try_from(event: &RawEvent) -> Result<Self, Self::Error> {
+        let dto = StackWalk_TypeGroup1::try_from(event)?;
         Ok(Self {
-            EventTimeStamp: event_timestamp,
-            StackProcess: stack_process,
-            StackThread: stack_thread,
-            RawFrames: raw_frames,
-            FrameCount: frame_count,
+            event_timestamp: dto.EventTimeStamp,
+            process_id: dto.StackProcess,
+            thread_id: dto.StackThread,
+            stack_trace: StackTrace::new(dto.to_frames()),
         })
     }
 }

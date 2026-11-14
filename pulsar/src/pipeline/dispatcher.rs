@@ -1,9 +1,9 @@
-//! Event router and dispatcher distributing pipeline events to registered listeners.
+//! Priority-aware event dispatcher distributing pipeline events to registered listeners.
 //!
-//! This module provides the [`EventDispatcher`] background worker that reads raw ETW
-//! records from the ingestion channel, processes them through the [`Pipeline`](crate::pipeline::Pipeline)
-//! engine, processes driver events from the kernel ring buffer, and broadcasts assembled [`Event`]
-//! objects to all registered [`EventListener`] subscribers.
+//! [`EventDispatcher`] enforces a strict three-tier priority draining order so that process
+//! state updates (`state_rx`) are always applied to `SystemState` / `ProcessTree` before
+//! kernel driver ring-buffer alerts (`driver_rx`) or high-volume telemetry (`telemetry_rx`)
+//! are evaluated by detection sinks.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,21 +16,12 @@ use shared::ring_buffer::LsassAccessEvent;
 use crate::model::events::{ProcessEvent, SyscallEvent};
 use crate::pipeline::engine::Pipeline;
 use crate::pipeline::event::Event;
+use crate::pipeline::router::TelemetryEnvelope;
 use crate::sensors::etw::EventRecord;
 
 /// The event listener contract defining strongly-typed domain event callbacks.
-///
-/// Implementors can override specific domain callbacks (e.g. `on_process`, `on_syscall`, `on_handle_pre_op`)
-/// or override `on_event` to receive all telemetry events uniformly.
 pub trait EventListener: Send + Sync {
     /// Generic dispatch hook invoked for every domain event flowing through the pipeline.
-    ///
-    /// The default implementation inspects the event variant and forwards it to the
-    /// corresponding specialized callback method.
-    ///
-    /// # Arguments
-    ///
-    /// * `event` - The domain [`Event`] being dispatched.
     fn on_event(&self, event: &Event) {
         match event {
             Event::Process(process_event) => self.on_process(process_event),
@@ -40,51 +31,53 @@ pub trait EventListener: Send + Sync {
     }
 
     /// Called when a process lifecycle or rundown event occurs.
-    ///
-    /// # Arguments
-    ///
-    /// * `_event` - The [`ProcessEvent`] details.
     fn on_process(&self, _event: &ProcessEvent) {}
 
     /// Called when a kernel system call execution event occurs.
-    ///
-    /// # Arguments
-    ///
-    /// * `_event` - The [`SyscallEvent`] details.
     fn on_syscall(&self, _event: &SyscallEvent) {}
 
     /// Called when an unauthorized or sensitive handle operation targeting `lsass.exe` is intercepted.
-    ///
-    /// # Arguments
-    ///
-    /// * `_event` - The [`LsassAccessEvent`] details.
     fn on_lsass_access(&self, _event: &LsassAccessEvent) {}
 }
 
+enum EtwInput {
+    /// Priority-split zero-copy channels driven by [`PipelineEventRouter`](crate::pipeline::PipelineEventRouter).
+    PrioritySplit {
+        state_rx: Receiver<Event>,
+        telemetry_rx: Receiver<TelemetryEnvelope>,
+    },
+    /// Legacy single-channel raw [`EventRecord`] receiver.
+    RawRecords(Receiver<EventRecord>),
+}
+
 /// Central event dispatcher distributing ingested telemetry across registered analytics listeners.
-///
-/// Consumes raw [`EventRecord`] items from an ETW channel, passes them through the synchronous
-/// [`Pipeline`] engine to resolve stack walks, drains driver events from the kernel ring buffer,
-/// and broadcasts completed [`Event`] instances to all attached [`EventListener`] sinks.
 pub struct EventDispatcher {
-    etw_rx: Receiver<EventRecord>,
+    input: EtwInput,
     driver_rx: Option<Receiver<Event>>,
     listeners: Vec<Box<dyn EventListener>>,
 }
 
 impl EventDispatcher {
-    /// Creates a new `EventDispatcher` consuming from the specified ETW channel receiver.
-    ///
-    /// # Arguments
-    ///
-    /// * `etw_rx` - Channel receiver yielding raw ETW records from sensors.
-    ///
-    /// # Returns
-    ///
-    /// An initialized [`EventDispatcher`] with no attached listeners.
+    /// Creates a new `EventDispatcher` consuming from priority-split zero-copy channels
+    /// (`state_rx` for high-priority `Process` state events, `telemetry_rx` for stack-correlated telemetry).
+    pub fn with_priority_channels(
+        state_rx: Receiver<Event>,
+        telemetry_rx: Receiver<TelemetryEnvelope>,
+    ) -> Self {
+        Self {
+            input: EtwInput::PrioritySplit {
+                state_rx,
+                telemetry_rx,
+            },
+            driver_rx: None,
+            listeners: Vec::new(),
+        }
+    }
+
+    /// Creates a new `EventDispatcher` consuming raw [`EventRecord`] items from a single channel.
     pub fn new(etw_rx: Receiver<EventRecord>) -> Self {
         Self {
-            etw_rx,
+            input: EtwInput::RawRecords(etw_rx),
             driver_rx: None,
             listeners: Vec::new(),
         }
@@ -97,23 +90,11 @@ impl EventDispatcher {
     }
 
     /// Registers a new event listener sink to receive dispatched events.
-    ///
-    /// # Arguments
-    ///
-    /// * `listener` - Boxed [`EventListener`] implementation.
     pub fn add_listener(&mut self, listener: Box<dyn EventListener>) {
         self.listeners.push(listener);
     }
 
     /// Launches the dispatch routing loop in a named background worker thread.
-    ///
-    /// # Arguments
-    ///
-    /// * `shutdown_flag` - Atomic flag checked periodically to initiate graceful termination.
-    ///
-    /// # Returns
-    ///
-    /// A `JoinHandle` for the spawned background worker thread.
     pub fn start(self, shutdown_flag: Arc<AtomicBool>) -> JoinHandle<()> {
         thread::Builder::new()
             .name("pulsar-dispatcher".to_string())
@@ -121,72 +102,160 @@ impl EventDispatcher {
             .expect("Failed to spawn pulsar-dispatcher thread")
     }
 
-    /// Internal worker loop processing records and broadcasting events until shutdown.
     fn run(self, shutdown_flag: Arc<AtomicBool>) {
         log::debug!(target: "dispatcher", "EventDispatcher background thread started.");
         let mut pipeline = Pipeline::new();
         let mut last_flush = Instant::now();
 
         while !shutdown_flag.load(Ordering::Relaxed) {
-            // Drain pending ETW records first so any Process::Start/DCStart events update
-            // SystemState BEFORE driver events are dispatched to detection sinks
-            for _ in 0..2048 {
-                match self.etw_rx.try_recv() {
-                    Ok(record) => {
-                        if let Some(event) = pipeline.feed(&record) {
-                            self.dispatch(&event);
+            let mut processed_any = false;
+
+            match &self.input {
+                EtwInput::PrioritySplit {
+                    state_rx,
+                    telemetry_rx,
+                } => {
+                    // Tier 1: High-priority state events (Process::Start/DCStart/End)
+                    for _ in 0..2048 {
+                        match state_rx.try_recv() {
+                            Ok(event) => {
+                                processed_any = true;
+                                self.dispatch(&event);
+                            }
+                            Err(_) => break,
                         }
                     }
-                    Err(_) => break,
-                }
-            }
 
-            // Drain up to 512 pending driver events per iteration to prevent starving ETW
-            if let Some(ref driver_rx) = self.driver_rx {
-                for _ in 0..512 {
-                    match driver_rx.try_recv() {
-                        Ok(event) => self.dispatch(&event),
-                        Err(_) => break,
+                    // Tier 2: Kernel driver ring-buffer alerts
+                    if let Some(ref driver_rx) = self.driver_rx {
+                        for _ in 0..512 {
+                            match driver_rx.try_recv() {
+                                Ok(event) => {
+                                    processed_any = true;
+                                    self.dispatch(&event);
+                                }
+                                Err(_) => break,
+                            }
+                        }
                     }
-                }
-            }
 
-            // Periodically flush expired stack correlations even under continuous ETW load
-            if last_flush.elapsed() >= Duration::from_millis(25) {
-                for expired_event in pipeline.flush_expired() {
-                    self.dispatch(&expired_event);
-                }
-                last_flush = Instant::now();
-            }
-
-            match self.etw_rx.recv_timeout(Duration::from_millis(5)) {
-                Ok(record) => {
-                    if let Some(event) = pipeline.feed(&record) {
-                        self.dispatch(&event);
-                    }
-                    // Batch-drain up to 2047 additional queued ETW records without timer overhead
-                    for _ in 0..2047 {
-                        match self.etw_rx.try_recv() {
-                            Ok(next_record) => {
-                                if let Some(event) = pipeline.feed(&next_record) {
+                    // Tier 3: Stack-correlated telemetry and StackWalk events
+                    for _ in 0..2048 {
+                        match telemetry_rx.try_recv() {
+                            Ok(envelope) => {
+                                processed_any = true;
+                                if let Some(event) = pipeline.feed_envelope(envelope) {
                                     self.dispatch(&event);
                                 }
                             }
                             Err(_) => break,
                         }
                     }
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    for expired_event in pipeline.flush_expired() {
-                        self.dispatch(&expired_event);
+
+                    if !pipeline.is_correlator_empty()
+                        && last_flush.elapsed() >= Duration::from_millis(25)
+                    {
+                        for expired_event in pipeline.flush_expired() {
+                            self.dispatch(&expired_event);
+                        }
+                        last_flush = Instant::now();
                     }
-                    last_flush = Instant::now();
+
+                    if !processed_any {
+                        match state_rx.recv_timeout(Duration::from_millis(5)) {
+                            Ok(event) => self.dispatch(&event),
+                            Err(RecvTimeoutError::Timeout) => {
+                                if !pipeline.is_correlator_empty() {
+                                    for expired_event in pipeline.flush_expired() {
+                                        self.dispatch(&expired_event);
+                                    }
+                                    last_flush = Instant::now();
+                                }
+                            }
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
+                EtwInput::RawRecords(etw_rx) => {
+                    for _ in 0..2048 {
+                        match etw_rx.try_recv() {
+                            Ok(record) => {
+                                processed_any = true;
+                                if let Some(event) = pipeline.feed(&record) {
+                                    self.dispatch(&event);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    if let Some(ref driver_rx) = self.driver_rx {
+                        for _ in 0..512 {
+                            match driver_rx.try_recv() {
+                                Ok(event) => {
+                                    processed_any = true;
+                                    self.dispatch(&event);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+
+                    if !pipeline.is_correlator_empty()
+                        && last_flush.elapsed() >= Duration::from_millis(25)
+                    {
+                        for expired_event in pipeline.flush_expired() {
+                            self.dispatch(&expired_event);
+                        }
+                        last_flush = Instant::now();
+                    }
+
+                    if !processed_any {
+                        match etw_rx.recv_timeout(Duration::from_millis(5)) {
+                            Ok(record) => {
+                                if let Some(event) = pipeline.feed(&record) {
+                                    self.dispatch(&event);
+                                }
+                            }
+                            Err(RecvTimeoutError::Timeout) => {
+                                if !pipeline.is_correlator_empty() {
+                                    for expired_event in pipeline.flush_expired() {
+                                        self.dispatch(&expired_event);
+                                    }
+                                    last_flush = Instant::now();
+                                }
+                            }
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                }
             }
         }
 
-        // Final sweep of driver events and buffered triggers upon termination
+        // Final sweep on shutdown so no queued state or driver events are lost
+        match &self.input {
+            EtwInput::PrioritySplit {
+                state_rx,
+                telemetry_rx,
+            } => {
+                while let Ok(event) = state_rx.try_recv() {
+                    self.dispatch(&event);
+                }
+                while let Ok(envelope) = telemetry_rx.try_recv() {
+                    if let Some(event) = pipeline.feed_envelope(envelope) {
+                        self.dispatch(&event);
+                    }
+                }
+            }
+            EtwInput::RawRecords(etw_rx) => {
+                while let Ok(record) = etw_rx.try_recv() {
+                    if let Some(event) = pipeline.feed(&record) {
+                        self.dispatch(&event);
+                    }
+                }
+            }
+        }
+
         if let Some(ref driver_rx) = self.driver_rx {
             while let Ok(event) = driver_rx.try_recv() {
                 self.dispatch(&event);
@@ -200,6 +269,7 @@ impl EventDispatcher {
     }
 
     /// Dispatches a fully assembled domain event to all registered listeners.
+    #[inline]
     fn dispatch(&self, event: &Event) {
         for listener in &self.listeners {
             listener.on_event(event);
@@ -247,7 +317,6 @@ mod tests {
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let handle = dispatcher.start(Arc::clone(&shutdown_flag));
 
-        // Send a mock process event through ETW
         let mut user_data = Vec::new();
         user_data.extend_from_slice(&(0xAAAA_BBBBusize).to_ne_bytes()); // UniqueProcessKey
         user_data.extend_from_slice(&1234u32.to_ne_bytes()); // ProcessId
@@ -283,12 +352,10 @@ mod tests {
 
         tx.send(record).unwrap();
 
-        // Send a mock LSASS access event through driver channel
         let lsass_event =
             LsassAccessEvent::new(5000, 816, 0x1FFFFF, 0x1000, 0x3000, 1, 0, 1, b"malware.exe");
         driver_tx.send(Event::LsassAccess(lsass_event)).unwrap();
 
-        // Allow worker thread to drain
         std::thread::sleep(Duration::from_millis(150));
 
         shutdown_flag.store(true, Ordering::SeqCst);

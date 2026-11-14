@@ -1,4 +1,4 @@
-//! This file contains strongly-typed domain event types derived from the legacy NT Kernel Logger
+//! This file contains strongly-typed domain event types derived from the NT Kernel Logger
 //! ETW provider.
 //!
 //! Reference documentation:
@@ -13,7 +13,7 @@ use crate::pipeline::etw_schemas::nt_kernel::process::{
     DtoProcessError, Process_V0_TypeGroup1, Process_V1_TypeGroup1, Process_V2_TypeGroup1,
     Process_V3_TypeGroup1,
 };
-use crate::sensors::etw::EventRecord;
+use crate::sensors::etw::{EventRecord, RawEvent};
 
 /// Domain-level error encountered while parsing and validating process events.
 #[derive(Debug, Error)]
@@ -89,8 +89,6 @@ impl fmt::Display for ProcessEventKind {
 }
 
 /// Unified domain event representing a process lifecycle change or telemetry record.
-/// Note: Since this is a telemetry event might be ephimer and its values might be **moved** to
-/// a bigger longliving structure where more process information data is collected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessEvent {
     // Header & Event Ingestion Context
@@ -117,9 +115,12 @@ pub struct ProcessEvent {
 }
 
 impl ProcessEvent {
-    /// Constructs a `ProcessEvent` from Windows 8.1 / 10 / 11 (Version 3 / Version 4+) schema payload.
-    fn from_v3(
-        record: &EventRecord,
+    #[inline]
+    fn build_from_v3(
+        timestamp: i64,
+        emitter_pid: u32,
+        emitter_tid: u32,
+        stack_trace: Option<StackTrace>,
         kind: ProcessEventKind,
         dto: &Process_V3_TypeGroup1,
     ) -> Result<Self, ProcessModelError> {
@@ -134,17 +135,15 @@ impl ProcessEvent {
         };
 
         Ok(Self {
-            timestamp: record.timestamp,
-            emitter_pid: ProcessId(record.process_id),
-            emitter_tid: record.thread_id,
-            stack_trace: record.stack_trace.clone().map(StackTrace::new),
+            timestamp,
+            emitter_pid: ProcessId(emitter_pid),
+            emitter_tid,
+            stack_trace,
             kind,
-
             unique_process_key: UniqueProcessKey(dto.UniqueProcessKey),
             process_id: ProcessId(dto.ProcessId),
             parent_id: ProcessId(dto.ParentId),
             session_id: SessionId(dto.SessionId),
-
             exit_status,
             user_sid,
             image_file_name: dto.ImageFileName.to_string(),
@@ -152,9 +151,12 @@ impl ProcessEvent {
         })
     }
 
-    /// Constructs a `ProcessEvent` from Windows 8 (Version 2) schema payload.
-    fn from_v2(
-        record: &EventRecord,
+    #[inline]
+    fn build_from_v2(
+        timestamp: i64,
+        emitter_pid: u32,
+        emitter_tid: u32,
+        stack_trace: Option<StackTrace>,
         kind: ProcessEventKind,
         dto: &Process_V2_TypeGroup1,
     ) -> Result<Self, ProcessModelError> {
@@ -169,17 +171,15 @@ impl ProcessEvent {
         };
 
         Ok(Self {
-            timestamp: record.timestamp,
-            emitter_pid: ProcessId(record.process_id),
-            emitter_tid: record.thread_id,
-            stack_trace: record.stack_trace.clone().map(StackTrace::new),
+            timestamp,
+            emitter_pid: ProcessId(emitter_pid),
+            emitter_tid,
+            stack_trace,
             kind,
-
             unique_process_key: UniqueProcessKey(dto.UniqueProcessKey),
             process_id: ProcessId(dto.ProcessId),
             parent_id: ProcessId(dto.ParentId),
             session_id: SessionId(dto.SessionId),
-
             exit_status,
             user_sid,
             image_file_name: dto.ImageFileName.to_string(),
@@ -187,9 +187,12 @@ impl ProcessEvent {
         })
     }
 
-    /// Constructs a `ProcessEvent` from Windows Vista / 7 (Version 1) schema payload.
-    fn from_v1(
-        record: &EventRecord,
+    #[inline]
+    fn build_from_v1(
+        timestamp: i64,
+        emitter_pid: u32,
+        emitter_tid: u32,
+        stack_trace: Option<StackTrace>,
         kind: ProcessEventKind,
         dto: &Process_V1_TypeGroup1,
     ) -> Result<Self, ProcessModelError> {
@@ -204,27 +207,28 @@ impl ProcessEvent {
         };
 
         Ok(Self {
-            timestamp: record.timestamp,
-            emitter_pid: ProcessId(record.process_id),
-            emitter_tid: record.thread_id,
-            stack_trace: record.stack_trace.clone().map(StackTrace::new),
+            timestamp,
+            emitter_pid: ProcessId(emitter_pid),
+            emitter_tid,
+            stack_trace,
             kind,
-
             unique_process_key: UniqueProcessKey(dto.PageDirectoryBase),
             process_id: ProcessId(dto.ProcessId),
             parent_id: ProcessId(dto.ParentId),
             session_id: SessionId(dto.SessionId),
-
             exit_status,
             user_sid,
             image_file_name: dto.ImageFileName.to_string(),
-            command_line: String::new(), // V1 did not capture command lines
+            command_line: String::new(),
         })
     }
 
-    /// Constructs a `ProcessEvent` from legacy Windows XP / 2003 (Version 0) schema payload.
-    fn from_v0(
-        record: &EventRecord,
+    #[inline]
+    fn build_from_v0(
+        timestamp: i64,
+        emitter_pid: u32,
+        emitter_tid: u32,
+        stack_trace: Option<StackTrace>,
         kind: ProcessEventKind,
         dto: &Process_V0_TypeGroup1,
     ) -> Result<Self, ProcessModelError> {
@@ -232,17 +236,15 @@ impl ProcessEvent {
             Sid::try_from(dto.UserSID).map_err(|e| ProcessModelError::InvalidSid(e.to_string()))?;
 
         Ok(Self {
-            timestamp: record.timestamp,
-            emitter_pid: ProcessId(record.process_id),
-            emitter_tid: record.thread_id,
-            stack_trace: record.stack_trace.clone().map(StackTrace::new),
+            timestamp,
+            emitter_pid: ProcessId(emitter_pid),
+            emitter_tid,
+            stack_trace,
             kind,
-
             unique_process_key: UniqueProcessKey(0),
             process_id: ProcessId(dto.ProcessId),
             parent_id: ProcessId(dto.ParentId),
             session_id: SessionId(0),
-
             exit_status: None,
             user_sid,
             image_file_name: dto.ImageFileName.to_string(),
@@ -251,29 +253,116 @@ impl ProcessEvent {
     }
 }
 
+impl TryFrom<&RawEvent> for ProcessEvent {
+    type Error = ProcessModelError;
+
+    #[inline]
+    fn try_from(event: &RawEvent) -> Result<Self, Self::Error> {
+        let kind = ProcessEventKind::try_from(event.opcode())?;
+        let stack_trace = event.extract_call_stack().map(StackTrace::new);
+
+        match event.version() {
+            3.. => {
+                let dto = Process_V3_TypeGroup1::try_from(event)?;
+                Self::build_from_v3(
+                    event.timestamp(),
+                    event.process_id(),
+                    event.thread_id(),
+                    stack_trace,
+                    kind,
+                    &dto,
+                )
+            }
+            2 => {
+                let dto = Process_V2_TypeGroup1::try_from(event)?;
+                Self::build_from_v2(
+                    event.timestamp(),
+                    event.process_id(),
+                    event.thread_id(),
+                    stack_trace,
+                    kind,
+                    &dto,
+                )
+            }
+            1 => {
+                let dto = Process_V1_TypeGroup1::try_from(event)?;
+                Self::build_from_v1(
+                    event.timestamp(),
+                    event.process_id(),
+                    event.thread_id(),
+                    stack_trace,
+                    kind,
+                    &dto,
+                )
+            }
+            0 => {
+                let dto = Process_V0_TypeGroup1::try_from(event)?;
+                Self::build_from_v0(
+                    event.timestamp(),
+                    event.process_id(),
+                    event.thread_id(),
+                    stack_trace,
+                    kind,
+                    &dto,
+                )
+            }
+        }
+    }
+}
+
 impl TryFrom<&EventRecord> for ProcessEvent {
     type Error = ProcessModelError;
 
+    #[inline]
     fn try_from(record: &EventRecord) -> Result<Self, Self::Error> {
         let kind = ProcessEventKind::try_from(record.opcode)?;
         let bytes = record.user_data.as_slice();
+        let stack_trace = record.stack_trace.clone().map(StackTrace::new);
 
         match record.version {
             3.. => {
                 let dto = Process_V3_TypeGroup1::try_from(bytes)?;
-                ProcessEvent::from_v3(record, kind, &dto)
+                Self::build_from_v3(
+                    record.timestamp,
+                    record.process_id,
+                    record.thread_id,
+                    stack_trace,
+                    kind,
+                    &dto,
+                )
             }
             2 => {
                 let dto = Process_V2_TypeGroup1::try_from(bytes)?;
-                ProcessEvent::from_v2(record, kind, &dto)
+                Self::build_from_v2(
+                    record.timestamp,
+                    record.process_id,
+                    record.thread_id,
+                    stack_trace,
+                    kind,
+                    &dto,
+                )
             }
             1 => {
                 let dto = Process_V1_TypeGroup1::try_from(bytes)?;
-                ProcessEvent::from_v1(record, kind, &dto)
+                Self::build_from_v1(
+                    record.timestamp,
+                    record.process_id,
+                    record.thread_id,
+                    stack_trace,
+                    kind,
+                    &dto,
+                )
             }
             0 => {
                 let dto = Process_V0_TypeGroup1::try_from(bytes)?;
-                ProcessEvent::from_v0(record, kind, &dto)
+                Self::build_from_v0(
+                    record.timestamp,
+                    record.process_id,
+                    record.thread_id,
+                    stack_trace,
+                    kind,
+                    &dto,
+                )
             }
         }
     }
@@ -282,12 +371,12 @@ impl TryFrom<&EventRecord> for ProcessEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sensors::etw::SyntheticEvent;
     use windows_sys::core::GUID;
 
-    /// Verifies complete transformation from raw EventRecord into strongly-typed ProcessEvent for Start and End lifecycles.
-    /// Ensures ExitStatus is appropriately populated for termination events and omitted for process spawn events.
+    /// Verifies complete transformation from raw EventRecord and RawEvent into strongly-typed ProcessEvent.
     #[test]
-    fn test_process_event_from_v2_record() {
+    fn test_process_event_from_v2_raw_event_and_record() {
         let mut user_data = Vec::new();
         user_data.extend_from_slice(&(0xAAAA_BBBBusize).to_ne_bytes()); // UniqueProcessKey
         user_data.extend_from_slice(&4321u32.to_ne_bytes()); // PID
@@ -303,33 +392,25 @@ mod tests {
             .collect();
         user_data.extend_from_slice(&cmd);
 
-        let mut record = EventRecord {
-            provider_id: GUID {
-                data1: 0x22fb2cd6,
-                data2: 0x0e7b,
-                data3: 0x4226,
-                data4: [0xa0, 0x66, 0x61, 0x80, 0xf7, 0x71, 0x24, 0x65],
-            },
-            event_id: 0,
-            version: 2,
-            opcode: 1, // Start
-            level: 0,
-            process_id: 4321,
-            thread_id: 100,
-            timestamp: 555_000,
-            user_data,
-            stack_trace: None,
+        let provider_id = GUID {
+            data1: 0x3d6fa8d0,
+            data2: 0xfe05,
+            data3: 0x11d0,
+            data4: [0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c],
         };
 
-        let start_event = ProcessEvent::try_from(&record).expect("Start record should convert");
+        let syn_start =
+            SyntheticEvent::new(provider_id, 2, 1, 4321, 100, 555_000, user_data.clone());
+        let start_event =
+            ProcessEvent::try_from(syn_start.as_raw_event()).expect("RawEvent Start should parse");
         assert_eq!(start_event.kind, ProcessEventKind::Start);
         assert_eq!(start_event.process_id, ProcessId(4321));
         assert_eq!(start_event.exit_status, None);
         assert_eq!(start_event.image_file_name, "consent.exe");
 
-        // Change opcode to End (2)
-        record.opcode = 2;
-        let end_event = ProcessEvent::try_from(&record).expect("End record should convert");
+        let syn_end = SyntheticEvent::new(provider_id, 2, 2, 4321, 100, 555_000, user_data);
+        let end_event =
+            ProcessEvent::try_from(syn_end.as_raw_event()).expect("RawEvent End should parse");
         assert_eq!(end_event.kind, ProcessEventKind::End);
         assert_eq!(end_event.exit_status, Some(ExitStatus::Success));
     }

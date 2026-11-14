@@ -18,10 +18,10 @@
 /// identifiers in the event data (in addition to those in the event header).
 ///
 /// Reference: https://learn.microsoft.com/en-us/windows/win32/etw/process-v2
-use crate::helpers::strings::{StringError, parse_ansi_string, parse_utf16_bytes};
+use crate::helpers::strings::StringError;
+use crate::pipeline::etw_schemas::cursor::{ByteCursor, CursorError};
+use crate::sensors::etw::RawEvent;
 use thiserror::Error;
-
-const PTR_SIZE: usize = std::mem::size_of::<usize>();
 
 /// Specific error type for Process ETW DTO parsing failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -36,79 +36,16 @@ pub enum DtoProcessError {
     String(&'static str, #[source] StringError),
 }
 
-/// Extracts a zero-copy slice of a Windows binary Security Identifier (SID).
-///
-/// The Windows SID Binary Layout as described in `WinNT.h` looks like the following:
-/// ```text
-/// +--------+-------------------+-----------------------+---------------------------------------+
-/// | Offset | Size (Bytes)      | Field                 | Description                           |
-/// +--------+-------------------+-----------------------+---------------------------------------+
-/// | 0x00   | 1 (BYTE)          | Revision              | SID structure revision (always 1)     |
-/// | 0x01   | 1 (BYTE)          | SubAuthorityCount (N) | Number of 32-bit sub-authority values |
-/// | 0x02   | 6 (BYTE[6])       | IdentifierAuthority   | 48-bit authority identifier (e.g., NT)|
-/// | 0x08   | N * 4 (DWORD[N])  | SubAuthority Array    | N x 32-bit integers (e.g., RIDs)      |
-/// +--------+-------------------+-----------------------+---------------------------------------+
-/// Total SID Size = 8 bytes (Header) + (SubAuthorityCount * 4 bytes)
-/// Example: S-1-5-21-1234-5678-9012-500 has N=5 sub-authorities -> 8 + (5 * 4) = 28 bytes.
-/// ```
-///
-/// # Arguments
-/// * `bytes` - Byte slice starting at the SID boundary.
-/// * `field` - Field name for error reporting.
-///
-/// # Returns
-/// A tuple containing:
-/// * `&[u8]` - Zero-copy subslice containing the exact binary SID bytes.
-/// * `usize` - Total number of bytes consumed by the SID.
-/// Fallback binary `S-1-0-0` (Null SID) returned when a kernel ETW record carries a `0u32`
-/// null-SID marker (e.g., `Idle` pseudo-process during `DCStart`).
-const NULL_SID_BYTES: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-
-#[inline]
-fn parse_sid<'a>(
-    bytes: &'a [u8],
-    field: &'static str,
-) -> Result<(&'a [u8], usize), DtoProcessError> {
-    if bytes.len() < 4 {
-        return Err(DtoProcessError::BufferTooShort(field));
+impl From<CursorError> for DtoProcessError {
+    #[inline]
+    fn from(err: CursorError) -> Self {
+        match err {
+            CursorError::BufferTooShort { field, .. } => Self::BufferTooShort(field),
+            CursorError::InvalidSid(field) => Self::InvalidSid(field),
+            CursorError::String(field, source) => Self::String(field, source),
+            CursorError::UnalignedTrailingBytes { field, .. } => Self::BufferTooShort(field),
+        }
     }
-
-    // In Windows ETW MOF `[extension("Sid")]`, a leading 32-bit 0 indicates no SID is attached
-    // (unless it is the low 32 bits of a 64-bit canonical kernel pointer `0xFFFF...`).
-    let is_64bit_kernel_ptr = bytes.len() >= 8 && bytes[6] == 0xFF && bytes[7] == 0xFF;
-    if bytes[0..4] == [0, 0, 0, 0] && !is_64bit_kernel_ptr {
-        return Ok((&NULL_SID_BYTES, 4));
-    }
-
-    if bytes.len() < 8 {
-        return Err(DtoProcessError::BufferTooShort(field));
-    }
-
-    // Distinguish a direct raw SID (Revision == 1, SubAuthorityCount 1..=15, upper 4 bytes of
-    // big-endian IdentifierAuthority == 0) from a kernel ETW `TOKEN_USER` (`2 * PTR_SIZE` bytes)
-    // header preceding the SID.
-    let is_raw_sid = bytes[0] == 1 && (1..=15).contains(&bytes[1]) && bytes[2..6] == [0, 0, 0, 0];
-    let sid_offset = if is_raw_sid { 0 } else { 2 * PTR_SIZE };
-
-    if bytes.len() < sid_offset + 8 {
-        return Err(DtoProcessError::BufferTooShort(field));
-    }
-
-    if bytes[sid_offset] != 1 {
-        return Err(DtoProcessError::InvalidSid(field));
-    }
-
-    let sub_auth_count = bytes[sid_offset + 1] as usize;
-    let sid_len = 8 + (sub_auth_count * 4);
-
-    if bytes.len() < sid_offset + sid_len {
-        return Err(DtoProcessError::InvalidSid(field));
-    }
-
-    Ok((
-        &bytes[sid_offset..sid_offset + sid_len],
-        sid_offset + sid_len,
-    ))
 }
 
 // V0 Process Schema (Windows XP / Server 2003)
@@ -121,30 +58,35 @@ pub struct Process_V0_TypeGroup1<'a> {
     pub ImageFileName: &'a str,
 }
 
+impl<'a> Process_V0_TypeGroup1<'a> {
+    /// Parses a V0 process payload from a bitness-aware [`ByteCursor`].
+    #[inline]
+    pub fn parse(cursor: &mut ByteCursor<'a>) -> Result<Self, DtoProcessError> {
+        cursor.ensure_remaining(8, "FixedHeader")?;
+        Ok(Self {
+            ProcessId: cursor.read_u32("ProcessId")?,
+            ParentId: cursor.read_u32("ParentId")?,
+            UserSID: cursor.read_sid("UserSID")?,
+            ImageFileName: cursor.read_ansi_str("ImageFileName")?,
+        })
+    }
+}
+
 impl<'a> TryFrom<&'a [u8]> for Process_V0_TypeGroup1<'a> {
     type Error = DtoProcessError;
 
+    #[inline]
     fn try_from(bytes: &'a [u8]) -> Result<Self, Self::Error> {
-        if bytes.len() < 8 {
-            return Err(DtoProcessError::BufferTooShort("FixedHeader"));
-        }
+        Self::parse(&mut ByteCursor::new(bytes))
+    }
+}
 
-        let process_id = u32::from_ne_bytes(bytes[0..4].try_into().unwrap());
-        let parent_id = u32::from_ne_bytes(bytes[4..8].try_into().unwrap());
-        let mut offset = 8;
+impl<'a> TryFrom<&'a RawEvent> for Process_V0_TypeGroup1<'a> {
+    type Error = DtoProcessError;
 
-        let (user_sid, sid_len) = parse_sid(&bytes[offset..], "UserSID")?;
-        offset += sid_len;
-
-        let (image_file_name, _) = parse_ansi_string(&bytes[offset..])
-            .map_err(|source| DtoProcessError::String("ImageFileName", source))?;
-
-        Ok(Self {
-            ProcessId: process_id,
-            ParentId: parent_id,
-            UserSID: user_sid,
-            ImageFileName: image_file_name,
-        })
+    #[inline]
+    fn try_from(event: &'a RawEvent) -> Result<Self, Self::Error> {
+        Self::parse(&mut ByteCursor::from_raw_event(event))
     }
 }
 
@@ -161,44 +103,40 @@ pub struct Process_V1_TypeGroup1<'a> {
     pub ImageFileName: &'a str,
 }
 
+impl<'a> Process_V1_TypeGroup1<'a> {
+    /// Parses a V1 process payload from a bitness-aware [`ByteCursor`].
+    #[inline]
+    pub fn parse(cursor: &mut ByteCursor<'a>) -> Result<Self, DtoProcessError> {
+        let fixed_size = cursor.pointer_size() + 16;
+        cursor.ensure_remaining(fixed_size, "FixedHeader")?;
+
+        Ok(Self {
+            PageDirectoryBase: cursor.read_ptr_usize("PageDirectoryBase")?,
+            ProcessId: cursor.read_u32("ProcessId")?,
+            ParentId: cursor.read_u32("ParentId")?,
+            SessionId: cursor.read_u32("SessionId")?,
+            ExitStatus: cursor.read_i32("ExitStatus")?,
+            UserSID: cursor.read_sid("UserSID")?,
+            ImageFileName: cursor.read_ansi_str("ImageFileName")?,
+        })
+    }
+}
+
 impl<'a> TryFrom<&'a [u8]> for Process_V1_TypeGroup1<'a> {
     type Error = DtoProcessError;
 
+    #[inline]
     fn try_from(bytes: &'a [u8]) -> Result<Self, Self::Error> {
-        let fixed_size = PTR_SIZE + 16;
-        if bytes.len() < fixed_size {
-            return Err(DtoProcessError::BufferTooShort("FixedHeader"));
-        }
+        Self::parse(&mut ByteCursor::new(bytes))
+    }
+}
 
-        let mut offset = 0;
-        let page_directory_base =
-            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
-        offset += PTR_SIZE;
+impl<'a> TryFrom<&'a RawEvent> for Process_V1_TypeGroup1<'a> {
+    type Error = DtoProcessError;
 
-        let process_id = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-        let parent_id = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-        let session_id = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-        let exit_status = i32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-
-        let (user_sid, sid_len) = parse_sid(&bytes[offset..], "UserSID")?;
-        offset += sid_len;
-
-        let (image_file_name, _) = parse_ansi_string(&bytes[offset..])
-            .map_err(|source| DtoProcessError::String("ImageFileName", source))?;
-
-        Ok(Self {
-            PageDirectoryBase: page_directory_base,
-            ProcessId: process_id,
-            ParentId: parent_id,
-            SessionId: session_id,
-            ExitStatus: exit_status,
-            UserSID: user_sid,
-            ImageFileName: image_file_name,
-        })
+    #[inline]
+    fn try_from(event: &'a RawEvent) -> Result<Self, Self::Error> {
+        Self::parse(&mut ByteCursor::from_raw_event(event))
     }
 }
 
@@ -217,54 +155,43 @@ pub struct Process_V2_TypeGroup1<'a> {
     pub CommandLine: &'a [u8],
 }
 
+impl<'a> Process_V2_TypeGroup1<'a> {
+    /// Parses a V2 process payload from a bitness-aware [`ByteCursor`].
+    #[inline]
+    pub fn parse(cursor: &mut ByteCursor<'a>) -> Result<Self, DtoProcessError> {
+        let ptr_size = cursor.pointer_size();
+        let fixed_size = ptr_size + 16 + ptr_size;
+        cursor.ensure_remaining(fixed_size, "FixedHeader")?;
+
+        Ok(Self {
+            UniqueProcessKey: cursor.read_ptr_usize("UniqueProcessKey")?,
+            ProcessId: cursor.read_u32("ProcessId")?,
+            ParentId: cursor.read_u32("ParentId")?,
+            SessionId: cursor.read_u32("SessionId")?,
+            ExitStatus: cursor.read_i32("ExitStatus")?,
+            DirectoryTableBase: cursor.read_ptr_usize("DirectoryTableBase")?,
+            UserSID: cursor.read_sid("UserSID")?,
+            ImageFileName: cursor.read_ansi_str("ImageFileName")?,
+            CommandLine: cursor.read_utf16_bytes("CommandLine")?,
+        })
+    }
+}
+
 impl<'a> TryFrom<&'a [u8]> for Process_V2_TypeGroup1<'a> {
     type Error = DtoProcessError;
 
+    #[inline]
     fn try_from(bytes: &'a [u8]) -> Result<Self, Self::Error> {
-        let fixed_size = PTR_SIZE + 16 + PTR_SIZE;
-        if bytes.len() < fixed_size {
-            return Err(DtoProcessError::BufferTooShort("FixedHeader"));
-        }
+        Self::parse(&mut ByteCursor::new(bytes))
+    }
+}
 
-        let mut offset = 0;
-        let unique_process_key =
-            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
-        offset += PTR_SIZE;
+impl<'a> TryFrom<&'a RawEvent> for Process_V2_TypeGroup1<'a> {
+    type Error = DtoProcessError;
 
-        let process_id = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-        let parent_id = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-        let session_id = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-        let exit_status = i32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-
-        let directory_table_base =
-            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
-        offset += PTR_SIZE;
-
-        let (user_sid, sid_len) = parse_sid(&bytes[offset..], "UserSID")?;
-        offset += sid_len;
-
-        let (image_file_name, name_len) = parse_ansi_string(&bytes[offset..])
-            .map_err(|source| DtoProcessError::String("ImageFileName", source))?;
-        offset += name_len;
-
-        let (command_line, _) = parse_utf16_bytes(&bytes[offset..])
-            .map_err(|source| DtoProcessError::String("CommandLine", source))?;
-
-        Ok(Self {
-            UniqueProcessKey: unique_process_key,
-            ProcessId: process_id,
-            ParentId: parent_id,
-            SessionId: session_id,
-            ExitStatus: exit_status,
-            DirectoryTableBase: directory_table_base,
-            UserSID: user_sid,
-            ImageFileName: image_file_name,
-            CommandLine: command_line,
-        })
+    #[inline]
+    fn try_from(event: &'a RawEvent) -> Result<Self, Self::Error> {
+        Self::parse(&mut ByteCursor::from_raw_event(event))
     }
 }
 
@@ -285,58 +212,44 @@ pub struct Process_V3_TypeGroup1<'a> {
     pub CommandLine: &'a [u8],
 }
 
+impl<'a> Process_V3_TypeGroup1<'a> {
+    /// Parses a V3/V4+ process payload from a bitness-aware [`ByteCursor`].
+    #[inline]
+    pub fn parse(cursor: &mut ByteCursor<'a>) -> Result<Self, DtoProcessError> {
+        let ptr_size = cursor.pointer_size();
+        let fixed_size = ptr_size + 16 + ptr_size + 4;
+        cursor.ensure_remaining(fixed_size, "FixedHeader")?;
+
+        Ok(Self {
+            UniqueProcessKey: cursor.read_ptr_usize("UniqueProcessKey")?,
+            ProcessId: cursor.read_u32("ProcessId")?,
+            ParentId: cursor.read_u32("ParentId")?,
+            SessionId: cursor.read_u32("SessionId")?,
+            ExitStatus: cursor.read_i32("ExitStatus")?,
+            DirectoryTableBase: cursor.read_ptr_usize("DirectoryTableBase")?,
+            Flags: cursor.read_u32("Flags")?,
+            UserSID: cursor.read_sid("UserSID")?,
+            ImageFileName: cursor.read_ansi_str("ImageFileName")?,
+            CommandLine: cursor.read_utf16_bytes("CommandLine")?,
+        })
+    }
+}
+
 impl<'a> TryFrom<&'a [u8]> for Process_V3_TypeGroup1<'a> {
     type Error = DtoProcessError;
 
+    #[inline]
     fn try_from(bytes: &'a [u8]) -> Result<Self, Self::Error> {
-        let fixed_size = PTR_SIZE + 16 + PTR_SIZE + 4;
-        if bytes.len() < fixed_size {
-            return Err(DtoProcessError::BufferTooShort("FixedHeader"));
-        }
+        Self::parse(&mut ByteCursor::new(bytes))
+    }
+}
 
-        let mut offset = 0;
-        let unique_process_key =
-            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
-        offset += PTR_SIZE;
+impl<'a> TryFrom<&'a RawEvent> for Process_V3_TypeGroup1<'a> {
+    type Error = DtoProcessError;
 
-        let process_id = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-        let parent_id = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-        let session_id = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-        let exit_status = i32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-
-        let directory_table_base =
-            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
-        offset += PTR_SIZE;
-
-        let flags = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-
-        let (user_sid, sid_len) = parse_sid(&bytes[offset..], "UserSID")?;
-        offset += sid_len;
-
-        let (image_file_name, name_len) = parse_ansi_string(&bytes[offset..])
-            .map_err(|source| DtoProcessError::String("ImageFileName", source))?;
-        offset += name_len;
-
-        let (command_line, _) = parse_utf16_bytes(&bytes[offset..])
-            .map_err(|source| DtoProcessError::String("CommandLine", source))?;
-
-        Ok(Self {
-            UniqueProcessKey: unique_process_key,
-            ProcessId: process_id,
-            ParentId: parent_id,
-            SessionId: session_id,
-            ExitStatus: exit_status,
-            DirectoryTableBase: directory_table_base,
-            Flags: flags,
-            UserSID: user_sid,
-            ImageFileName: image_file_name,
-            CommandLine: command_line,
-        })
+    #[inline]
+    fn try_from(event: &'a RawEvent) -> Result<Self, Self::Error> {
+        Self::parse(&mut ByteCursor::from_raw_event(event))
     }
 }
 
@@ -366,112 +279,53 @@ pub struct Process_V2_TypeGroup2 {
     pub OtherTransferCount: u64,
 }
 
+impl Process_V2_TypeGroup2 {
+    /// Parses a V2 process performance counters payload from a bitness-aware [`ByteCursor`].
+    #[inline]
+    pub fn parse(cursor: &mut ByteCursor<'_>) -> Result<Self, DtoProcessError> {
+        let total_size = (9 * cursor.pointer_size()) + 12 + 64;
+        cursor.ensure_remaining(total_size, "FixedHeader")?;
+
+        Ok(Self {
+            UniqueProcessKey: cursor.read_ptr_usize("UniqueProcessKey")?,
+            ProcessId: cursor.read_u32("ProcessId")?,
+            UserTime: cursor.read_u64("UserTime")?,
+            KernelTime: cursor.read_u64("KernelTime")?,
+            PeakVirtualSize: cursor.read_ptr_usize("PeakVirtualSize")?,
+            PeakWorkingSetSize: cursor.read_ptr_usize("PeakWorkingSetSize")?,
+            VirtualSize: cursor.read_ptr_usize("VirtualSize")?,
+            PagefileUsage: cursor.read_ptr_usize("PagefileUsage")?,
+            PeakPagefileUsage: cursor.read_ptr_usize("PeakPagefileUsage")?,
+            WorkingSetSize: cursor.read_ptr_usize("WorkingSetSize")?,
+            PageFaultCount: cursor.read_u32("PageFaultCount")?,
+            HardFaultCount: cursor.read_u32("HardFaultCount")?,
+            CommitCharge: cursor.read_ptr_usize("CommitCharge")?,
+            PeakCommitCharge: cursor.read_ptr_usize("PeakCommitCharge")?,
+            ReadOperationCount: cursor.read_u64("ReadOperationCount")?,
+            WriteOperationCount: cursor.read_u64("WriteOperationCount")?,
+            OtherOperationCount: cursor.read_u64("OtherOperationCount")?,
+            ReadTransferCount: cursor.read_u64("ReadTransferCount")?,
+            WriteTransferCount: cursor.read_u64("WriteTransferCount")?,
+            OtherTransferCount: cursor.read_u64("OtherTransferCount")?,
+        })
+    }
+}
+
 impl TryFrom<&[u8]> for Process_V2_TypeGroup2 {
     type Error = DtoProcessError;
 
+    #[inline]
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        let total_size = (9 * PTR_SIZE) + 12 + 64;
-        if bytes.len() < total_size {
-            return Err(DtoProcessError::BufferTooShort("FixedHeader"));
-        }
+        Self::parse(&mut ByteCursor::new(bytes))
+    }
+}
 
-        let mut offset = 0;
+impl TryFrom<&RawEvent> for Process_V2_TypeGroup2 {
+    type Error = DtoProcessError;
 
-        let unique_process_key =
-            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
-        offset += PTR_SIZE;
-
-        let process_id = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-
-        let user_time = u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
-        offset += 8;
-
-        let kernel_time = u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
-        offset += 8;
-
-        let peak_virtual_size =
-            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
-        offset += PTR_SIZE;
-
-        let peak_working_set_size =
-            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
-        offset += PTR_SIZE;
-
-        let virtual_size =
-            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
-        offset += PTR_SIZE;
-
-        let pagefile_usage =
-            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
-        offset += PTR_SIZE;
-
-        let peak_pagefile_usage =
-            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
-        offset += PTR_SIZE;
-
-        let working_set_size =
-            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
-        offset += PTR_SIZE;
-
-        let page_fault_count = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-
-        let hard_fault_count = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-
-        let commit_charge =
-            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
-        offset += PTR_SIZE;
-
-        let peak_commit_charge =
-            usize::from_ne_bytes(bytes[offset..offset + PTR_SIZE].try_into().unwrap());
-        offset += PTR_SIZE;
-
-        let read_operation_count =
-            u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
-        offset += 8;
-
-        let write_operation_count =
-            u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
-        offset += 8;
-
-        let other_operation_count =
-            u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
-        offset += 8;
-
-        let read_transfer_count = u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
-        offset += 8;
-
-        let write_transfer_count =
-            u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
-        offset += 8;
-
-        let other_transfer_count =
-            u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
-
-        Ok(Self {
-            UniqueProcessKey: unique_process_key,
-            ProcessId: process_id,
-            UserTime: user_time,
-            KernelTime: kernel_time,
-            PeakVirtualSize: peak_virtual_size,
-            PeakWorkingSetSize: peak_working_set_size,
-            VirtualSize: virtual_size,
-            PagefileUsage: pagefile_usage,
-            PeakPagefileUsage: peak_pagefile_usage,
-            WorkingSetSize: working_set_size,
-            PageFaultCount: page_fault_count,
-            HardFaultCount: hard_fault_count,
-            CommitCharge: commit_charge,
-            PeakCommitCharge: peak_commit_charge,
-            ReadOperationCount: read_operation_count,
-            WriteOperationCount: write_operation_count,
-            OtherOperationCount: other_operation_count,
-            ReadTransferCount: read_transfer_count,
-            WriteTransferCount: write_transfer_count,
-            OtherTransferCount: other_transfer_count,
-        })
+    #[inline]
+    fn try_from(event: &RawEvent) -> Result<Self, Self::Error> {
+        Self::parse(&mut ByteCursor::from_raw_event(event))
     }
 }
 
@@ -485,14 +339,16 @@ mod tests {
     fn test_parse_sid_boundaries_and_truncation() {
         // S-1-5-18 (Revision 1, 1 Sub-Authority, Authority 5, RID 18): 8 + 4 = 12 bytes
         let valid_sid = [1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
-        let (sid_slice, len) = parse_sid(&valid_sid, "UserSID").expect("Valid SID must parse");
+        let mut cursor = ByteCursor::new(&valid_sid);
+        let sid_slice = cursor.read_sid("UserSID").expect("Valid SID must parse");
         assert_eq!(sid_slice, &valid_sid);
-        assert_eq!(len, 12);
+        assert_eq!(cursor.position(), 12);
 
         // Header claims 2 sub-authorities (requires 16 bytes), but only 12 bytes provided
         let truncated_sid = [1u8, 2, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+        let mut bad_cursor = ByteCursor::new(&truncated_sid);
         assert_eq!(
-            parse_sid(&truncated_sid, "UserSID"),
+            bad_cursor.read_sid("UserSID").map_err(DtoProcessError::from),
             Err(DtoProcessError::InvalidSid("UserSID"))
         );
     }
@@ -535,7 +391,7 @@ mod tests {
     /// Prevents slice-indexing panics on truncated or corrupted ETW trace frames delivered during high system load.
     #[test]
     fn test_process_v2_dto_truncated_fixed_header() {
-        let truncated = vec![0u8; PTR_SIZE + 8]; // Smaller than required fixed header size
+        let truncated = vec![0u8; std::mem::size_of::<usize>() + 8]; // Smaller than required fixed header size
         assert_eq!(
             Process_V2_TypeGroup1::try_from(truncated.as_slice()),
             Err(DtoProcessError::BufferTooShort("FixedHeader"))
@@ -556,5 +412,37 @@ mod tests {
         assert_eq!(v0_dto.ProcessId, 2000);
         assert_eq!(v0_dto.ParentId, 1000);
         assert_eq!(v0_dto.ImageFileName, "cmd.exe");
+    }
+
+    /// Verifies that 32-bit WOW64 Process_V3 payloads (4-byte pointers) deserialize accurately via ByteCursor.
+    #[test]
+    fn test_process_v3_32bit_pointer_size_deserialization() {
+        let mut buf32 = Vec::new();
+        buf32.extend_from_slice(&0x8123_4560u32.to_ne_bytes()); // UniqueProcessKey (4 bytes)
+        buf32.extend_from_slice(&4444u32.to_ne_bytes()); // ProcessId
+        buf32.extend_from_slice(&2222u32.to_ne_bytes()); // ParentId
+        buf32.extend_from_slice(&2u32.to_ne_bytes()); // SessionId
+        buf32.extend_from_slice(&0i32.to_ne_bytes()); // ExitStatus
+        buf32.extend_from_slice(&0x001A_B000u32.to_ne_bytes()); // DirectoryTableBase (4 bytes)
+        buf32.extend_from_slice(&0u32.to_ne_bytes()); // Flags
+        buf32.extend_from_slice(&[1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]); // SID
+        buf32.extend_from_slice(b"wow64app.exe\0");
+        let cmdline: Vec<u8> = "wow64app.exe --32bit\0"
+            .encode_utf16()
+            .flat_map(|u| u.to_ne_bytes())
+            .collect();
+        buf32.extend_from_slice(&cmdline);
+
+        let mut cur32 = ByteCursor::with_pointer_size(&buf32, 4);
+        let dto = Process_V3_TypeGroup1::parse(&mut cur32).expect("32-bit V3 payload must parse");
+        assert_eq!(dto.UniqueProcessKey, 0x8123_4560);
+        assert_eq!(dto.ProcessId, 4444);
+        assert_eq!(dto.ParentId, 2222);
+        assert_eq!(dto.DirectoryTableBase, 0x001A_B000);
+        assert_eq!(dto.ImageFileName, "wow64app.exe");
+        assert_eq!(
+            crate::helpers::strings::decode_utf16le_bytes(dto.CommandLine),
+            "wow64app.exe --32bit"
+        );
     }
 }
